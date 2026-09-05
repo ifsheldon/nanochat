@@ -111,6 +111,8 @@ The important thing to note is that nanochat is written and configured around on
 
 ## Running on CPU / MPS
 
+For a single-GPU DGX Spark version of the small demo, including a smoke test, see [DGX Spark small experiments](dev/SPARK.md).
+
 SFT packs complete conversations when possible and truncates the shortest oversized conversation only when none fits an empty row.
 Examples without assistant targets inside the context window are excluded and counted toward dataset progress; a dataset cycle with no usable targets on a rank raises an error.
 

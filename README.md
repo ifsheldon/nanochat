@@ -29,7 +29,9 @@ See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret a
 
 ### Setup
 
-nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management. To install:
+nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management.
+The GPU extra installs PyTorch 2.14.0 with CUDA 13.2 runtime libraries.
+To install:
 
 ```bash
 uv sync --extra gpu    # Use for CUDA (A100/H100/etc.)

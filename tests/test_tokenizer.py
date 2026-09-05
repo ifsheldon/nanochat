@@ -123,6 +123,20 @@ def test_render_conversation_truncation(tokenizer):
     assert len(ids) == 32 and len(mask) == 32
 
 
+def test_render_conversation_without_truncation_preserves_assistant_end(tokenizer):
+    conversation = {"messages": [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "world " * 3000},
+    ]}
+    ids, mask = tokenizer.render_conversation(conversation, max_tokens=None)
+    assert len(ids) > 2048
+    assert ids[-1] == tokenizer.encode_special("<|assistant_end|>")
+    assert mask[-1] == 1
+    capped_ids, capped_mask = tokenizer.render_conversation(conversation)
+    assert capped_ids == ids[:2048]
+    assert capped_mask == mask[:2048]
+
+
 def test_render_for_completion(tokenizer):
     conversation = {"messages": [
         {"role": "user", "content": "hi"},

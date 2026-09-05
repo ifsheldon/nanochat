@@ -111,6 +111,9 @@ The important thing to note is that nanochat is written and configured around on
 
 ## Running on CPU / MPS
 
+SFT packs complete conversations when possible and truncates the shortest oversized conversation only when none fits an empty row.
+Examples without assistant targets inside the context window are excluded and counted toward dataset progress; a dataset cycle with no usable targets on a rank raises an error.
+
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
 
 ## Precision / dtype

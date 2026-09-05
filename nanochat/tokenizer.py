@@ -140,6 +140,7 @@ class RustBPETokenizer:
     def render_conversation(self, conversation, max_tokens=2048):
         """
         Tokenize a single Chat conversation (which we call a "doc" or "document" here).
+        Pass max_tokens=None to preserve the full conversation for length-aware packing.
         Returns:
         - ids: list[int] is a list of token ids of this rendered conversation
         - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.

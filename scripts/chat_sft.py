@@ -21,6 +21,8 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.sft_dataloader import sft_data_loader_bos_bestfit
+from nanochat.sft_training import SFTProgress, sft_lr_multiplier
+from nanochat.training_runtime import check_training_memory, require_finite_loss
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
 from nanochat.engine import Engine
@@ -172,45 +174,25 @@ val_dataset = TaskMixture([
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
     GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
 ]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
-# The packing loader emits inputs/targets plus progress metadata.
-# This adapter updates the training loop's existing progress and stopping state.
-last_step = False # we will toggle this to True when we reach the end of the training dataset
-approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
-current_epoch = 1 # track epoch for logging
+# Keep prefetched data separate from completed optimizer progress.
 def sft_data_generator_bos_bestfit(split, buffer_size=100):
-    """Connect packed SFT batches to the training loop's progress tracking."""
-    global last_step, approx_progress, current_epoch
     assert split in {"train", "val"}, "split must be 'train' or 'val'"
     dataset = train_dataset if split == "train" else val_dataset
-    loader = sft_data_loader_bos_bestfit(
+    return sft_data_loader_bos_bestfit(
         dataset, tokenizer, args.device_batch_size, args.max_seq_len, device,
         rank=ddp_rank, world_size=ddp_world_size, buffer_size=buffer_size,
     )
-    for it, (inputs, targets, state) in enumerate(loader, start=1):
-        if split == "train":
-            current_epoch = state.epoch
-            approx_progress = it / args.num_iterations if args.num_iterations > 0 else state.consumed / len(dataset)
-            if 0 < args.num_iterations <= it or state.consumed >= len(dataset):
-                last_step = True
-        yield inputs, targets
 
 train_loader = sft_data_generator_bos_bestfit("train")
-build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
-progress = 0 # will go from 0 to 1 over the course of the epoch
+build_val_loader = lambda: ((x, y) for x, y, _ in sft_data_generator_bos_bestfit("val"))
+training_progress = SFTProgress(len(train_dataset), args.num_iterations)
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
-# Same shape as base_train but uses progress (0→1) instead of absolute step counts,
-# because SFT doesn't always know num_iterations in advance (dataset-driven stopping).
 def get_lr_multiplier(progress):
-    if progress < args.warmup_ratio:
-        return (progress + 1e-8) / args.warmup_ratio
-    elif progress <= 1.0 - args.warmdown_ratio:
-        return 1.0
-    else:
-        decay = (progress - (1.0 - args.warmdown_ratio)) / args.warmdown_ratio
-        return (1 - decay) * 1.0 + decay * args.final_lr_frac
+    return sft_lr_multiplier(progress, args.warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
 
-# Momentum scheduler for Muon optimizer
+# Validate schedule before starting training.
+get_lr_multiplier(0.0)
+
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
     momentum = (1 - frac) * 0.85 + frac * 0.95
@@ -218,13 +200,15 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-x, y = next(train_loader) # prefetch the very first batch of data
+x, y, data_state = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
 while True:
+    check_training_memory(device, step)
+    last_step = training_progress.done
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
     # Synchronize last_step across all ranks to avoid hangs in the distributed setting
@@ -319,18 +303,19 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    lrm = get_lr_multiplier(training_progress.fraction)
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
+        require_finite_loss(loss, step)
+        processed_state = data_state
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        progress = max(progress, approx_progress) # only increase progress monotonically
+        x, y, data_state = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
-    lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
@@ -352,7 +337,10 @@ while True:
     # -------------------------------------------------------------------------
 
     # State
-    step += 1
+    training_progress.complete_update(processed_state)
+    step = training_progress.step
+    progress = training_progress.fraction
+    current_epoch = training_progress.epoch
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss

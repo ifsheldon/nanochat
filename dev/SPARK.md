@@ -27,8 +27,8 @@ Set `NANOCHAT_BASE_DIR` to use another artifact directory.
 | Command | Work |
 | --- | --- |
 | `bash runs/runspark.sh prepare` | Install locked GPU and development dependencies, verify CUDA, download eight ClimbMix training shards plus validation, train the 32,768-token tokenizer on up to two billion characters, evaluate tokenization. |
-| `bash runs/runspark.sh smoke` | Pretrain for 20 steps, save and reload, evaluate bits per byte and a small CORE sample, fine-tune with a 20-batch budget, then exercise chat inference. |
-| `bash runs/runspark.sh demo` | Pretrain for 5,000 steps, evaluate, fine-tune with a 1,500-batch budget, then run a chat prompt. |
+| `bash runs/runspark.sh smoke` | Pretrain for 20 steps, save and reload, evaluate bits per byte and a small CORE sample, fine-tune for 20 optimizer updates, then exercise chat inference. |
+| `bash runs/runspark.sh demo` | Pretrain for 5,000 steps, evaluate, fine-tune for 1,500 optimizer updates, then run a chat prompt. |
 | `bash runs/runspark.sh sft` | Reuse the demo's pretrained checkpoint and rerun fine-tuning, final ChatCORE sampling, and chat inference. |
 | `bash runs/runspark.sh all` | Run all three stages sequentially, stopping on the first failure. |
 
@@ -47,9 +47,10 @@ If nothing fits a partially filled row, the remainder is padded; if nothing fits
 This follows the packing-time approach discussed in [upstream PR #486](https://github.com/karpathy/nanochat/pull/486), avoiding the bias toward truncated conversations introduced by truncating every conversation before packing.
 Conversations with no supervised target in that usable prefix are excluded and counted as consumed for dataset progress.
 If a rank's entire dataset cycle has no usable targets, the loader raises an error instead of emitting empty training batches or looping indefinitely.
-The standalone loader and its state are in `nanochat/sft_dataloader.py`; the training script retains its existing scheduling and stopping logic.
+The standalone packing loader and its state are in `nanochat/sft_dataloader.py`; optimizer-update progress and learning-rate scheduling are handled by `nanochat/sft_training.py`.
 Truncation can still cut an assistant response, but it is used only when no complete buffered conversation fits an empty row.
-The upstream SFT loop prefetches one batch, so `--num-iterations=1500` with this batch configuration currently saves at optimizer step 1,499.
+SFT now counts completed optimizer updates independently of prefetching and gradient accumulation, so `--num-iterations=1500` saves at optimizer step 1,500.
+The historical measurements below predate this progress fix and therefore record 1,499 updates for the earlier demo.
 These small evaluation samples validate the workflow; they are not comparable to full benchmark scores.
 Weights & Biases logging is disabled with `--run=dummy`.
 Initial PyTorch/Triton compilation can take substantially longer than subsequent steps.

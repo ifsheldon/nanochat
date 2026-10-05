@@ -180,6 +180,10 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if device_type == "mps":
         assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
 
+    if device_type == "cuda":
+        from nanochat.training_runtime import configure_cuda_memory
+        configure_cuda_memory(torch.device("cuda", get_dist_info()[2]))
+
     # Reproducibility
     # Note that we set the global seeds here, but most of the code uses explicit rng objects.
     # The only place where global rng might be used is nn.Module initialization of the model weights.

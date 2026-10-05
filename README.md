@@ -118,6 +118,17 @@ Examples without assistant targets inside the context window are excluded and co
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
 
+## Training resource limits and checkpoint recovery
+
+Set `NANOCHAT_CUDA_MEMORY_LIMIT_GB` to cap PyTorch's CUDA allocator in decimal GB; CPU and external CUDA allocations are additional overhead.
+`NANOCHAT_MIN_SYSTEM_AVAILABLE_GB` stops training at an update boundary when available system memory is below the configured minimum, and non-finite losses abort before an optimizer update.
+Set `NANOCHAT_ATTENTION_IMPL=sdpa` to bypass remote FA3 discovery; the default `auto` retains automatic detection.
+
+Checkpoint files are written through temporary files, with metadata published last; checkpoint selection ignores unpublished steps.
+`NANOCHAT_CHECKPOINT_RESERVE_GB` reserves free disk space in addition to the estimated checkpoint size.
+Pretraining's `--stop-after-step=N` saves and stops at a completed update while preserving the original training horizon; resume with `--resume-from-step=N` and the original training configuration, omitting the stop flag.
+Data resumption retains the upstream approximate row-group behavior.
+
 ## Precision / dtype
 
 nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:

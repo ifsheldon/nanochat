@@ -5,6 +5,9 @@ import os
 import re
 import json
 import logging
+import shutil
+import tempfile
+from pathlib import Path
 import torch
 
 from nanochat.common import get_base_dir
@@ -38,26 +41,83 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
+def _atomic_write(path, write):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    try:
+        write(temporary)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _tensor_bytes(value):
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, dict):
+        return sum(_tensor_bytes(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_bytes(v) for v in value)
+    return 0
+
+
+def checkpoint_is_complete(checkpoint_dir, step, load_optimizer=False, rank=0):
+    root = Path(checkpoint_dir)
+    try:
+        with (root / f"meta_{step:06d}.json").open() as f:
+            meta = json.load(f)
+        if meta["step"] != step:
+            return False
+    except (OSError, ValueError, KeyError):
+        return False
+    names = [f"model_{step:06d}.pt"]
+    if load_optimizer:
+        names.append(f"optim_{step:06d}_rank{rank}.pt")
+    return all((root / name).is_file() and (root / name).stat().st_size > 0 for name in names)
+
+
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    root = Path(checkpoint_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    meta_path = root / f"meta_{step:06d}.json"
+    error = None
+    try:
+        reserve = os.environ.get("NANOCHAT_CHECKPOINT_RESERVE_GB")
+        if reserve is not None:
+            from nanochat.training_runtime import positive_gb
+            required = positive_gb(reserve, "NANOCHAT_CHECKPOINT_RESERVE_GB")
+            required += 1.05 * (_tensor_bytes(model_data) + _tensor_bytes(optimizer_data))
+            if shutil.disk_usage(root).free < required:
+                raise OSError("Insufficient disk space for checkpoint and configured free-space reserve")
+        if rank == 0:
+            # Metadata is the publication record; invalidate it before replacing files.
+            meta_path.unlink(missing_ok=True)
+            model_path = root / f"model_{step:06d}.pt"
+            _atomic_write(model_path, lambda name: torch.save(model_data, name))
+        if optimizer_data is not None:
+            optimizer_path = root / f"optim_{step:06d}_rank{rank}.pt"
+            _atomic_write(optimizer_path, lambda name: torch.save(optimizer_data, name))
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    if torch.distributed.is_initialized():
+        errors = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(errors, error)
+        error = next((item for item in errors if item is not None), None)
+    if error is not None:
+        raise RuntimeError(f"Checkpoint {step} was not published: {error}")
     if rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        # Save the model state parameters
-        model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        torch.save(model_data, model_path)
-        logger.info(f"Saved model parameters to: {model_path}")
-        # Save the metadata dict as json
-        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2)
-        logger.info(f"Saved metadata to: {meta_path}")
-    # Note that optimizer state is sharded across ranks, so each rank must save its own.
-    if optimizer_data is not None:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        torch.save(optimizer_data, optimizer_path)
-        logger.info(f"Saved optimizer state to: {optimizer_path}")
+        def write_meta(name):
+            with open(name, "w", encoding="utf-8") as f:
+                json.dump(meta_data, f, indent=2)
+        _atomic_write(meta_path, write_meta)
+        logger.info(f"Published complete checkpoint at step {step}: {root}")
+
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+    if not checkpoint_is_complete(checkpoint_dir, step, load_optimizer, rank):
+        raise FileNotFoundError(f"Incomplete checkpoint at step {step}: {checkpoint_dir}")
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     model_data = torch.load(model_path, map_location=device)
@@ -134,13 +194,14 @@ def find_largest_model(checkpoints_dir):
     return model_tags[0]
 
 
-def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
-    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if re.search(r'model_(\d+)\.pt$', f)]
-    if not checkpoint_files:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    last_step = max(int(f.split("_")[-1].split(".")[0]) for f in checkpoint_files)
-    return last_step
+def find_last_step(checkpoint_dir, load_optimizer=False):
+    steps = [int(path.stem.split("_")[-1]) for path in Path(checkpoint_dir).glob("meta_*.json")
+             if re.fullmatch(r"meta_\d+", path.stem)]
+    complete = [step for step in steps if checkpoint_is_complete(checkpoint_dir, step, load_optimizer)]
+    if not complete:
+        raise FileNotFoundError(f"No complete checkpoints found in {checkpoint_dir}")
+    return max(complete)
+
 
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure

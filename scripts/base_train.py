@@ -32,6 +32,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from nanochat.training_runtime import check_training_memory, require_finite_loss
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
@@ -77,6 +78,7 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--stop-after-step", type=int, default=-1, help="save and pause at this completed update without changing the training horizon")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -414,6 +416,8 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Go!
 while True:
+    check_training_memory(device, step)
+    pausing = args.stop_after_step > 0 and step >= args.stop_after_step
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -474,7 +478,7 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    if pausing or last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -499,7 +503,7 @@ while True:
         )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
-    if last_step:
+    if last_step or pausing:
         break
 
     # -------------------------------------------------------------------------
@@ -509,6 +513,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
+        require_finite_loss(loss, step)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:

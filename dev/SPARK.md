@@ -1,5 +1,72 @@
 # DGX Spark small experiments
 
+## Current status — October 5, 2026
+
+The six-layer experiments below are complete, and the subsequent [d24 training pipeline](SPARK_D24.md) has completed pretraining and SFT.
+The d24 run remains intentionally paused at final chat evaluation following the user's September 15 request to free the GPU.
+No nanochat training or evaluation process was running when this status was checked.
+Do not resume GPU work until the user requests it.
+
+| Result | Saved value |
+| --- | --- |
+| Base checkpoint | Step 5,568; 5,838,471,168 training tokens; validation BPB 0.690965 |
+| SFT checkpoint | Step 574; validation BPB 0.271158 |
+| Full base CORE | 0.253972, below the GPT-2 target of 0.256525; target not met |
+| ARC-Easy | 64.18% |
+| ARC-Challenge | 48.12% |
+| MMLU | 37.09% |
+| GSM8K | 12.28% |
+| HumanEval | Interrupted; no completed score |
+
+The base and SFT BPB values measure different datasets and are not directly comparable.
+Both final model and optimizer checkpoints are present under `~/.cache/nanochat/spark-d24`, using tag `spark-d24-bf16`.
+Training does not need to be repeated to finish evaluation.
+`report.json` is not present because HumanEval and the aggregate final report remain unfinished.
+
+## Handoff to another agent
+
+Work in `/home/maplespark/code/nanochat` on branch `spark` and read [the d24 workflow](SPARK_D24.md) before acting.
+Use the locked uv environment, BF16, SDPA, and the 80,000,000,000-byte CUDA allocator limit; CPU and external CUDA allocations are additional overhead.
+The active artifact root is `/home/maplespark/.cache/nanochat/spark-d24`; `/home/maplespark/.cache/nanochat/spark` contains the earlier small experiments.
+Artifacts and checkpoints are local cache files, not part of Git, and must be preserved separately when moving to another machine.
+
+Read these files to recover the authoritative run state:
+
+- `status.json` and `pause.json`: intentional pause, completed stages, and remaining task.
+- `base-results.json` and `base_eval/base_model_005568.csv`: full CORE results and the unmet capability target.
+- `chat-results.json`: the four completed chat-task scores listed above.
+- `base_checkpoints/spark-d24-bf16/meta_005568.json` and `chatsft_checkpoints/spark-d24-bf16/meta_000574.json`: final training metadata, alongside model and optimizer files.
+- `production-console.log` and `logs/20260915-203649-615938/05-scripts.chat_eval.log`: pipeline output and the interrupted HumanEval invocation.
+- `validated.json` and `data-inventory.json`: batch 16, 32-way accumulation, measured CUDA peak of 63.145 GB, source fingerprint, and tokenizer/data checksums.
+
+Once the user requests resumption, restart only HumanEval from SFT step 574.
+HumanEval has no per-example resume, so restart that task from its beginning; its interrupted partial count is not a final score.
+The generic `runs/runspark_d24.sh chat-eval` stage starts all five tasks again and rewrites `chat-results.json` as it goes, so do not use it to resume this partial evaluation.
+Use a new timestamped log for this command:
+
+```bash
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_CUDA_MEMORY_LIMIT_GB=80 NANOCHAT_DTYPE=bfloat16 \
+NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 \
+uv run --no-sync python -m scripts.chat_eval \
+    --device-type=cuda --source=sft --model-tag=spark-d24-bf16 \
+    --step=574 --task-name=HumanEval --batch-size=8 \
+    --temperature=0 --num-samples=1 --max-new-tokens=512
+```
+
+After successful completion, preserve the four existing scores and merge the final HumanEval accuracy into `chat-results.json`.
+Assemble `report.json` using the fields and calculation in `Pipeline.chat_eval` in `scripts/spark_d24.py`: average `(accuracy - 0.25) / 0.75` for the three categorical tasks together with raw GSM8K and HumanEval accuracy.
+Retain `gpt2_target_met=false`, add the base/SFT checkpoint paths and steps, and include the interactive chat command.
+Mark `status.json` completed only after all results and the final report are saved; retain the historical pause record.
+Do not automatically extend training to chase the CORE target.
+
+The runner rejects fresh production overwrites and checks its source/dependency fingerprint before pretraining resume.
+A Git commit alone does not alter that fingerprint, but source or dependency edits do; do not bypass this check if a future training run is requested.
+Pretraining uses approximate row-group data resumption, and exact SFT mid-epoch resumption is not implemented.
+Verify changes with `OMP_NUM_THREADS=1 uv run --no-sync python -m pytest -q`, `uv lock --check`, shell syntax checks, and `git diff --check` before committing.
+
+## Small experiment workflow
+
 Run the existing six-layer demo from `runs/runcpu.sh` on the Spark's single CUDA GPU with `runs/runspark.sh`.
 The runner uses PyTorch 2.14.0 from the official stable CUDA 13.2 wheel index, with Triton 3.8.0 and locked dependencies.
 It requires `uv`, a C compiler for PyTorch compilation, and a working NVIDIA driver.
@@ -39,7 +106,7 @@ Re-running training with the same tag writes to the same checkpoint directory; u
 
 The demo preserves the upstream six-layer architecture, 512-token context, 32 sequences per batch, 16,384 tokens per optimizer step, and training horizons.
 It uses BF16 as detected by nanochat and full-context attention (`--window-pattern=L`), which supports the existing PyTorch SDPA path when Flash Attention 3 is unavailable.
-No matching FA3 hub build is available for the installed PyTorch 2.14/cu132 stack, so the original attention detection selects SDPA and passes GPU forward/backward checks.
+During the September 5 validation, no matching FA3 hub build was available for the installed PyTorch 2.14/cu132 stack, so the original attention detection selected SDPA and passed GPU forward/backward checks.
 The extra FA3 architecture guard used during the PyTorch 2.9.1 experiments has been removed.
 It adds pretraining checkpoints every 1,000 steps and limits ChatCORE to the final SFT step with 16 examples per categorical task and four per generative task.
 SFT packing preserves full tokenized conversation lengths and selects the longest complete conversation that fits the remaining row space.

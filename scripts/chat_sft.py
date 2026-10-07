@@ -24,7 +24,7 @@ from nanochat.sft_dataloader import sft_data_loader_bos_bestfit
 from nanochat.sft_training import SFTProgress, sft_lr_multiplier
 from nanochat.training_runtime import check_training_memory, require_finite_loss
 import torch.distributed as dist
-from nanochat.flash_attention import HAS_FA3
+from nanochat.flash_attention import ATTENTION_BACKEND
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
@@ -90,8 +90,7 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
 # Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+print0(f"Attention backend: {ATTENTION_BACKEND.value}")
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)

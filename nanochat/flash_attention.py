@@ -1,8 +1,8 @@
 """
-Unified Flash Attention interface with automatic FA3/SDPA switching.
+Unified attention interface with automatic FA3/SDPA selection and opt-in FA4.
 
-Exports `flash_attn` module that matches the FA3 API exactly, but falls back
-to PyTorch SDPA on incompatible CUDA GPUs, MPS, and CPU.
+Set NANOCHAT_ATTENTION_IMPL=fa4 to require the separately installed FA4 backend.
+The default auto selection uses FA3 when available and PyTorch SDPA otherwise.
 
 Usage (drop-in replacement for FA3):
     from nanochat.flash_attention import flash_attn
@@ -13,28 +13,40 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+from enum import Enum
+import importlib
 import os
+from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
 
 # =============================================================================
-# Detection: Try to load FA3 on CUDA GPUs
+# Backend selection
 # =============================================================================
+class AttentionBackend(str, Enum):
+    SDPA = "sdpa"
+    FA3 = "fa3"
+    FA4 = "fa4"
+
+
 try:
-    _force_sdpa = {"auto": False, "sdpa": True}[os.environ.get("NANOCHAT_ATTENTION_IMPL", "auto")]
+    _requested_backend = {
+        "auto": None,
+        "sdpa": AttentionBackend.SDPA,
+        "fa4": AttentionBackend.FA4,
+    }[os.environ.get("NANOCHAT_ATTENTION_IMPL", "auto")]
 except KeyError as exc:
-    raise ValueError("NANOCHAT_ATTENTION_IMPL must be 'auto' or 'sdpa'") from exc
+    raise ValueError("NANOCHAT_ATTENTION_IMPL must be 'auto', 'sdpa', or 'fa4'") from exc
 
 
 def _load_flash_attention_3():
     """Try to load Flash Attention 3."""
-    if _force_sdpa or not torch.cuda.is_available():
+    if _requested_backend is not None or not torch.cuda.is_available():
         return None
     try:
         major, _ = torch.cuda.get_device_capability()
-        # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
-        # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
+        # Preserve the existing automatic FA3 discovery. FA4 requires explicit opt-in.
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel, has_kernel
         # The varunneal kernel obtains better results for H100/Hopper
@@ -52,29 +64,58 @@ def _load_flash_attention_3():
         return None
 
 
+def _load_flash_attention_4():
+    """Load an explicitly requested FA4 backend, failing instead of falling back."""
+    from nanochat.common import COMPUTE_DTYPE
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("NANOCHAT_ATTENTION_IMPL=fa4 requires a CUDA GPU")
+    major, minor = torch.cuda.get_device_capability()
+    # The pinned FA4 release permits SM8 forward, but its backward entry point
+    # accepts only SM9 through SM12. Require a backend suitable for training.
+    if major not in (9, 10, 11, 12):
+        raise RuntimeError(f"FA4 training does not support CUDA compute capability {major}.{minor}")
+    if COMPUTE_DTYPE not in (torch.float16, torch.bfloat16):
+        raise RuntimeError("FA4 requires NANOCHAT_DTYPE=bfloat16 or float16")
+    try:
+        return importlib.import_module("flash_attn.cute")
+    except ImportError as exc:
+        raise RuntimeError(
+            "NANOCHAT_ATTENTION_IMPL=fa4 requires flash-attn-4 and its dependencies; "
+            "install the project's fa4 extra"
+        ) from exc
+
+
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
-
-# Override for testing: set to 'fa3', 'sdpa', or None (auto)
-_override_impl = None
+_fa4 = _load_flash_attention_4() if _requested_backend is AttentionBackend.FA4 else None
 
 
-def _resolve_use_fa3():
-    """Decide once whether to use FA3, based on availability, override, and dtype."""
-    if _override_impl == 'fa3':
-        assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
-        return True
-    if _override_impl == 'sdpa':
-        return False
+def _resolve_backend():
+    """Resolve the configured backend once, before compiling the model."""
+    if _requested_backend is not None:
+        return _requested_backend
     if HAS_FA3:
         # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use SDPA fallback
         from nanochat.common import COMPUTE_DTYPE
         if COMPUTE_DTYPE == torch.bfloat16:
-            return True
-        return False
-    return False
+            return AttentionBackend.FA3
+    return AttentionBackend.SDPA
 
-USE_FA3 = _resolve_use_fa3()
+ATTENTION_BACKEND = _resolve_backend()
+
+
+def _fa4_attention(q, k, v, causal, window_size):
+    """Adapt FA4's unlimited-window markers and (output, LSE) return contract."""
+    left, right = window_size
+    # The largest possible distance to an earlier key is Tk - 1, including
+    # bottom-right aligned queries during cached inference.
+    left = None if left < 0 or left >= k.size(1) - 1 else left
+    right = None if right < 0 else right
+    output, _lse = _fa4.flash_attn_func(
+        q, k, v, causal=causal, window_size=(left, right)
+    )
+    return output
 
 
 # =============================================================================
@@ -130,8 +171,10 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if USE_FA3:
+    if ATTENTION_BACKEND is AttentionBackend.FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    if ATTENTION_BACKEND is AttentionBackend.FA4:
+        return _fa4_attention(q, k, v, causal, window_size)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
@@ -147,7 +190,9 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     """
     Flash Attention with KV cache for inference.
 
-    FA3 updates k_cache/v_cache in-place. Our SDPA fallback does the same.
+    All backends update k_cache/v_cache in-place. FA4 attends to the occupied
+    cache using its dense API, whose causal mask is aligned to the last query.
+    SDPA and FA4 require uniform cache positions, as used by nanochat's KVCache.
 
     Args:
         q: Queries, shape (B, T_new, H, D)
@@ -160,15 +205,33 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if USE_FA3:
+    if ATTENTION_BACKEND is AttentionBackend.FA3:
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size
         )
 
-    # SDPA fallback: manually manage KV cache
-    B, T_new, H, D = q.shape
-    pos = cache_seqlens[0].item()  # assume uniform position across batch
+    # SDPA and FA4 share cache ownership; their attention kernels read only the
+    # occupied prefix. Validate before mutating either cache.
+    B, T_new, _, _ = q.shape
+    if cache_seqlens is None or cache_seqlens.shape != (B,):
+        raise ValueError("cache_seqlens must contain one position per batch item")
+    pos = int(cache_seqlens[0].item())
+    if not torch.all(cache_seqlens == pos).item():
+        raise ValueError("SDPA and FA4 require uniform KV cache positions across the batch")
+    if (k is None) != (v is None):
+        raise ValueError("New KV cache keys and values must be supplied together")
+    if k_cache.shape != v_cache.shape or k_cache.size(0) != B:
+        raise ValueError("Key and value caches must have matching batch and tensor shapes")
+    if k is not None:
+        expected_shape = (B, T_new, k_cache.size(2), k_cache.size(3))
+        if k.shape != expected_shape or v.shape != expected_shape:
+            raise ValueError(f"New KV cache keys and values must have shape {expected_shape}")
+    end_pos = pos + (T_new if k is not None else 0)
+    if pos < 0 or end_pos > k_cache.size(1):
+        raise ValueError("KV cache insertion exceeds the allocated sequence capacity")
+    if T_new > end_pos:
+        raise ValueError("KV cache must contain at least as many keys as query tokens")
 
     # Insert new k, v into cache (in-place, matching FA3 behavior)
     if k is not None and v is not None:
@@ -176,25 +239,14 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
         v_cache[:, pos:pos+T_new, :, :] = v
 
     # Get full cache up to current position + new tokens
-    end_pos = pos + T_new
     k_full = k_cache[:, :end_pos, :, :]
     v_full = v_cache[:, :end_pos, :, :]
-
-    # Transpose to SDPA layout: (B, T, H, D) -> (B, H, T, D)
-    q_sdpa = q.transpose(1, 2)
-    k_sdpa = k_full.transpose(1, 2)
-    v_sdpa = v_full.transpose(1, 2)
-
-    enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
-    y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
-
-    return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
+    return flash_attn_func(q, k_full, v_full, causal=causal, window_size=window_size)
 
 
 # =============================================================================
 # Export: flash_attn module interface (drop-in replacement for FA3)
 # =============================================================================
-from types import SimpleNamespace
 flash_attn = SimpleNamespace(
     flash_attn_func=flash_attn_func,
     flash_attn_with_kvcache=flash_attn_with_kvcache,

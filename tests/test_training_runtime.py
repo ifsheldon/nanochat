@@ -65,7 +65,8 @@ def unexpected(*args):
 fake.get_kernel = fake.has_kernel = unexpected
 sys.modules['kernels'] = fake
 import nanochat.flash_attention as attention
-assert not attention.HAS_FA3 and not attention.USE_FA3
+assert not attention.HAS_FA3
+assert attention.ATTENTION_BACKEND is attention.AttentionBackend.SDPA
 q = torch.randn(1, 4, 2, 8, requires_grad=True)
 attention.flash_attn_func(q, q, q, causal=True).sum().backward()
 assert q.grad.isfinite().all()

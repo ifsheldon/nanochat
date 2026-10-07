@@ -21,9 +21,10 @@ from nanochat.engine import KVCache
 
 
 def set_impl(impl):
-    """Set the implementation override ('fa3', 'sdpa', or None for auto) and re-resolve USE_FA3."""
-    fa_module._override_impl = impl
-    fa_module.USE_FA3 = fa_module._resolve_use_fa3()
+    """Select an available backend, or restore configured backend selection."""
+    fa_module.ATTENTION_BACKEND = (
+        fa_module._resolve_backend() if impl is None else fa_module.AttentionBackend(impl)
+    )
 
 
 def run_both_impls(fn):
@@ -344,19 +345,30 @@ class TestOverrideMechanism:
     def test_override_fa3(self):
         """Test that override='fa3' uses FA3."""
         set_impl('fa3')
-        assert fa_module.USE_FA3 == True
+        assert fa_module.ATTENTION_BACKEND is fa_module.AttentionBackend.FA3
         set_impl(None)
 
     def test_override_sdpa(self):
         """Test that override='sdpa' uses SDPA."""
         set_impl('sdpa')
-        assert fa_module.USE_FA3 == False
+        assert fa_module.ATTENTION_BACKEND is fa_module.AttentionBackend.SDPA
         set_impl(None)
 
-    def test_override_auto(self):
-        """Test that override=None uses auto-detection."""
+    def test_override_auto(self, monkeypatch):
+        """Automatic selection uses FA3 only when the compute dtype supports it."""
+        import nanochat.common as common
+
+        with monkeypatch.context() as patch:
+            patch.setattr(fa_module, "_requested_backend", None)
+            patch.setattr(fa_module, "HAS_FA3", True)
+            patch.setattr(common, "COMPUTE_DTYPE", torch.bfloat16)
+            set_impl('sdpa')
+            set_impl(None)
+            assert fa_module.ATTENTION_BACKEND is fa_module.AttentionBackend.FA3
+            patch.setattr(common, "COMPUTE_DTYPE", torch.float32)
+            set_impl(None)
+            assert fa_module.ATTENTION_BACKEND is fa_module.AttentionBackend.SDPA
         set_impl(None)
-        assert fa_module.USE_FA3 == HAS_FA3
 
 
 if __name__ == "__main__":

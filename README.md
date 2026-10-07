@@ -125,6 +125,9 @@ The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of runni
 Set `NANOCHAT_CUDA_MEMORY_LIMIT_GB` to cap PyTorch's CUDA allocator in decimal GB; CPU and external CUDA allocations are additional overhead.
 `NANOCHAT_MIN_SYSTEM_AVAILABLE_GB` stops training at an update boundary when available system memory is below the configured minimum, and non-finite losses abort before an optimizer update.
 Set `NANOCHAT_ATTENTION_IMPL=sdpa` to bypass remote FA3 discovery; the default `auto` retains automatic detection.
+Install `uv sync --extra gpu --extra fa4` and set `NANOCHAT_ATTENTION_IMPL=fa4` to require Flash Attention 4 for BF16/FP16 attention on a supported CUDA GPU.
+FA4 is explicitly selected and raises an error when unavailable; `auto` continues to select FA3 or SDPA.
+The `--fp8` pretraining option applies to linear layers while attention retains the selected compute dtype.
 
 Checkpoint files are written through temporary files, with metadata published last; checkpoint selection ignores unpublished steps.
 `NANOCHAT_CHECKPOINT_RESERVE_GB` reserves free disk space in addition to the estimated checkpoint size.

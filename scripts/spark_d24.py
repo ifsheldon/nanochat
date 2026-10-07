@@ -183,8 +183,8 @@ class Pipeline:
         self.verify_inventory()
         if (self.root / "validated.json").exists():
             raise FileExistsError("Validation already exists; preserve it or use a new artifact root")
-        from nanochat.flash_attention import USE_FA3
-        if USE_FA3:
+        from nanochat.flash_attention import ATTENTION_BACKEND, AttentionBackend
+        if ATTENTION_BACKEND is not AttentionBackend.SDPA:
             raise RuntimeError("This workflow requires the validated SDPA environment")
         for batch in (16, 8, 4, 2, 1):
             tag = f"validate-d24-b{batch}-{self.log_dir.name}"

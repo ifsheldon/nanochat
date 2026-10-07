@@ -128,11 +128,14 @@ Set `NANOCHAT_ATTENTION_IMPL=sdpa` to bypass remote FA3 discovery; the default `
 Install `uv sync --extra gpu --extra fa4` and set `NANOCHAT_ATTENTION_IMPL=fa4` to require Flash Attention 4 for BF16/FP16 attention on a supported CUDA GPU.
 FA4 is explicitly selected and raises an error when unavailable; `auto` continues to select FA3 or SDPA.
 The `--fp8` pretraining option applies to linear layers while attention retains the selected compute dtype.
+See [the Spark FA4 comparison](dev/SPARK_FA4.md) for the D24 full/sliding-window × SDPA/FA4 × BF16/FP8 benchmark.
 
 Checkpoint files are written through temporary files, with metadata published last; checkpoint selection ignores unpublished steps.
 `NANOCHAT_CHECKPOINT_RESERVE_GB` reserves free disk space in addition to the estimated checkpoint size.
 Pretraining's `--stop-after-step=N` saves and stops at a completed update while preserving the original training horizon; resume with `--resume-from-step=N` and the original training configuration, omitting the stop flag.
 Data resumption retains the upstream approximate row-group behavior.
+Pretraining's `--benchmark-output=PATH` runs one warmup optimizer update and one timed optimizer update with the original training schedule, writes timing/configuration JSON, and exits without evaluation, samples, or checkpoints.
+Benchmark mode requires a fresh single-process run with W&B disabled and a horizon of at least two updates.
 
 ## Precision / dtype
 

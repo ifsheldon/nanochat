@@ -20,6 +20,7 @@ import math
 import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
+from pathlib import Path
 
 import wandb
 import torch
@@ -79,13 +80,23 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 parser.add_argument("--stop-after-step", type=int, default=-1, help="save and pause at this completed update without changing the training horizon")
+parser.add_argument("--benchmark-output", type=Path, help="run one warmup update and one timed update, write JSON here, and exit without evaluation or checkpoints")
 args = parser.parse_args()
+benchmark = args.benchmark_output is not None
+if benchmark:
+    if args.resume_from_step != -1 or args.stop_after_step != -1 or args.run != "dummy":
+        parser.error("--benchmark-output requires a fresh run with --run=dummy and no --stop-after-step")
+    if args.benchmark_output.exists():
+        parser.error("--benchmark-output already exists; choose a new result path")
 user_config = vars(args).copy()  # for logging
+user_config["benchmark_output"] = str(args.benchmark_output) if benchmark else None
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+if benchmark and (ddp_world_size != 1 or (args.fp8 and device_type != "cuda")):
+    raise ValueError("Benchmark mode requires one process, and FP8 requires CUDA")
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -340,6 +351,8 @@ elif args.target_param_data_ratio > 0:
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
+if benchmark and num_iterations < 2:
+    raise ValueError("Benchmark mode needs a training horizon of at least two updates")
 total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
@@ -400,16 +413,21 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+benchmark_timings = []
+if benchmark:
+    print0("Benchmark: one warmup update, then one timed update; training schedule is unchanged.")
 
 # Go!
 while True:
+    if benchmark and step == 2:
+        break
     check_training_memory(device, step)
     pausing = args.stop_after_step > 0 and step >= args.stop_after_step
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    if not benchmark and args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
@@ -430,7 +448,7 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    if not benchmark and args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
@@ -445,7 +463,7 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    if not benchmark and args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -465,7 +483,7 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if pausing or last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    if not benchmark and (pausing or last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0)):
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -496,8 +514,11 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
+    if benchmark and step == 1:
+        from torch._dynamo.utils import counters
+        compile_stats_before = dict(counters["stats"])
     synchronize()
-    t0 = time.time()
+    t0 = time.perf_counter()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         require_finite_loss(loss, step)
@@ -532,8 +553,15 @@ while True:
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
-    t1 = time.time()
+    t1 = time.perf_counter()
     dt = t1 - t0
+    if benchmark:
+        benchmark_timings.append(dt)
+        if step == 1:
+            compile_stats_delta = {
+                key: value - compile_stats_before.get(key, 0)
+                for key, value in counters["stats"].items()
+            }
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -586,6 +614,35 @@ while True:
         gc.collect() # manually collect, just to be safe for very, very long runs
 
 # print a few more stats
+if benchmark:
+    result = {
+        "attention_backend": ATTENTION_BACKEND.value,
+        "compute_dtype": str(COMPUTE_DTYPE),
+        "fp8": args.fp8,
+        "fp8_recipe": args.fp8_recipe if args.fp8 else None,
+        "seed": 42,
+        "model_config": model_config_kwargs,
+        "num_parameters": num_params,
+        "device_batch_size": args.device_batch_size,
+        "tokens_per_update": total_batch_size,
+        "gradient_accumulation_steps": grad_accum_steps,
+        "training_horizon_updates": num_iterations,
+        "completed_updates": step,
+        "timed_update": 2,
+        "warmup_update_seconds": benchmark_timings[0],
+        "measured_update_seconds": benchmark_timings[1],
+        "tokens_per_second": total_batch_size / benchmark_timings[1],
+        "learning_rate_multiplier": lrm,
+        "loss": train_loss_f,
+        "compile_stats_delta": compile_stats_delta,
+        "cuda_peak_allocated_gb": get_max_memory() / 1e9,
+        "cuda_peak_reserved_gb": torch.cuda.max_memory_reserved(device) / 1e9 if device_type == "cuda" else 0,
+    }
+    args.benchmark_output.parent.mkdir(parents=True, exist_ok=True)
+    with args.benchmark_output.open("x") as output:
+        json.dump(result, output, indent=2)
+        output.write("\n")
+    print0(f"Timed update: {benchmark_timings[1]:.3f}s; result: {args.benchmark_output}")
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:

@@ -11,6 +11,7 @@ Run commands from the repository root on the `spark` branch.
 The locked environment uses PyTorch 2.14.0+cu132 and Triton 3.8.0.
 Training uses BF16 compute, existing parameter/optimizer precision, 24 layers, width 1536, 12 heads, 2048-token context, and full-context SDPA.
 The runner sets `NANOCHAT_ATTENTION_IMPL=sdpa` to bypass remote FA3 kernel discovery throughout the run; the default `auto` retains upstream detection for other workflows.
+The separate [FA4 benchmark workflow](SPARK_FA4.md) compares alternative attention and linear precision settings without resuming this production run.
 The tokenizer is copied from the validated small Spark experiment, without retraining.
 The global batch is 1,048,576 tokens, the target tokens-to-scaling-parameters ratio is 8, and the production horizon is 5,568 optimizer updates, or 5,838,471,168 tokens.
 Initial device batch 16 requires 32 accumulation microbatches per update.

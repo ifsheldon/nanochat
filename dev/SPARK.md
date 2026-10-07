@@ -5,7 +5,8 @@
 The six-layer experiments below are complete, and the subsequent [d24 training pipeline](SPARK_D24.md) has completed pretraining and SFT.
 The d24 run remains intentionally paused at final chat evaluation following the user's September 15 request to free the GPU.
 No nanochat training or evaluation process was running when this status was checked.
-Do not resume GPU work until the user requests it.
+Do not resume this production run's training or final evaluation until the user requests it.
+The separately authorized October 8 [FA4 training comparison](SPARK_FA4.md) is complete; it used fresh models and left these checkpoints and evaluation results untouched.
 
 | Result | Saved value |
 | --- | --- |

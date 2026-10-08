@@ -81,12 +81,16 @@ The learning-rate schedule uses progress before the current update and is bounde
 Checkpoint tensors are written to temporary files and renamed, with metadata published last after all ranks finish their tensor files.
 Automatic selection requires published metadata and the required tensor files; the d24 runner additionally requires the optimizer checkpoint and passes explicit steps to every load.
 An interrupted save does not publish its step.
-All checkpoints for this run are retained, and validation verifies their projected disk footprint plus the free-space reserve.
+The runner retains every checkpoint during training, and validation verifies their projected disk footprint plus the free-space reserve.
+The approved manual cleanup on October 8, 2026 retained complete d24 base checkpoints 5500 and 5568 and final SFT checkpoint 574, removing base checkpoints 100 through 5400 and the obsolete validation checkpoint fixtures.
+Combined with the old smoke, profiling, and RLM CPU-test checkpoints, this removed 68 checkpoint sets and reclaimed 573.15 GB; the six-update RLM pilot and D6 research/demo checkpoints remain.
+Run logs, evaluation results, source snapshots, and dataset/tokenizer caches were preserved, with removed checkpoint metadata archived in `~/.cache/nanochat/checkpoint-cleanup-20261008T143350Z/deleted-checkpoint-metadata.json`.
+The exact deletion manifest, retained-file verification, and disk-space measurements are in that directory's `plan.json` and `result.json`.
 
-To resume pretraining, substitute a completed checkpoint step:
+To resume an interrupted pretraining run, substitute a retained complete checkpoint step:
 
 ```bash
-bash runs/runspark_d24.sh pretrain --resume-from-step=100
+bash runs/runspark_d24.sh pretrain --resume-from-step=5500
 ```
 
 Resume requires matching architecture, batch configuration, horizon, tokenizer, and ordered data inventory.

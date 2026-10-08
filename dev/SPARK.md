@@ -20,6 +20,8 @@ Do not resume GPU work until the user requests it.
 
 The base and SFT BPB values measure different datasets and are not directly comparable.
 Both final model and optimizer checkpoints are present under `~/.cache/nanochat/spark-d24`, using tag `spark-d24-bf16`.
+The approved October 8 checkpoint cleanup also retained base step 5500; earlier d24 base steps and obsolete validation, smoke, profiling, and RLM CPU-test checkpoint files were removed, reclaiming 573.15 GB across 68 sets.
+Research/demo checkpoints, including the six-update RLM pilot, and all run logs, metrics, source snapshots, and dataset/tokenizer caches remain; the deletion receipt and archived checkpoint metadata are under `~/.cache/nanochat/checkpoint-cleanup-20261008T143350Z`.
 Training does not need to be repeated to finish evaluation.
 `report.json` is not present because HumanEval and the aggregate final report remain unfinished.
 

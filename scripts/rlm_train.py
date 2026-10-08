@@ -1,0 +1,304 @@
+"""Train or measure recurrent latent memory with explicit text-token budgets.
+
+Use NANOCHAT_BASE_DIR for the existing tokenizer/data cache and --output-dir
+for a new, independent run. See dev/SPARK_RLM.md for commands and contracts.
+"""
+
+import argparse
+from dataclasses import asdict
+from datetime import datetime, timezone
+import hashlib
+from importlib.metadata import PackageNotFoundError, version
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--mode", choices=("probe", "train"), default="probe")
+    parser.add_argument("--device-type", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--depth", type=int, default=24)
+    parser.add_argument("--width", type=int, default=None, help="default: depth * 64, rounded to head dimension")
+    parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--text-length", type=int, default=1023)
+    parser.add_argument("--memory-tokens", type=int, default=512)
+    parser.add_argument("--cycles", type=int, default=2)
+    parser.add_argument("--device-batch-size", type=int, default=16)
+    parser.add_argument("--total-batch-size", type=int, default=1_047_552, help="real text targets per optimizer update; EOM adds one prediction per cycle")
+    parser.add_argument("--num-iterations", type=int, default=None, help="required for training; probe defaults to two updates")
+    parser.add_argument("--warmup-steps", type=int, default=40)
+    parser.add_argument("--warmdown-ratio", type=float, default=0.65)
+    parser.add_argument("--final-lr-frac", type=float, default=0.05)
+    parser.add_argument("--embedding-lr", type=float, default=0.3)
+    parser.add_argument("--unembedding-lr", type=float, default=0.008)
+    parser.add_argument("--matrix-lr", type=float, default=0.02)
+    parser.add_argument("--scalar-lr", type=float, default=0.5)
+    parser.add_argument("--weight-decay", type=float, default=0.28)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument("--save-every", type=int, default=0, help="training only; zero saves only the final/paused update")
+    parser.add_argument("--resume-from-step", type=int, default=None)
+    parser.add_argument("--stop-after-step", type=int, default=None, help="save and stop at a completed update without changing schedule")
+    args = parser.parse_args()
+    if args.num_iterations is None:
+        if args.mode == "train":
+            parser.error("training requires an explicit --num-iterations budget")
+        args.num_iterations = 2
+    if args.mode == "probe" and (args.num_iterations < 2 or args.resume_from_step is not None
+                                  or args.stop_after_step is not None or args.save_every):
+        parser.error("probe requires at least two updates, with no resume, early stop, or checkpoint saving")
+    if args.save_every < 0:
+        parser.error("--save-every cannot be negative")
+    if args.resume_from_step is not None and args.resume_from_step <= 0:
+        parser.error("--resume-from-step must name a completed positive optimizer update")
+    if args.stop_after_step is not None and not 0 < args.stop_after_step <= args.num_iterations:
+        parser.error("--stop-after-step must be within the configured training horizon")
+    if args.depth <= 0 or args.head_dim <= 0 or args.head_dim % 2:
+        parser.error("depth must be positive and head dimension must be positive and even")
+    if args.text_length <= 0 or args.memory_tokens <= 0:
+        parser.error("text length and memory token count must be positive")
+    if args.width is None:
+        args.width = ((args.depth * 64 + args.head_dim - 1) // args.head_dim) * args.head_dim
+    if args.width < 24 or args.width % args.head_dim:
+        parser.error("width must be at least 24 and compatible with the attention head dimension")
+    return args
+
+
+def dataset_inventory():
+    from nanochat.dataset import list_parquet_files
+    entries = []
+    paths = [Path(path) for path in list_parquet_files()]
+    if len(paths) < 2:
+        raise ValueError("RLM training requires at least one training shard and one validation shard")
+    for path in paths:
+        if not path.is_file():
+            raise ValueError(f"Dataset shard is not a regular file: {path}")
+        stat = path.stat()
+        entries.append({"path": str(path.resolve()), "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    digest = hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
+    return {"sha256": digest, "files": entries, "identity": "ordered_paths_sizes_and_mtimes"}
+
+
+def run(args, attempt):
+    import torch
+    from nanochat.checkpoint_manager import load_checkpoint, save_checkpoint
+    from nanochat.common import COMPUTE_DTYPE, compute_init, get_base_dir
+    from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
+    from nanochat.rlm import RecurrentGPT, RLMConfig
+    from nanochat.rlm_training import (
+        TrainingConfig, apply_schedule, build_optimizer, checkpoint_metadata,
+        cuda_metrics, file_digest, measured_update, MemoryMonitor,
+        require_latest_resume_checkpoint, restore_rng,
+        source_manifest, synchronize, write_json,
+    )
+    from nanochat.tokenizer import get_tokenizer
+    from nanochat.training_runtime import check_training_memory
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        raise ValueError("The initial RLM workflow supports one device per run")
+    if COMPUTE_DTYPE not in (torch.bfloat16, torch.float32):
+        raise ValueError("RLM training supports BF16 or FP32 compute; FP16 needs a separate scaling policy")
+    _, _, _, _, device = compute_init(args.device_type)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed(args.seed)
+    check_training_memory(device, 0)
+    config = TrainingConfig(**{name: getattr(args, name) for name in TrainingConfig.__dataclass_fields__})
+    accumulation = config.accumulation_steps(args.text_length)
+    tokenizer_path = Path(get_base_dir()) / "tokenizer" / "tokenizer.pkl"
+    tokenizer_sha256 = file_digest(tokenizer_path)
+    tokenizer = get_tokenizer()
+    model_config = RLMConfig(
+        sequence_len=args.text_length + 1 + 2 * args.memory_tokens,
+        vocab_size=tokenizer.get_vocab_size(), n_layer=args.depth,
+        n_head=args.width // args.head_dim, n_kv_head=args.width // args.head_dim,
+        n_embd=args.width, window_pattern="L", text_length=args.text_length,
+        memory_tokens=args.memory_tokens, activation_checkpointing=args.activation_checkpointing,
+    )
+    source = source_manifest(Path(__file__).resolve().parents[1])
+    inventory = dataset_inventory()
+    try:
+        triton_version = version("triton")
+    except PackageNotFoundError:
+        triton_version = None
+    contract = {
+        "model_config": asdict(model_config), "training_config": asdict(config),
+        "source_sha256": source["sha256"], "tokenizer_sha256": tokenizer_sha256,
+        "data_inventory_sha256": inventory["sha256"], "compute_dtype": str(COMPUTE_DTYPE),
+        "device_type": device.type, "attention_impl": "sdpa",
+        "runtime": {
+            "python": sys.version.split()[0], "torch": torch.__version__,
+            "cuda": torch.version.cuda, "triton": triton_version,
+        },
+    }
+    write_json(attempt / "source.json", source)
+    write_json(attempt / "data-inventory.json", inventory)
+    repo = Path(__file__).resolve().parents[1]
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+    diff = subprocess.run(["git", "diff", "HEAD", "--", "nanochat", "scripts/rlm_train.py"], cwd=repo, text=True, capture_output=True, check=True).stdout
+    (attempt / "tracked-source.diff").write_text(diff)
+    # Capture actual source bytes, including new untracked modules.
+    for name in source["files"]:
+        target = attempt / "source" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((repo / name).read_bytes())
+    write_json(attempt / "invocation.json", {
+        "argv": sys.argv, "revision": revision, "contract": contract,
+        "mode": args.mode, "torch_version": torch.__version__,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    })
+    print(json.dumps({
+        "configuration": contract, "accumulation_steps": accumulation,
+        "cycle_lengths": [args.text_length + 1 + args.memory_tokens]
+        + [args.text_length + 1 + 2 * args.memory_tokens] * (args.cycles - 2)
+        + [args.text_length + 1 + args.memory_tokens],
+        "prediction_targets_per_update": config.prediction_targets_per_update(args.text_length),
+    }), flush=True)
+
+    checkpoint_dir = args.output_dir / "checkpoints"
+    metadata = None
+    optimizer_data = None
+    model_data = None
+    step = 0
+    if args.resume_from_step is not None:
+        require_latest_resume_checkpoint(checkpoint_dir, args.resume_from_step)
+        model_data, optimizer_data, metadata = load_checkpoint(
+            checkpoint_dir, args.resume_from_step, device, load_optimizer=True,
+        )
+        if metadata.get("model_type") != "rlm" or metadata.get("run_contract") != contract:
+            raise ValueError("Resume requires matching RLM model, training budget, source, data, tokenizer, and precision")
+        step = metadata["step"]
+        endpoint = args.stop_after_step or args.num_iterations
+        if step >= endpoint:
+            raise ValueError("Resume must continue beyond the checkpoint's completed update")
+    else:
+        write_json(args.output_dir / "run.json", {"contract": contract, "revision": revision, "mode": args.mode})
+    with torch.device("meta"):
+        model = RecurrentGPT(model_config)
+    model.to_empty(device=device)
+    model.init_weights()
+    if model_data is not None:
+        model.load_state_dict(model_data, strict=True, assign=True)
+        del model_data
+    model.train()
+    optimizer, decay = build_optimizer(model, config)
+    parameter_counts = model.num_scaling_params()
+    print(json.dumps({"parameter_counts": parameter_counts}), flush=True)
+    if optimizer_data is not None:
+        optimizer.load_state_dict(optimizer_data)
+        del optimizer_data
+        restore_rng(metadata["rng_state"], device)
+    forward_cycle = torch.compile(model.forward_cycle, dynamic=False) if args.compile else model.forward_cycle
+    loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer, args.device_batch_size, args.cycles * args.text_length,
+        split="train", device=device.type,
+        resume_state_dict=None if metadata is None else metadata["dataloader_state_dict"],
+    )
+    setup_metrics = cuda_metrics(device)
+    updates = []
+    checkpoint_measurements = []
+    endpoint = args.stop_after_step or args.num_iterations
+    metrics_path = attempt / "updates.jsonl"
+    while step < endpoint:
+        check_training_memory(device, step)
+        lrm = apply_schedule(optimizer, config, step, decay)
+        metrics, loader_state = measured_update(
+            model, forward_cycle, optimizer, loader, config, step, tokenizer.get_bos_token_id(),
+            os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB"),
+            failure_path=attempt / "failed-update.json",
+        )
+        step += 1
+        metrics["lr_multiplier"] = lrm
+        updates.append(metrics)
+        with metrics_path.open("a") as stream:
+            stream.write(json.dumps(metrics, allow_nan=False) + "\n")
+            stream.flush()
+        print(json.dumps(metrics), flush=True)
+        if args.mode == "train" and (step == endpoint or (args.save_every and step % args.save_every == 0)):
+            synchronize(device)
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            saving_started = time.monotonic()
+            with MemoryMonitor(os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB")) as monitor:
+                monitor.require_available(step)
+                save_checkpoint(
+                    checkpoint_dir, step, model.state_dict(), optimizer.state_dict(),
+                    checkpoint_metadata(model, config, step, loader_state, contract),
+                )
+                synchronize(device)
+                monitor.require_available(step)
+            checkpoint_measurements.append({
+                "step": step, "duration_seconds": time.monotonic() - saving_started,
+                "minimum_system_available_gb": monitor.minimum_observed / 1e9,
+                **cuda_metrics(device),
+            })
+            write_json(attempt / "checkpoint-measurements.json", checkpoint_measurements)
+    measurements = updates + checkpoint_measurements
+    training_peak_reserved = max([setup_metrics["cuda_peak_reserved_gb"]] + [item["cuda_peak_reserved_gb"] for item in updates])
+    peak_reserved = max([setup_metrics["cuda_peak_reserved_gb"]] + [item["cuda_peak_reserved_gb"] for item in measurements])
+    peak_allocated = max([setup_metrics["cuda_peak_allocated_gb"]] + [item["cuda_peak_allocated_gb"] for item in measurements])
+    report = {
+        "status": "completed" if step == args.num_iterations else "paused",
+        "mode": args.mode, "completed_updates": step, "attempt_updates": len(updates),
+        "parameter_counts": parameter_counts,
+        "text_tokens": step * config.total_batch_size,
+        "supervised_tokens": step * config.prediction_targets_per_update(args.text_length),
+        "peak_cuda_reserved_gb": peak_reserved, "peak_cuda_allocated_gb": peak_allocated,
+        "minimum_system_available_gb": min(item["minimum_system_available_gb"] for item in measurements),
+        "within_72gb_training_reserve_target": training_peak_reserved <= 72 if device.type == "cuda" else None,
+        "evaluation_overhead_measured": False,
+        "checkpoint_overhead_measured": bool(checkpoint_measurements),
+        "checkpoint_measurements": checkpoint_measurements,
+        "checkpoint_dir": str(checkpoint_dir) if args.mode == "train" else None,
+        "setup_memory": setup_metrics, "updates": updates,
+    }
+    write_json(attempt / "result.json", report)
+    write_json(args.output_dir / "result.json", report)
+    print(json.dumps({"result": str(attempt / "result.json"), "status": report["status"]}), flush=True)
+
+
+def main():
+    args = parse_args()
+    os.environ["NANOCHAT_ATTENTION_IMPL"] = "sdpa"
+    os.environ.setdefault("NANOCHAT_DTYPE", "bfloat16" if args.device_type == "cuda" else "float32")
+    os.environ.setdefault("NANOCHAT_CUDA_MEMORY_LIMIT_GB", "80")
+    os.environ.setdefault("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB", "16")
+    os.environ.setdefault("NANOCHAT_CHECKPOINT_RESERVE_GB", "100")
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    args.output_dir = args.output_dir.expanduser().absolute()
+    if args.output_dir.is_symlink():
+        raise ValueError("Run output must be an owned directory, not a symlink")
+    if args.resume_from_step is None:
+        args.output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+    elif not (args.output_dir / "run.json").is_file():
+        raise ValueError("Resume requires an existing RLM run directory")
+    from filelock import FileLock
+    from nanochat.rlm_training import validate_run_directory, write_json
+    validate_run_directory(args.output_dir)
+    with FileLock(args.output_dir / ".run.lock", timeout=0):
+        attempt = args.output_dir / "attempts" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        attempt.mkdir(parents=True)
+        try:
+            run(args, attempt)
+        except BaseException as exc:
+            import torch
+            from nanochat.rlm_training import cuda_metrics
+            device = torch.device(args.device_type)
+            status = {
+                "status": "failed", "error_type": type(exc).__name__, "error": str(exc),
+                "memory": cuda_metrics(device) if device.type == "cpu" or torch.cuda.is_initialized() else {},
+            }
+            write_json(attempt / "failure.json", status)
+            write_json(args.output_dir / "result.json", status)
+            raise
+
+
+if __name__ == "__main__":
+    main()

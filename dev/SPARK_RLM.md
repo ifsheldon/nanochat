@@ -1,6 +1,8 @@
 # Recurrent latent memory on DGX Spark
 
-The RLM model carries differentiable memory between bounded text chunks using the shared GPT backbone.
+This workflow implements the first version of the [RLM plan](SPARK_RLM_PLAN.md).
+It trains fresh models with differentiable memory between bounded text chunks and provides separate evaluation and sampling entry points.
+The existing d24 production artifacts remain under `~/.cache/nanochat/spark-d24`.
 
 ## Model and data contract
 
@@ -37,7 +39,99 @@ Batch 32 uses 16 microbatches for the same update budget.
 Internal positions do not count as additional training text or advance the learning-rate schedule.
 Unroll lengths that do not divide the global text batch require an explicit batch-budget choice.
 
-## Python inference
+## Memory probe
+
+Use the existing tokenizer and training data by setting `NANOCHAT_BASE_DIR` to their cache root.
+Write each new run to a fresh output directory; the trainer refuses to overwrite an existing directory.
+Run from the repository root using the locked uv environment.
+
+```bash
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+uv run --no-sync python -m scripts.rlm_train \
+    --mode probe \
+    --output-dir "$HOME/.cache/nanochat/spark-rlm/probe-b16" \
+    --device-batch-size 16
+```
+
+The probe completes two full optimizer updates without evaluation or checkpoint saving.
+It starts without activation checkpointing and compiles the cycle forward with separate first-cycle and recurrent shapes.
+Optimizer kernels also compile, even with `--no-compile` for the model.
+The first update includes compilation and lazy optimizer-state creation; the second includes resident optimizer state throughout forward/backward.
+
+Defaults are an 80 decimal GB CUDA allocator ceiling, a 16 GB minimum system available memory, and expandable allocator segments.
+CPU memory and external CUDA allocations add overhead on the Spark's shared memory system.
+A background sampler records the minimum observed system availability every 50 ms, while synchronized CUDA counters record allocated and reserved peaks.
+The trainer checks finite loss and gradients before applying an optimizer update and checks model/optimizer tensors afterward before publishing a checkpoint.
+The workflow retains a 72 GB peak-reserved acceptance target, including measured checkpoint overhead; evaluation runs separately after loading a checkpoint.
+
+If batch 16 fails, keep its output directory and run a separately named case with `--device-batch-size 8`, or explicitly enable `--activation-checkpointing`.
+No automatic batch reduction conceals the requested configuration's result.
+Reports include per-update time, text throughput, internal-position throughput, cycle losses, compiler counters, memory peaks, and document-continuation statistics.
+They do not estimate RLM FLOPs using the ordinary GPT token estimator.
+
+## Bounded training, checkpointing, and resume
+
+Training requires an explicit optimizer-update budget.
+For example, after choosing a feasible device batch:
+
+```bash
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+uv run --no-sync python -m scripts.rlm_train \
+    --mode train --num-iterations 20 --warmup-steps 2 \
+    --device-batch-size 16 --activation-checkpointing --save-every 10 \
+    --output-dir "$HOME/.cache/nanochat/spark-rlm/learning-20"
+```
+
+The short budget and warmup above are experiment choices, not the original production horizon.
+The base learning-rate policy preserves batch scaling, model-width scaling, and the d12 reference for Muon weight decay.
+Every run records its complete configuration and source fingerprint.
+
+Checkpoint metadata is published only after the model and optimizer files are complete.
+Checkpoints are saved only after a completed optimizer update, with model, summary, and `<EOM>` parameters, optimizer state, PyTorch RNG state, last-consumed loader progress, and separate real-text, prediction, and internal-position counters.
+There is no live episode memory or partial gradient accumulation at this boundary.
+The default free-space reserve for checkpoint saving is 100 GB.
+
+To pause reproducibly at an update boundary, add `--stop-after-step 10` to the training command.
+To resume, repeat the original model/training options, keep the original `--num-iterations`, and add `--resume-from-step 10` while removing the earlier stop flag.
+Only the latest complete checkpoint in that run can be resumed; choosing an older step is rejected to protect newer published checkpoints.
+Resume requires identical model settings, training budget, source/dependency fingerprint, installed Python/PyTorch/CUDA/Triton versions, tokenizer bytes, ordered data paths/sizes/timestamps, device type, and compute precision.
+Data identity records file metadata rather than rehashing the entire corpus.
+The best-fit loader retains approximate row-group resumption, so resumed training is not claimed to replay the exact uninterrupted token stream.
+
+Each invocation writes an `attempts/` subdirectory containing the command, source snapshot including untracked modules, source/data inventories, and update metrics.
+Completed measurements go to `result.json`; failures produce `failure.json` and, for failed updates, `failed-update.json` within the attempt, preserving prior attempt artifacts.
+Training checkpoints are under `checkpoints/` within the run directory.
+Checkpoint saving records its own elapsed time, CUDA peaks, and minimum system available memory.
+
+## Evaluation and generation
+
+Use the dedicated RLM entry points so checkpoint loading preserves the recurrent contract.
+Both verify the tokenizer fingerprint and model vocabulary before loading the exact saved parameters.
+
+```bash
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+uv run --no-sync python -m scripts.rlm_eval \
+    --checkpoint-dir "$HOME/.cache/nanochat/spark-rlm/learning-20/checkpoints" \
+    --step 20 --cycles 2 --batch-size 2 --batches 8 \
+    --sampler contiguous_documents \
+    --output "$HOME/.cache/nanochat/spark-rlm/learning-20/evaluation.json"
+
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+uv run --no-sync python -m scripts.rlm_sample \
+    --checkpoint-dir "$HOME/.cache/nanochat/spark-rlm/learning-20/checkpoints" \
+    --step 20 --prompt "The meaning of life is" --max-tokens 128
+```
+
+Evaluation compares identical held-out rows using intact, zeroed, and shuffled incoming memory and reports shifted text loss separately by cycle, excluding the additional `<EOM>` predictions from these text-only metrics.
+The default `--sampler bos_bestfit` uses the existing packed loader.
+Use `--sampler contiguous_documents` for one uninterrupted prefix per sufficiently long validation document, with BOS only at the beginning and one extra token for shifted targets.
+This sampler visits validation documents once, skips short documents, drops any final partial batch, and fails if it cannot supply the requested number of full batches.
+It also reports paired per-episode loss differences and standard errors, treating episodes as independent observations; overall loss weights text targets, while these paired statistics weight episodes equally.
+The resource report measures checkpoint loading and evaluation separately, including CUDA peaks and minimum system available memory across both phases.
+The optional output file must be new and its parent directory must already exist.
+Each intervention changes the current cycle's incoming memory; the intact trajectory continues to later cycles.
+Cycle 1 has no memory intervention and cannot establish memory use.
+Natural-language quality claims still require matched ordinary-context training baselines.
 
 Generation retains only incoming memory and the current text chunk and recomputes that bounded context for each token.
 At a boundary it replaces the completed chunk with its summary, then predicts the new chunk's first token from `[memory][<EOM>]`.
@@ -49,3 +143,244 @@ Python callers can request `forward_cycle(..., write_memory=False)` when no outg
 The native episode forward and trainer use this option for the final cycle, preserving the supervised logits, loss, and cross-cycle gradient path.
 The default remains `write_memory=True` for callers performing a memory handoff.
 An empty initial readout without incoming memory requires that default; an empty readout with incoming memory supports either setting.
+
+## Historical controlled recall result
+
+A small controlled task tested whether a later query could recover a payload appearing only in the earlier chunk, using a two-layer model with a separate AdamW setup and independent training and held-out generators.
+The run used 300 updates, batch 64, 16-token chunks, four memory slots, and 512 held-out episodes.
+On October 8, 2026, the original layout without `<EOM>` reached 100% intact accuracy, 12.89% with zeroed memory, and 13.28% with shuffled memory; chance was 12.5%.
+The intact accuracy's Wilson 95% interval was 99.26% to 100%.
+This demonstrated learnable information transfer on the controlled task, not natural-language quality or long-horizon retention.
+The standalone synthetic diagnostic was removed during cleanup; the model's causal and cross-cycle gradient regression tests remain.
+Historical results are retained in `~/.cache/nanochat/spark-rlm/recall-20261008/metrics.json`.
+
+## EOM speed comparison on October 8, 2026
+
+A fresh batch-32 control and a separate `<EOM>` run each completed three optimizer updates with two cycles, 512 memory slots, BF16, full SDPA, and activation checkpointing.
+These baseline runs retained the unused final summary suffix and used 16 accumulation microbatches, 1,048,576 supervised predictions, and 1,835,008 internal positions per update.
+The comparison excludes the first update and averages updates 2 and 3; neither steady update compiled additional graphs.
+
+| Layout | Real text targets/update | Steady update times | Mean update | Real text tokens/s | Peak CUDA reserved |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Original, 1024 text/cycle | 1,048,576 | 195.68 s, 194.53 s | 195.11 s | 5,374 | 67.64 GB |
+| `<EOM>` + 1023 text/cycle | 1,047,552 | 194.96 s, 194.06 s | 194.51 s | 5,386 | 68.02 GB |
+| `<EOM>`, unused terminal summary omitted | 1,047,552 | 165.90 s, 166.08 s | 165.99 s | 6,311 | 55.90 GB |
+
+Adding `<EOM>` while retaining the full summary layout changed measured update time by -0.30% and real-text throughput by +0.21%, which does not establish a speed difference with only two steady samples per case.
+Peak allocated memory was 67.4162 GB for the original layout and 67.4164 GB with `<EOM>`.
+The `<EOM>` run's minimum system available memory was 41.18 GB; all losses, gradients, model parameters, and optimizer state remained finite.
+Both runs used the approved 100 GB allocator limit and 12 GB system guard, while training defaults remain 80 GB and 16 GB.
+The first updates took 197.79 seconds for the cached original graph and 275.59 seconds for the freshly compiled `<EOM>` graph; these are not steady speed measurements.
+
+The `<EOM>` run processed 0.098% fewer real text tokens because each cycle reserves one of the 1024 readout positions for `<EOM>`.
+The unchanged base learning-rate recipe scales affected learning rates and initial Muon decay by `sqrt(1023/1024)`, approximately 0.049% below the original run.
+The shorter packed rows also change the selected text stream, and the joint training loss now includes `<EOM>` predictions, so these probes are a resource comparison rather than matched-data quality evidence.
+Artifacts, complete launch source snapshots, and explicit resource settings are under `~/.cache/nanochat/spark-rlm/old-b32-control-20261008-1249` and `~/.cache/nanochat/spark-rlm/eom-b32-baseline-20261008-1258`.
+
+### Profile and terminal-summary optimization
+
+The complete-suffix `<EOM>` profile traced one warmed batch-32 episode and one optimizer step with optimizer state resident and no new compiled graphs.
+Its 5,995 actual CUDA kernels occupied 13.176 seconds of a 13.220-second instrumented interval, all on one stream.
+Nested GPU annotation ranges and CPU operator attribution are excluded from these totals to avoid double counting.
+
+| Kernel family | GPU time | Share of kernel time |
+| --- | ---: | ---: |
+| Matrix products | 7.413 s | 56.26% |
+| Fused Triton operations | 4.017 s | 30.49% |
+| FlashAttention kernels | 1.271 s | 9.65% |
+| Other elementwise operations and reductions | 0.398 s | 3.02% |
+| Explicit copy kernels | 0.076 s | 0.58% |
+
+These are mutually exclusive classifications by generated kernel name; fused kernels can combine normalization, activation, copy, reduction, or optimizer work.
+Cycle forwards cost 1.255 and 1.679 seconds; backward including activation recomputation cost 9.065 seconds.
+The optimizer cost 0.835 seconds, gradient checks 0.096 seconds, and model/optimizer-state checks 0.246 seconds, each incurred once per production update rather than once per accumulation microbatch.
+The clone/slice kernel identified as a readout-copy candidate cost only 1.747 ms over two calls; this does not support explicit `.contiguous()` calls as a material speed optimization.
+The finite checks remain enabled.
+
+The measured matrix-work cost motivates omitting the terminal 512 summary positions, whose outputs have no consumer and cannot affect earlier predictions under causal attention.
+This reduces internal positions by 14.29% while preserving the text/EOM loss, first-cycle summary, and differentiable memory handoff.
+CPU tests verify joint logits, losses, and every parameter gradient with active contextual weights in FP32/BF16, with and without activation checkpointing.
+An additional compiled D24/B32/BF16 check used the same real-data batch and weights, with nonzero attention/MLP output projections and smear to exercise contextual gradients.
+Its joint losses matched exactly, all 177 parameter gradients were finite, maximum absolute gradient difference was `1.90735e-6`, and aggregate gradient relative L2 difference was 0.0663%.
+Its declared 2% per-tensor relative-L2 criterion failed for the tiny `smear_lambda` scalar alone: `9.09965e-7` versus `8.82960e-7`, an absolute difference of `2.70046e-8` and relative difference of 2.97%.
+That failure remains recorded; the other 176 parameter tensors and the incoming-memory gradient passed their bounds, and the summary/EOM gradients remained nonzero.
+Changed BF16 reduction shapes are a plausible explanation, while the FP32 equivalence tests and causal suffix structure support the semantic change; the GPU check does not establish bitwise gradient equivalence.
+The complete numerical evidence and independent assessment are in `~/.cache/nanochat/spark-rlm/eom-elision-parity-20261008`.
+The profile and corrected operator attribution are in `~/.cache/nanochat/spark-rlm/profile-eom-b32-baseline-20261008`, including `profile-analysis.json`.
+
+The optimized batch-32 run then completed three full optimizer updates under the same model, training, tokenizer, data, precision, and runtime contracts as the complete-suffix `<EOM>` run; only the source fingerprint changed.
+Updates 2 and 3 took 165.90 and 166.08 seconds, averaging 165.99 seconds or 6,311 real text tokens/second, without compiling new graphs.
+Compared with the complete-suffix `<EOM>` baseline, update time fell 14.66%, throughput rose 17.18%, and peak CUDA reservation fell by 12.12 GB to 55.90 GB.
+Peak allocated memory was 55.86 GB and minimum system available memory was 57.66 GB.
+The first update took 173.87 seconds including cached warmup and optimizer-state creation.
+All three updates had finite loss, gradients, model parameters, and optimizer state; joint losses matched the complete-suffix run exactly in updates 1 and 2 and differed by `1.90735e-6` in update 3.
+This remains a short training-only speed probe with two steady samples; checkpoint saving and evaluation overhead were not measured for this configuration.
+The run, full source snapshot, explicit resource settings, and three-way `comparison.json` are under `~/.cache/nanochat/spark-rlm/eom-b32-elided-20261008-1324`.
+
+### Historical frozen main input embedding probe
+
+The optional freezing policy and its CLI flag were removed after this experiment found no measurable speed benefit.
+Current training keeps all parameters trainable; the recorded results below describe the archived experiment.
+
+A subsequent two-update probe froze only `transformer.wte.weight` and kept the optimized `<EOM>` layout, batch 32, two cycles, activation checkpointing, seed, data, tokenizer, runtime, and resource limits above.
+The comparison uses update 2 from each run, after compilation and with optimizer state resident.
+Both updates process 1,047,552 real text targets and 1,048,576 supervised predictions through 16 accumulation microbatches.
+
+| Metric | Trainable input embedding | Frozen input embedding | Change |
+| --- | ---: | ---: | ---: |
+| Update 2 time | 165.897 s | 165.941 s | +0.027% |
+| Real text tokens/s | 6,314.5 | 6,312.8 | -0.027% |
+| Peak CUDA allocated | 55.8631 GB | 55.5611 GB | -0.3020 GB, -0.541% |
+| Peak CUDA reserved | 55.8996 GB | 55.6479 GB | -0.2517 GB, -0.450% |
+| Allocated after update | 10.0409 GB | 9.8396 GB | -0.2013 GB |
+
+The peak allocated saving is exactly 301,989,888 bytes, or 288 MiB: one BF16 gradient tensor and two BF16 AdamW moments for the 50,331,648-parameter input table.
+The 100.66 MB of input weights remain resident, and the 12 additional value-embedding tables remain trainable.
+This probe found no measurable speedup; its single steady update also differs by only -0.028% from the earlier run's 165.988-second mean across updates 2 and 3.
+Freezing the input table saves little memory because it accounts for only 3.64% of parameters and does not remove the Transformer activations needed by other trainable parameters and recurrent memory.
+
+Both frozen updates passed the finite loss, gradient, model, and optimizer-state checks, and update 2 compiled no new graphs.
+The input table's SHA-256 digest remained unchanged, with no gradient, optimizer ownership, or optimizer state.
+The first update took 216.78 seconds including compilation; its loss matched the trainable reference exactly at 10.397381.
+The second update's loss was 10.348749 versus 10.346804 with trainable input embeddings; two fresh-initialization updates do not establish the effect on model quality.
+The frozen run has a two-update horizon versus three in the existing reference: both use the same warmup rates, but the Muon decay scalar applied at the end of update 2 is 0.5 versus 0.75 of initial decay.
+This difference cannot affect that update's preceding forward/backward and leaves optimizer operations and shapes unchanged; it is retained in the comparison metadata.
+These are training-only measurements without checkpoint saving or evaluation overhead.
+The run, launch source snapshot, unchanged-weight proof, and `comparison.json` are under `~/.cache/nanochat/spark-rlm/eom-b32-frozen-input-20261008-1345`.
+
+### Four-cycle batch-32 feasibility and pretraining time
+
+The optimized four-cycle configuration completed two full optimizer updates under a 100 GB CUDA allocator cap and 12 GB system-availability guard.
+It retained `<EOM>`, 1023 text tokens per cycle, 512 memory slots, BF16, full SDPA, activation checkpointing, and trainable embeddings.
+Only the terminal cycle omits its unused summary suffix, giving cycle lengths of 1536, 2048, 2048, and 1536 positions.
+
+```bash
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_CUDA_MEMORY_LIMIT_GB=100 \
+NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=12 \
+uv run --no-sync python -m scripts.rlm_train \
+    --mode probe --num-iterations 2 --cycles 4 \
+    --device-batch-size 32 --activation-checkpointing \
+    --output-dir "$HOME/.cache/nanochat/spark-rlm/probe-u4-b32"
+```
+
+Four cycles use eight accumulation microbatches, while two cycles use sixteen, preserving 1,047,552 real text targets and 1,048,576 supervised predictions per optimizer update.
+Internal positions increase from 1,572,864 to 1,835,008 per update, or 16.67%; all intermediate memory handoffs retain their gradient paths.
+The table uses the four-cycle second update and the earlier optimized two-cycle mean across updates 2 and 3, excluding compilation.
+
+| Metric | Two cycles, batch 32 | Four cycles, batch 32 |
+| --- | ---: | ---: |
+| Steady update time | 165.988 s | 195.507 s |
+| Real text tokens/s | 6,311 | 5,358 |
+| Peak CUDA allocated | 55.863 GB | 77.824 GB |
+| Peak CUDA reserved | 55.900 GB | 79.558 GB |
+| Projected training-update time for 5,574 updates | 257.0 hours / 10.71 days | 302.7 hours / 12.61 days |
+
+The four-cycle probe fits the requested 100 GB training cap, with 20.44 GB of reserved-memory headroom and a minimum measured system availability of 32.02 GB.
+CUDA allocator figures exclude CPU and external CUDA allocations; the system-availability guard remains separate.
+It exceeds the unchanged 72 GB acceptance target for the earlier full workflow, and checkpoint/evaluation overhead has not been measured for this four-cycle configuration.
+Both updates passed all finite loss, gradient, model, and optimizer-state checks, and the second update compiled no additional graphs: the count remained 14.
+The first update took 328.13 seconds including compilation and peaked at 73.70 GB reserved before optimizer state was resident throughout a full update.
+Measured steady update time increased by 17.78% over two cycles, adding approximately 1.90 days at the same total text budget.
+
+The existing [d24 plan](SPARK_D24.md#configuration) budgets 5,838,471,168 real text tokens, originally 5,568 updates of 1,048,576 tokens.
+With `<EOM>`, preserving that text budget requires `ceil(5,838,471,168 / 1,047,552) = 5574` full updates, consuming 5,839,054,848 real text tokens after rounding.
+The projections above multiply that update count by measured steady update time; startup, compilation, checkpoint saving, evaluation, and interruptions add overhead.
+Keeping exactly 5,568 updates instead would consume 0.098% less real text and shorten the two-cycle estimate by only 16.6 minutes.
+These estimates use one steady four-cycle sample and two steady two-cycle samples, and do not establish a model-quality benefit from longer recurrence.
+The model, tokenizer, data inventory, precision, attention implementation, and runtime contracts match; longer packed episodes change the selected training stream.
+The two-update probe horizon also changes the Muon decay scalar at the end of update 2 relative to the three-update reference, without changing the preceding forward/backward or optimizer operation shapes.
+Artifacts, source snapshots, explicit resource settings, and the full comparison and projection are under `~/.cache/nanochat/spark-rlm/eom-u4-b32-20261008-1359`.
+
+## Original-layout D24 memory measurements on October 8, 2026
+
+These historical cases preceded `<EOM>` and used two recurrent cycles, 1024 text tokens per cycle, and 512 memory/summary positions.
+The batch-16 and batch-32 probes used a global batch of 1,048,576 text targets; batch 48 used 1,081,344 targets so each update contained 11 complete microbatches.
+
+| Device batch | Activation checkpointing | Outcome | Peak CUDA reserved | Update time |
+| --- | --- | --- | ---: | ---: |
+| 16 episodes | Off | Out of memory during the first unroll; no optimizer update completed | 79.91 GB at the 80 GB limit | No completed update |
+| 16 episodes | On | Two complete updates, finite losses and gradients | 41.75 GB | 314.02 s first, 207.07 s second |
+| 32 episodes | On | Two complete updates, finite losses, gradients, and optimizer state | 67.94 GB | 306.88 s first, 196.29 s second |
+| 48 episodes | On | With a 16 GB system guard: first update completed; second stopped at the guard | 94.01 GB under the approved 100 GB limit | 325.67 s first; second incomplete |
+| 48 episodes | On | With an approved 12 GB system guard and cached compilation: two complete updates, all finite | 94.01 GB under the approved 100 GB limit | 206.42 s first, 202.24 s second |
+
+The checkpointed batch-16 second update processed 5,064 text tokens/second and retained at least 66.69 GB of system available memory.
+Its peak allocated memory was 41.55 GB.
+The first cycle and recurrent cycle each compiled once; the second optimizer update added no compiled graphs.
+Activation checkpointing retains full gradients across both cycles and recomputes intermediate block activations during backward.
+These measurements establish batch-16 training feasibility; the probe excluded checkpoint saving and evaluation.
+The failed and successful batch-16 artifacts are respectively `~/.cache/nanochat/spark-rlm/probe-b16-20261008` and `~/.cache/nanochat/spark-rlm/probe-b16-checkpointed-20261008`.
+
+The batch-32 probe retained the same global text batch, model, optimizer settings, 40-update warmup, and data/tokenizer fingerprints, reducing accumulation from 32 to 16 episode microbatches.
+It passed under the existing 80 GB allocator ceiling, so the authorized 100 GB retry was unnecessary.
+The second update reached 5,342 text tokens/second, with 67.42 GB peak allocated memory and 40.87 GB minimum system available memory; no new graphs compiled in that update.
+Compared with batch 16's second update, measured update time fell 5.2% and throughput rose 5.5%, at a cost of 26.19 GB additional peak reserved memory.
+These are individual steady-update measurements rather than repeated benchmark averages.
+The current trainer also checks finite model and optimizer state after each update, a check added after the original batch-16 probe without changing its training computation.
+Batch 32 stays below the 72 GB training-reserve target, but this probe excludes checkpoint saving and evaluation.
+Its artifacts are in `~/.cache/nanochat/spark-rlm/probe-b32-checkpointed-20261008-1135`.
+
+The batch-48 probe used the explicitly approved 100 GB CUDA ceiling while retaining the 16 GB minimum system available memory.
+Its global text batch was 3.125% larger because 1,048,576 targets does not divide evenly by 48 two-cycle episodes.
+Configured base learning rates were unchanged; the existing batch-scaling policy raised affected effective learning rates and initial Muon decay by approximately 1.55%.
+The first update completed with finite loss, gradients, and optimizer state, taking 325.67 seconds including compilation and peaking at 88.66 GB reserved; minimum system available memory was 16.13 GB.
+During the second update, peak allocated and reserved CUDA memory reached 93.29 GB and 94.01 GB, while minimum system available memory fell to 15.85 GB.
+The system-memory guard then stopped the run before its second optimizer step.
+That failed update ran for 37.27 seconds, which is only partial work and must not be reported as an update time or extrapolated into a measured speedup.
+No additional graphs compiled during the failed second update.
+The failed batch-48 artifacts are in `~/.cache/nanochat/spark-rlm/probe-b48-checkpointed-100gb-20261008-1150`.
+
+At the user's request, a separate batch-48 retry lowered the system-memory guard to 12 GB while retaining the 100 GB CUDA ceiling and all model/training settings.
+The retry completed both updates with finite loss, gradients, model parameters, and optimizer state.
+With compilation cached, its first update took 206.42 seconds; the second took 202.24 seconds and processed 5,347 text tokens/second, without compiling additional graphs.
+Peak allocated and reserved CUDA memory were 93.29 GB and 94.01 GB, and minimum system available memory was 18.24 GB.
+The observed minimum stayed above even the earlier 16 GB threshold, so the successful retry must not be attributed solely to lowering the guard; cached compilation and different transient memory use also distinguish the attempts.
+Accounting for its 3.125% larger text batch, the second update corresponds to 196.11 seconds per 1,048,576 text tokens, compared with batch 32's 196.29 seconds.
+The throughput difference is only 0.09% in these single-update measurements, while peak reserved memory increases by 26.07 GB.
+Batch 32 therefore remains the preferred measured configuration for throughput per memory footprint; batch 48 passes this training-only retry but exceeds the unchanged 72 GB full-workflow reserve target.
+The successful retry is in `~/.cache/nanochat/spark-rlm/probe-b48-checkpointed-100gb-guard12-20261008-1159`, including `probe-settings.json` recording the explicit resource overrides.
+The trainer's default system-memory guard remains 16 GB.
+
+A real-data CPU integration run also completed training to update 2, checkpoint publication, resume to update 4, memory-ablation evaluation, and sampling.
+Its small-model artifacts are in `~/.cache/nanochat/spark-rlm/cpu-resume-20261008`.
+
+## Original-layout six-update d24 learning pilot
+
+The bounded run used fresh weights, batch 16, activation checkpointing, a two-update warmup, and 6,291,456 supervised text tokens over six optimizer updates.
+Training took 1245.61 seconds, with loss falling from 10.3974 to 7.0645 nats per text token.
+The peak CUDA reservation remained 41.75 GB, and minimum observed system available memory was 67.92 GB.
+Final checkpoint saving took another 37.11 seconds without increasing the CUDA reservation.
+Separate checkpoint loading and held-out evaluation at batch 4 peaked at 11.99 GB reserved, leaving the measured workflow below the 72 GB target.
+
+On 128 held-out packed episodes, second-cycle loss was 6.951757 with intact memory, 6.963053 with zeroed memory, and 6.951917 with shuffled memory.
+The paired zero-minus-intact difference was 0.011296 ± 0.001021 standard error; shuffled-minus-intact was 0.000160 ± 0.000056.
+On 128 uninterrupted validation-document prefixes, second-cycle loss was 7.032266 intact, 7.044650 zeroed, and 7.032714 shuffled.
+The corresponding paired differences were 0.012384 ± 0.001117 and 0.000448 ± 0.000083 standard error.
+Each evaluation scored 262,144 text targets across both cycles and took approximately 43.15 seconds, excluding checkpoint loading.
+These are small early-run effects; the shuffled control is especially relevant because zeroing memory also changes its distribution.
+The summary parameter's AdamW first moment had nonzero norm, 0.000929, confirming that this d24 run updated the memory writer.
+On the first four packed validation episodes, first-cycle memory slots had mean off-diagonal cosine similarity 0.99878 and mean entropy effective rank 2.57, defined from normalized singular values of the uncentered slot matrix.
+The slots remain highly similar after this short run; these diagnostics do not establish useful retention or justify the 512-slot budget.
+A CUDA generation check consumed a 1020-token prompt and generated eight tokens across the 1024-token boundary.
+
+Artifacts are in `~/.cache/nanochat/spark-rlm/learning-6-20261008`, including `result.json`, `evaluation.json`, `evaluation-contiguous.json`, `summary-gradient-check.json`, `slot-diagnostics.json`, `generation-check.json`, and the complete step-6 checkpoint.
+The invocation's source snapshot is authoritative: later validation, generation, and evaluation-data changes intentionally make the current source fingerprint incompatible with training resume of this pilot.
+These checkpoints also predate the learned `<EOM>` parameter and require their archived source snapshot for inference; the current implementation intentionally has no old-layout compatibility path.
+Matched ordinary 2048-token and independent 1024-token training baselines, longer-horizon quality comparisons, and learning-efficiency claims remain future experiments.
+
+## Development checks
+
+```bash
+CUDA_VISIBLE_DEVICES='' NANOCHAT_DTYPE=float32 NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 \
+uv run --no-sync python -m pytest tests/test_rlm_model.py tests/test_rlm_training.py tests/test_rlm_inference.py tests/test_rlm_data.py -q
+
+uv lock --check
+git diff --check
+```
+
+The targeted tests cover causal isolation, cross-cycle gradients, shifted target accounting, loader buffer lifetime, optimizer/summary state, checkpoint reload, generation rollover, and paired memory interventions.
+An additional CPU comparison against the pre-refactor ordinary GPT exactly matched logits, parameter gradients, cached prefill/decode, parameter counts, and optimizer groups in FP32/BF16 with full attention and sliding attention with grouped-query heads.
+Run the full suite with `NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 uv run --no-sync python -m pytest -q`.
+The uv lock check, shell syntax checks for the existing Spark runners, and diff whitespace check also passed.
+Run the project's full required checks before committing.

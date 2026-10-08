@@ -69,6 +69,31 @@ No automatic batch reduction conceals the requested configuration's result.
 Reports include per-update time, text throughput, internal-position throughput, cycle losses, compiler counters, memory peaks, and document-continuation statistics.
 They do not estimate RLM FLOPs using the ordinary GPT token estimator.
 
+## Operator profiling
+
+Profile a recorded run's model and training configuration using real training data and a fresh model:
+
+```bash
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+uv run --no-sync python -m scripts.rlm_profile \
+    --run-config "$HOME/.cache/nanochat/spark-rlm/probe-b32/run.json" \
+    --output-dir "$HOME/.cache/nanochat/spark-rlm/profile-b32" \
+    --no-record-shapes
+```
+
+The profiler warms all configured cycle shapes, backward, and the optimizer before tracing one episode and one optimizer step with CPU and CUDA activity.
+Its first warmup step allocates optimizer state; later warmups and the traced episode run with that state resident.
+Each diagnostic step consumes one episode scaled by the production accumulation factor, so this is operator attribution rather than a training-throughput or learning measurement.
+Production amortizes the optimizer and update health checks over all accumulation microbatches.
+Use ordinary unprofiled multi-update probes for speed comparisons.
+
+Artifacts include a Chrome trace, CPU/device operator tables, structured operator and device-event timings, per-phase scopes, memory measurements, and source/configuration fingerprints.
+CUDA profiling fails explicitly if no CUDA device events were captured.
+The default records input shapes; `--no-record-shapes` avoids the additional tensor-reference retention associated with shape recording.
+Resource limits use the same environment variables and defaults as training.
+The recorded file supplies the configuration; the profiler runs the current source and records its fingerprint, rather than loading checkpoint weights or replaying archived code.
+Recorded configurations must use the current training schema; archived experiments retain their source snapshots for reproduction.
+
 ## Bounded training, checkpointing, and resume
 
 Training requires an explicit optimizer-update budget.
@@ -373,7 +398,7 @@ Matched ordinary 2048-token and independent 1024-token training baselines, longe
 
 ```bash
 CUDA_VISIBLE_DEVICES='' NANOCHAT_DTYPE=float32 NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 \
-uv run --no-sync python -m pytest tests/test_rlm_model.py tests/test_rlm_training.py tests/test_rlm_inference.py tests/test_rlm_data.py -q
+uv run --no-sync python -m pytest tests/test_rlm_model.py tests/test_rlm_training.py tests/test_rlm_inference.py tests/test_rlm_data.py tests/test_rlm_profile.py -q
 
 uv lock --check
 git diff --check
@@ -381,6 +406,6 @@ git diff --check
 
 The targeted tests cover causal isolation, cross-cycle gradients, shifted target accounting, loader buffer lifetime, optimizer/summary state, checkpoint reload, generation rollover, and paired memory interventions.
 An additional CPU comparison against the pre-refactor ordinary GPT exactly matched logits, parameter gradients, cached prefill/decode, parameter counts, and optimizer groups in FP32/BF16 with full attention and sliding attention with grouped-query heads.
-Run the full suite with `NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 uv run --no-sync python -m pytest -q`.
+After removing the freezing option and standalone recall diagnostic on October 8, 2026, `NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 uv run --no-sync python -m pytest -q` completed with 176 passed and 10 skipped, including the available CUDA tests.
 The uv lock check, shell syntax checks for the existing Spark runners, and diff whitespace check also passed.
 Run the project's full required checks before committing.

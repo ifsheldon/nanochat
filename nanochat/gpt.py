@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
@@ -405,9 +406,10 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        extra_embeddings = sum(p.numel() for p in self._extra_embedding_parameters())
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + extra_embeddings
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
-        return {
+        counts = {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
@@ -415,6 +417,13 @@ class GPT(nn.Module):
             'scalars': scalars,
             'total': total,
         }
+        if extra_embeddings:
+            counts['extra_embeddings'] = extra_embeddings
+        return counts
+
+    def _extra_embedding_parameters(self):
+        """Embedding parameters supplied by a model with continuous input queries."""
+        return []
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
         model_dim = self.config.n_embd
@@ -427,7 +436,8 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        extra_embedding_params = self._extra_embedding_parameters()
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(extra_embedding_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -443,6 +453,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if extra_embedding_params:
+            param_groups.append(dict(
+                kind='adamw', params=extra_embedding_params, lr=embedding_lr * dmodel_lr_scale,
+                betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001,
+            ))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -456,20 +471,10 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        B, T = idx.size()
-
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
-
-        # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
-        x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
+    def _forward_embeddings(self, x, idx, cos_sin, kv_cache=None, *, prefix_tokens=0,
+                            suffix_tokens=0, activation_checkpointing=False):
+        """Run the shared trunk; only idx positions receive token value embeddings."""
+        T = x.size(1)
         x = norm(x)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
@@ -499,20 +504,44 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if ve is not None and (prefix_tokens or suffix_tokens):
+                ve = F.pad(ve, (0, 0, prefix_tokens, suffix_tokens))
+            if activation_checkpointing and self.training and torch.is_grad_enabled():
+                if kv_cache is not None:
+                    raise ValueError("Activation checkpointing cannot mutate a KV cache")
+                x = checkpoint(block, x, ve, cos_sin, self.window_sizes[i], None, use_reentrant=False)
+            else:
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        return norm(x)
 
-        # Forward the lm_head (compute logits)
+    def _compute_logits(self, x):
+        """Project selected hidden states to the original, soft-capped vocabulary."""
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        return logits
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+        B, T = idx.size()
+
+        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
+        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+
+        x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
+        x = self._forward_embeddings(x, idx, cos_sin, kv_cache)
+        logits = self._compute_logits(x)
 
         if targets is not None:
             # training: given the targets, compute and return the loss

@@ -112,22 +112,58 @@ The short budget and warmup above are experiment choices, not the original produ
 The base learning-rate policy preserves batch scaling, model-width scaling, and the d12 reference for Muon weight decay.
 Every run records its complete configuration and source fingerprint.
 
-Checkpoint metadata is published only after the model and optimizer files are complete.
 Checkpoints are saved only after a completed optimizer update, with model, summary, and `<EOM>` parameters, optimizer state, PyTorch RNG state, last-consumed loader progress, and separate real-text, prediction, and internal-position counters.
+Training saves `checkpoints/latest.pt` after every completed update.
+The default `--checkpoint-mode async` overlaps the save with the next update's forward and backward passes, then waits for the writer before the next optimizer step can change any saved tensors.
+One writer handles at most one checkpoint request at a time, including its numbered save and retention.
+On CUDA, the writer uses PyTorch's `DefaultStager` to copy into reusable pinned CPU buffers on a dedicated stream, then serializes the completed CPU snapshot.
+Nonblocking copies move the long transfer wait out of the GIL-holding storage-copy binding; the staging stream's synchronization releases the GIL while the copy finishes.
+The stager is initialized on the training thread, preserves shared storage and tensor layouts, and closes after the final save drains.
+Metadata and optimizer parameter-group values are captured before the next loader, RNG, or schedule advance; tensor storage stays unchanged until the writer finishes.
+The CPU staging buffers add approximately 9.97 GB of retained host memory for this model and optimizer, consuming the Spark's shared memory alongside CUDA allocations.
+Latest and numbered writes reuse the same completed snapshot, so a numbered save does not repeat the GPU-to-CPU transfer.
+Use `--checkpoint-mode sync` to finish checkpointing before starting the next update's computation.
+This single file contains the full model, optimizer, and metadata together; the replacement is written to a temporary file, flushed and fsynced, atomically published, and followed by a directory fsync.
+The bundle's `metadata.step` identifies its completed update; publication logs and the result's `checkpoint_status` also report the last confirmed durable update and its lag behind completed training.
+While saves succeed, stopping during an update or its save loses at most one completed optimizer update, plus any unfinished computation.
+Checkpoint write and retention errors print structured warnings and training continues; subsequent updates retry saving, so repeated errors can leave `latest` multiple updates behind.
+Staging failures also warn and retry after queued copies have drained; if CUDA itself cannot synchronize after a failed stage, training fails because parameter mutation would be unsafe.
+The writer still finishes or fails before the next optimizer step, so warning-and-continue never permits a save to race with parameter mutation.
+Normal completion and explicit update-boundary stops drain the final writer before reporting the saved step.
+Owned staging files left by an interrupted rolling save are removed during the next save.
+
+Training also saves numbered checkpoints at update 2, each `--save-every` interval, and the final or explicitly paused update.
+The defaults are `--save-every 10 --keep-checkpoints 10`, retaining the ten newest numbered checkpoints in addition to the rolling latest checkpoint.
+Numbered model, optimizer, and metadata files are staged and fsynced before publication; a durable record permits interrupted publication to finish safely.
+Metadata is published after both tensor files.
+The ordering is latest publication, numbered publication, then deletion of older numbered checkpoints; saving never deletes an older checkpoint to make space for a new one.
+Retention validates every managed checkpoint set before deleting any older set and records removals in checkpoint measurements and structured logs.
+A durable retirement record permits an interrupted deletion to finish safely on resume or a later successful numbered save; incomplete or invalid sets without a matching record block deletion and produce a warning.
 There is no live episode memory or partial gradient accumulation at this boundary.
 The default free-space reserve for checkpoint saving is 100 GB.
 
 To pause reproducibly at an update boundary, add `--stop-after-step 10` to the training command.
-To resume, repeat the original model/training options, keep the original `--num-iterations`, and add `--resume-from-step 10` while removing the earlier stop flag.
-Only the latest complete checkpoint in that run can be resumed; choosing an older step is rejected to protect newer published checkpoints.
+Stopping the service uses the most recent fully published rolling checkpoint; it does not invoke a signal-time save.
+To resume, repeat the original model/training and checkpoint-policy options, keep the original `--num-iterations`, and add `--resume-latest` while removing the earlier stop flag and any initialization flags.
+The explicit `--resume-from-step 10` option selects a numbered checkpoint and is mutually exclusive with `--resume-latest`.
+Only the newest published update across rolling and numbered checkpoints can be resumed; choosing an older step is rejected to protect newer published history.
+If a stop interrupted a numbered checkpoint save after the rolling checkpoint was published, latest resume repairs that exact numbered set from the rolling checkpoint and completes pending retention before training continues.
 Resume requires identical model settings, training budget, source/dependency fingerprint, installed Python/PyTorch/CUDA/Triton versions, tokenizer bytes, ordered data paths/sizes/timestamps, device type, and compute precision.
+An explicitly reviewed source or checkpoint-policy change requires a `--resume-transition` receipt binding the exact run directory, checkpoint metadata, old and new contracts, and source manifests.
+Every other contract field must remain identical; a receipt cannot authorize a model, training, data, tokenizer, initialization, precision, or runtime change.
+The old checkpoint and founding `run.json` remain unchanged; the new attempt and checkpoints record the actual source contract and transition provenance.
+Subsequent resumes use the new checkpoint's matching contract without the transition flag, and further source changes invalidate the earlier receipt.
 Data identity records file metadata rather than rehashing the entire corpus.
 The best-fit loader retains approximate row-group resumption, so resumed training is not claimed to replay the exact uninterrupted token stream.
 
 Each invocation writes an `attempts/` subdirectory containing the command, source snapshot including untracked modules, source/data inventories, and update metrics.
 Completed measurements go to `result.json`; failures produce `failure.json` and, for failed updates, `failed-update.json` within the attempt, preserving prior attempt artifacts.
 Training checkpoints are under `checkpoints/` within the run directory.
-Checkpoint saving records its own elapsed time, CUDA peaks, and minimum system available memory.
+Checkpoint saving records writer elapsed time and separate durations for CPU staging, rolling saves, and numbered saves.
+Update timing includes any `checkpoint_wait_seconds` spent at the optimizer barrier, and `execution_wall_seconds` covers all updates plus final checkpoint draining, excluding model loading and other setup.
+The system-memory sampler spans training and checkpointing; async per-update CUDA peaks include overlapping checkpoint activity, and memory values attached to checkpoint results reflect the main thread's observation when it joins the writer.
+Writer durations overlap update durations in async mode and must not be added to estimate total runtime.
+Numbered saves add another write on their scheduled updates.
 
 ### Four-cycle pretraining with the step-5568 input embedding
 
@@ -146,7 +182,7 @@ NANOCHAT_CHECKPOINT_RESERVE_GB=100 \
 uv run --no-sync python -m scripts.rlm_train \
     --mode train --num-iterations 5574 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing \
-    --save-every 10 \
+    --save-every 10 --keep-checkpoints 10 --checkpoint-mode async \
     --init-embedding-checkpoint-dir "$HOME/.cache/nanochat/spark-d24/base_checkpoints/spark-d24-bf16" \
     --init-embedding-step 5568 \
     --init-embedding-tokenizer "$HOME/.cache/nanochat/spark-d24/tokenizer/tokenizer.pkl" \
@@ -157,6 +193,150 @@ The initializer requires identical source and target tokenizer bytes, vocabulary
 It loads the source table through a CPU mapping and records checkpoint, metadata, tokenizer, and embedding SHA-256 identities in the run contract.
 `embedding-initialization.json` verifies the copied table's exact digest before optimizer construction.
 Resume restores the RLM checkpoint's trained weights and saved initialization provenance without reopening or reapplying the original d24 checkpoint.
+For this run, use `--save-every 10 --keep-checkpoints 10 --checkpoint-mode async` when resuming and omit all three `--init-embedding-*` arguments.
+The 100 GB allocator cap and 12 GB system guard are explicit settings for this selected configuration; the general defaults remain unchanged.
+Ten numbered checkpoints require approximately 100 GB, plus approximately 10 GB for `latest.pt` and another approximately 10 GB temporarily while replacing it or publishing a numbered checkpoint.
+The earlier four-cycle probe projects about 12.6 days for training updates alone; checkpointing and other overhead add to this estimate.
+
+The selected run was launched on October 8, 2026 at 14:54 UTC as the user service `nanochat-rlm-u4-b32-20261008.service`.
+The service uses the repository's locked `.venv/bin/python`, records both output streams in the adjacent `.log` file, and continues after the interactive session ends.
+User lingering is enabled; automatic restart is disabled, so a failure or reboot requires an explicit resume from the latest complete checkpoint.
+The adjacent `pretrain-u4-b32-20261008-launch.json` records the exact command, environment, service name, and validation results.
+
+```bash
+systemctl --user status nanochat-rlm-u4-b32-20261008.service
+tail -f "$HOME/.cache/nanochat/spark-rlm/pretrain-u4-b32-20261008.log"
+```
+
+Startup verification completed two updates with finite losses, gradients, model weights, and optimizer state.
+Their losses were 10.369809 and 10.255342, with elapsed times of 208.17 and 195.70 seconds; update 2 compiled no additional graphs.
+Peak CUDA allocated and reserved memory reached 77.824 GB and 79.558 GB, and the second update retained at least 33.33 GB of system available memory.
+The complete step-2 checkpoint contains 9.968 GB of model, optimizer, and metadata files and passed run-contract and retention verification.
+Saving took 39.22 seconds, did not increase CUDA reservation, and retained at least 32.80 GB of system available memory.
+Training continued after this early save; `startup-verification.json` records the measurements and service status at verification time.
+The user stopped this run on October 9, 2026 at 19:46 SGT after update 381; the process exited and released its GPU allocations.
+The latest complete checkpoint at that stop was update 300, so resuming will repeat the 81 completed updates that were not checkpointed under the earlier periodic-only policy.
+The subsequent rolling-checkpoint change bounds future loss while saves succeed; it cannot recover those already discarded weights, and warning-only save failures can increase the unsaved gap.
+`pause.json` records the stopped state, verified checkpoint files, environment, and resume arguments preserving the 5574-update horizon and latest-ten numbered-checkpoint policy.
+The first resume from the saved update 300 uses its reviewed source-transition receipt; after a new rolling checkpoint is published, use `--resume-latest` without that receipt.
+The prepared receipt and updated source snapshot are under this run's `resume-preparation/`; `pause.json` identifies the current source-bound receipt and complete first-resume command.
+Preparing this change did not restart training or alter checkpoint 300 and the founding run record.
+
+The rolling save path was validated on October 9 using checkpoint 300 loaded on the GPU, without executing training updates.
+The initial 9.968 GB bundle write took 37.41 seconds and atomic replacement took 39.72 seconds; a full GPU reload preserved the metadata and passed finite model and optimizer-state checks.
+This isolated I/O validation reserved 9.985 GB of CUDA memory and retained at least 102.37 GB of system available memory; it does not measure the combined training-and-save peak.
+Relative to the earlier 195.70-second training update, a roughly 40-second save implies about 20% additional update time, before the occasional numbered save.
+Measurements are under `~/.cache/nanochat/spark-rlm/latest-io-validation-20261009T120257Z`; the temporary duplicate checkpoint was removed after validation.
+
+### Three-update synchronous and asynchronous checkpoint comparison
+
+On October 9, 2026, both modes trained the full four-cycle, batch-32 model for updates 301 through 303 from independent copies of checkpoint 300, using seed 42 and the same saved CPU/CUDA RNG state.
+All 24 actual loader input and target batches had identical SHA-256 hashes across the cases.
+Both used the original 5574-update schedule, BF16, activation checkpointing, a 100 GB CUDA allocator cap, a 12 GB system-memory guard, and the existing real training corpus.
+Each case wrote `latest` three times and a numbered checkpoint at the final update, with the final writer fully drained before timing ended.
+
+| Measurement | Synchronous | Asynchronous, dedicated CUDA stream |
+| --- | ---: | ---: |
+| Total for three updates and all checkpoint writes | 753.55 s | 714.71 s |
+| Average per update including checkpointing | 251.18 s | 238.24 s |
+| Update computation and optimizer-barrier durations | 208.96 / 196.17 / 194.32 s | 208.40 / 217.48 / 217.68 s |
+| Latest writer durations | 38.53 / 36.64 / 39.38 s | 72.10 / 69.89 / 35.74 s |
+| Final numbered writer duration | 39.53 s | 35.36 s |
+| Maximum checkpoint wait inside an overlapped update | Not applicable | 0.00085 s |
+| Peak CUDA reserved memory | 79.85 GB | 79.85 GB |
+| Minimum system available memory from the invocation sampler | 31.40 GB | 32.26 GB |
+
+Asynchronous checkpointing reduced measured elapsed time by 38.84 seconds, or 5.15%, with no checkpoint warnings.
+Concurrent checkpoint writing increased the next update's computation time and the writer's elapsed time, but each overlapping write finished before the next optimizer step.
+Writer durations overlap training and must not be summed with update durations.
+These totals exclude model loading and final verification, include first-update compilation, and describe one three-update comparison rather than established long-run throughput.
+The input-hashing phase includes waits for previously queued GPU work; its recorded duration is not an isolated measure of hashing overhead and is not subtracted from the totals.
+
+An initial async trial using the shared default CUDA stream took 759.42 seconds, slightly longer than sync, because its copies queued behind training kernels and left 28.54 and 30.29 seconds of waiting at optimizer barriers.
+The corrected case uses a private copy stream and reuses the unchanged sync control; each case records its own source fingerprint, and the only subsequent trainer-source change was the async stream selection.
+The initial comparison is under `~/.cache/nanochat/spark-rlm/checkpoint-comparison-20261009T124713Z`; the corrected comparison, exact commands, input hashes, and state comparison are under `~/.cache/nanochat/spark-rlm/checkpoint-comparison-stream-20261009T131500Z`.
+
+Final model and optimizer checkpoints matched their numbered counterparts exactly in both cases.
+The corrected async checkpoint also matched every tensor and scalar in the live model and optimizer exactly after training; that verification ran after the measured interval.
+CPU/CUDA RNG state, loader progress, configuration, and token counters matched across cases.
+Cross-run model and optimizer values were not bitwise identical, and the largest loss difference was 0.00002503; GPU deterministic algorithms were not enabled, so these tests do not claim exact cross-run numerical reproducibility.
+The production run remained paused throughout all nine independent benchmark updates, and its checkpoint 300 and founding `run.json` were preserved.
+Its prepared resume command now selects asynchronous checkpointing, numbered saves every ten updates, and ten retained numbered checkpoints, using a new source-bound receipt recorded in `pause.json`.
+
+Update 302 is the only warm, non-final update in this comparison.
+Its reconstructed synchronous cycle took 232.81 seconds: 196.17 seconds of computation, 36.64 seconds saving, and 0.0017 seconds preparing the checkpoint state containers.
+The asynchronous cycle took 217.48 seconds, including its 0.00075-second optimizer barrier and 0.0014-second container preparation.
+That saves 15.32 seconds, or 6.58%, for this sample: computation slowed by 21.31 seconds while the previous checkpoint was being written, consuming part of the avoided save wait.
+These are component totals rather than exact update-start timestamps; unaccounted loop overhead across the complete three-update runs was below 0.04 seconds in each mode.
+One eligible update does not establish a steady-state average or its variability.
+
+### Checkpoint overlap profiling
+
+A bounded Nsight Systems profile on October 9, 2026 separated computation, checkpoint saving, and their overlap using the unchanged full-size checkpoint-300 model and optimizer.
+Each computation condition ran the same three batch-32, four-cycle forward/backward episodes after warmup; no optimizer updates were applied.
+The profile captured CUDA, NVTX, Python GIL, and operating-system runtime events, with additional wall and thread-CPU timing around storage copies, serialization, file writes, and `fsync`.
+
+| Checkpoint component | Saving alone | Saving during computation |
+| --- | ---: | ---: |
+| GPU-to-CPU `storage.cpu()` calls | 29.770 s | 61.009 s |
+| File writes | 3.247 s | 6.894 s |
+| ZIP/checksum/bookkeeping, excluding file writes | 2.028 s | 3.647 s |
+| File and directory `fsync` | 0.293 s | 0.519 s |
+| Complete checkpoint | 35.600 s | 73.384 s |
+
+Storage copying accounted for 84% of checkpoint time alone and 83% during overlap.
+File-write time is excluded from the ZIP residual to avoid counting nested calls twice; that residual does not isolate CRC32 from other archive work.
+The measured copy traffic was 9.96749 GB per checkpoint.
+
+The identical three computation episodes took 71.884 seconds alone and 95.202 seconds during overlap, with equal losses and exactly 23,253 GPU kernels in each condition.
+Nsight attributed 11.225 seconds of the additional 23.318 seconds to longer aggregate kernel execution and 12.093 seconds to additional time without a training kernel executing.
+Copy operations occupied 12.104 seconds without concurrent training kernels; time with neither kernels nor copies executing remained below 0.05 seconds in each condition.
+The same 12.104 seconds overlapped the checkpoint writer holding Python's GIL while the main computation thread or autograd thread waited for it.
+The writer held the GIL for 61.500 seconds during overlap, including 60.876 seconds inside `storage.cpu()`; the installed PyTorch storage-copy binding retains the GIL during its blocking copy.
+Only 0.00457 seconds of the time without training kernels coincided with the harness's `cudaDeviceSynchronize` calls, so those episode boundaries do not account for the observed launch gaps.
+Blocking storage copies therefore inhibit training submission, alongside the separate increase in GPU kernel duration.
+This shows interference during concurrent saving rather than a delay at the optimizer barrier or a long disk-flush wait.
+It does not establish saturated DRAM bandwidth because hardware bandwidth counters were not collected.
+The third overlapped episode returned to 23.956 seconds, close to its 23.977-second control, as checkpoint activity ended.
+This profile identified the blocking storage-copy path as the next optimization target, leading to the subsequent pinned-staging implementation described above.
+Its measurements describe the earlier direct GPU serialization path, before pinned staging was introduced.
+
+This attribution probe cleared gradients and synchronized the device after each episode, unlike a full eight-episode accumulated update, and tracing adds overhead.
+Use the complete non-final update measurement above for throughput, rather than extrapolating these shorter phases.
+The probe reserved at most 75.223 GB of CUDA memory and retained at least 37.379 GB of system available memory.
+The production run remained paused, and trainer sources and the prepared resume receipt were unchanged.
+The harness, raw Nsight report, SQLite export, invocation, timings, and derived analyses are under `~/.cache/nanochat/spark-rlm/checkpoint-profile-20261009T134116Z`.
+
+### Pinned CPU staging comparison
+
+The subsequent CUDA checkpoint writer uses PyTorch's `DefaultStager` to copy the model and optimizer into reusable pinned CPU buffers before serializing them.
+The private staging stream queues nonblocking storage copies and releases the GIL while waiting for completion; rolling and numbered saves reuse the same completed CPU snapshot.
+On October 9, 2026, this implementation repeated updates 301 through 303 with the same checkpoint, seed, configuration, and all 24 input/target hashes as both earlier cases.
+The table reuses the preceding synchronous and asynchronous controls; these are separate invocations with recorded source fingerprints.
+
+| Measurement | Synchronous control | Previous async writer | Async with pinned staging |
+| --- | ---: | ---: | ---: |
+| Total for three updates and all checkpoint writes | 753.55 s | 714.71 s | 610.68 s |
+| Average per update including checkpointing | 251.18 s | 238.24 s | 203.56 s |
+| Warm non-final update 302, reconstructed cycle | 232.81 s | 217.48 s | 198.69 s |
+| CPU staging durations | Included in saving | Included in saving | 3.49 / 0.18 / 0.18 s |
+| Latest serialization and publication durations | 38.53 / 36.64 / 39.38 s | 72.10 / 69.89 / 35.74 s | 6.32 / 6.20 / 3.54 s |
+| Final numbered serialization and publication duration | 39.53 s | 35.36 s | 3.68 s |
+| Peak CUDA reserved memory | 79.85 GB | 79.85 GB | 79.85 GB |
+| Minimum system available memory | 31.40 GB | 32.26 GB | 24.60 GB |
+
+Pinned staging reduced total measured time by 14.56% relative to the previous async writer and 18.96% relative to the synchronous control.
+The warm non-final update improved by 8.64% relative to the previous async writer; it includes the optimizer barrier and checkpoint container preparation, with both writers finishing before the next optimizer step.
+The first staging operation allocates the cached buffers; subsequent operations reuse them, adding approximately 9.97 GB of retained host storage for this model and optimizer.
+The invocation remained above the 12 GB system-memory guard and produced no checkpoint warnings.
+Writer work overlaps computation, and the pinned writer's serialization durations exclude its separately reported CPU staging, so these columns are not additive update costs.
+As in the preceding comparison, totals include first-update compilation and final writer draining but exclude model loading and verification; one warm non-final sample does not establish long-run throughput.
+
+The rolling and numbered checkpoints matched exactly, and every saved model/optimizer tensor and scalar matched the final live training state exactly.
+RNG state, loader progress, configuration, and token counters matched the synchronous control, while cross-run model and optimizer values were not bitwise identical with GPU deterministic algorithms disabled.
+The maximum loss difference from that control was 0.00000644.
+The comparison, input hashes, exact-state validation, source fingerprints, and commands are under `~/.cache/nanochat/spark-rlm/checkpoint-comparison-pinned-20261009T141227Z`.
+The production run remained paused at checkpoint 300 throughout all twelve independent comparison updates; its source-bound resume receipt and `pause.json` were refreshed for the validated pinned-staging implementation without altering the founding run record or checkpoint.
 
 ## Evaluation and generation
 
@@ -428,14 +608,18 @@ Matched ordinary 2048-token and independent 1024-token training baselines, longe
 
 ```bash
 CUDA_VISIBLE_DEVICES='' NANOCHAT_DTYPE=float32 NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 \
-uv run --no-sync python -m pytest tests/test_rlm_model.py tests/test_rlm_training.py tests/test_rlm_initialization.py tests/test_rlm_inference.py tests/test_rlm_data.py tests/test_rlm_profile.py -q
+uv run --no-sync python -m pytest tests/test_rlm_model.py tests/test_rlm_training.py tests/test_rlm_initialization.py tests/test_rlm_checkpoints.py tests/test_rlm_latest.py tests/test_rlm_resume.py tests/test_rlm_checkpointing.py tests/test_rlm_train_cli.py tests/test_rlm_inference.py tests/test_rlm_data.py tests/test_rlm_profile.py -q
 
 uv lock --check
 git diff --check
 ```
 
-The targeted tests cover causal isolation, cross-cycle gradients, shifted target accounting, loader buffer lifetime, optimizer/summary state, input-table-only initialization, checkpoint reload, generation rollover, and paired memory interventions.
+The targeted tests cover causal isolation, cross-cycle gradients, shifted target accounting, loader buffer lifetime, optimizer/summary state, input-table-only initialization, interrupted rolling saves and retention, reviewed source transitions, exact fixture training/resume, generation rollover, and paired memory interventions.
 An additional CPU comparison against the pre-refactor ordinary GPT exactly matched logits, parameter gradients, cached prefill/decode, parameter counts, and optimizer groups in FP32/BF16 with full attention and sliding attention with grouped-query heads.
 After removing the freezing option and standalone recall diagnostic on October 8, 2026, `NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 uv run --no-sync python -m pytest -q` completed with 176 passed and 10 skipped, including the available CUDA tests.
 The uv lock check, shell syntax checks for the existing Spark runners, and diff whitespace check also passed.
+The subsequent pretrained-input initialization, retention, and integrated resume changes passed the same full command with 220 passed and 10 skipped, including the available CUDA tests.
+The rolling-checkpoint and interrupted-retention changes passed the full command on October 9 with 329 passed and 10 skipped, including the available CUDA tests, as well as the lock, runner syntax, and diff checks above.
+The subsequent async writer, warning-and-continue policy, ten-update defaults, and recoverable numbered publication passed the full command with 388 passed and 10 skipped, including actual CUDA copy-stream and state-round-trip tests.
+The pinned-staging follow-up passed with 392 tests and 10 skipped, including actual CUDA snapshot reuse, shared storage and strided views, exact latest/numbered state, failed-copy drainage, and the optimizer mutation barrier.
 Run the project's full required checks before committing.

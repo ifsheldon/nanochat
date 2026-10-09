@@ -191,7 +191,7 @@ def continuation_counts(inputs, text_length, cycles, bos_token_id):
 
 
 def train_update(model, forward_cycle, optimizer, loader, config, step, bos_token_id,
-                 memory_monitor=None):
+                 memory_monitor=None, before_optimizer_step=None):
     """Consume, backpropagate, then release each loader view before requesting another."""
     text_length = model.config.text_length
     accumulation = config.accumulation_steps(text_length)
@@ -230,6 +230,11 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
         # No loader prefetch can occur before the entire unroll's backward above.
         del loss, inputs, targets
     require_finite_gradients(model, step)
+    checkpoint_wait = 0.0
+    if before_optimizer_step is not None:
+        waiting_started = time.monotonic()
+        before_optimizer_step()
+        checkpoint_wait = time.monotonic() - waiting_started
     if memory_monitor is not None:
         memory_monitor.require_available(step)
     optimizer.step()
@@ -239,6 +244,7 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
         memory_monitor.require_available(step)
     possible_handoffs = accumulation * config.device_batch_size * (config.cycles - 1)
     return {
+        "checkpoint_wait_seconds": checkpoint_wait,
         "loss": (cycle_sums.sum() / cycle_counts.sum()).item(),
         "cycle_losses": (cycle_sums / cycle_counts).tolist(),
         "within_document_handoff_fraction": handoffs.item() / possible_handoffs,
@@ -312,7 +318,8 @@ def cuda_metrics(device):
 
 
 def measured_update(model, forward_cycle, optimizer, loader, config, step, bos_token_id,
-                    minimum_available_gb=None, failure_path: Path | None = None):
+                    minimum_available_gb=None, failure_path: Path | None = None,
+                    before_optimizer_step=None):
     synchronize(model.get_device())
     if model.get_device().type == "cuda":
         torch.cuda.reset_peak_memory_stats(model.get_device())
@@ -323,6 +330,7 @@ def measured_update(model, forward_cycle, optimizer, loader, config, step, bos_t
         with monitor:
             result, loader_state = train_update(
                 model, forward_cycle, optimizer, loader, config, step, bos_token_id, monitor,
+                before_optimizer_step=before_optimizer_step,
             )
             synchronize(model.get_device())
             monitor.require_available(step)
@@ -381,7 +389,17 @@ def validate_run_directory(root: Path):
 
 def require_latest_resume_checkpoint(checkpoint_dir: Path, step: int):
     """Admit resume only when it cannot replace an already published later step."""
-    latest = find_last_step(checkpoint_dir)
+    from nanochat.rlm_latest import LatestCheckpoint
+
+    try:
+        latest = find_last_step(checkpoint_dir)
+    except FileNotFoundError:
+        latest = 0
+    rolling = LatestCheckpoint(checkpoint_dir)
+    if rolling.exists():
+        latest = max(latest, rolling.metadata()["step"])
+    if latest == 0:
+        raise FileNotFoundError(f"No complete checkpoints found in {checkpoint_dir}")
     if step != latest:
         raise ValueError(
             f"Resume requires the latest published checkpoint, step {latest}; "

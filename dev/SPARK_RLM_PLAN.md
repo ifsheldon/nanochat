@@ -17,6 +17,17 @@ The experimental freezing option was removed after that measurement; all model p
 A four-cycle batch-32 probe then completed two updates under the requested 100 GB CUDA cap with 79.56 GB peak reserved memory and a 195.51-second steady update, retaining trainable embeddings and activation checkpointing.
 At the existing 5.84-billion-real-text-token budget, rounded to 5574 updates for `<EOM>`, this projects 12.61 days of training updates versus 10.71 days for optimized two-cycle batch-32 training, before startup, checkpointing, and evaluation overhead.
 The selected full pretraining run uses four cycles and batch 32, initializes only the main input token embedding from d24 step 5568, and keeps all parameters trainable.
+It saves a rolling `latest.pt` after every completed update and numbered checkpoints at update 2, every 10 updates, and the final update, retaining the latest ten numbered checkpoints in addition to the rolling checkpoint.
+Checkpoint writing defaults to asynchronous overlap with the next forward/backward, with a writer barrier before the next optimizer step and final draining at an explicit stop.
+The CUDA writer now prepares a pinned CPU snapshot through PyTorch's `DefaultStager`, then reuses that snapshot for rolling and numbered writes; retained host buffers add approximately 9.97 GB for the selected model and optimizer.
+Save failures warn and continue, logging the completed update, saved latest update, and checkpoint lag; the one-completed-update loss bound applies only while saves succeed.
+Both rolling and numbered publication finish before older numbered checkpoints are retired; durable publication and retirement records permit recovery after interrupted filesystem operations.
+A full-size three-update comparison reduced total training-and-checkpoint time from 753.55 seconds synchronously to 714.71 seconds with a dedicated async CUDA copy stream, a 5.15% reduction; the workflow report records the identical input/RNG evidence, exact saved-versus-live state check, and cross-run floating-point differences.
+Its warm non-final update took 232.81 seconds synchronously versus 217.48 seconds asynchronously, a 6.58% reduction in one sample.
+A subsequent bounded Nsight profile found that GPU-to-CPU storage copies consumed 83–84% of checkpoint time and that overlapping saves both prolonged training kernels and blocked training threads on Python's GIL during storage copying; the workflow report records the attribution and measurement limits.
+The pinned-staging follow-up reduced the same three-update total to 610.68 seconds, 14.56% below the previous async writer, and the warm non-final update to 198.69 seconds, an 8.64% reduction.
+Its checkpoint matched the final live state exactly; CUDA reservation stayed at 79.85 GB and minimum system available memory was 24.60 GB with the additional pinned host buffers.
+The production run remains paused at checkpoint 300 with a refreshed source-bound resume receipt; the workflow report includes the short-trial limits.
 The earlier batch-size measurements and six-update pilot describe the original layout without `<EOM>`; the current contract follows below.
 
 ## Objective and current decisions

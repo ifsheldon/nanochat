@@ -42,6 +42,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument("--init-embedding-checkpoint-dir", type=Path, help="fresh runs only: checkpoint directory providing transformer.wte.weight")
+    parser.add_argument("--init-embedding-step", type=int, help="published source checkpoint step for input embedding initialization")
+    parser.add_argument("--init-embedding-tokenizer", type=Path, help="source tokenizer.pkl; must exactly match the training tokenizer")
     parser.add_argument("--save-every", type=int, default=0, help="training only; zero saves only the final/paused update")
     parser.add_argument("--resume-from-step", type=int, default=None)
     parser.add_argument("--stop-after-step", type=int, default=None, help="save and stop at a completed update without changing schedule")
@@ -55,6 +58,16 @@ def parse_args():
         parser.error("probe requires at least two updates, with no resume, early stop, or checkpoint saving")
     if args.save_every < 0:
         parser.error("--save-every cannot be negative")
+    initialization_args = (
+        args.init_embedding_checkpoint_dir, args.init_embedding_step, args.init_embedding_tokenizer,
+    )
+    if any(value is not None for value in initialization_args):
+        if not all(value is not None for value in initialization_args):
+            parser.error("embedding initialization requires checkpoint directory, step, and source tokenizer together")
+        if args.init_embedding_step < 0:
+            parser.error("--init-embedding-step must be nonnegative")
+        if args.resume_from_step is not None:
+            parser.error("embedding initialization is fresh-run only; resume restores its saved initialization provenance and trained weights")
     if args.resume_from_step is not None and args.resume_from_step <= 0:
         parser.error("--resume-from-step must name a completed positive optimizer update")
     if args.stop_after_step is not None and not 0 < args.stop_after_step <= args.num_iterations:
@@ -114,6 +127,30 @@ def run(args, attempt):
     tokenizer_path = Path(get_base_dir()) / "tokenizer" / "tokenizer.pkl"
     tokenizer_sha256 = file_digest(tokenizer_path)
     tokenizer = get_tokenizer()
+    checkpoint_dir = args.output_dir / "checkpoints"
+    metadata = None
+    if args.resume_from_step is not None:
+        require_latest_resume_checkpoint(checkpoint_dir, args.resume_from_step)
+        metadata = json.loads((checkpoint_dir / f"meta_{args.resume_from_step:06d}.json").read_text())
+        if metadata.get("model_type") != "rlm" or metadata.get("step") != args.resume_from_step:
+            raise ValueError("Resume requires an RLM checkpoint at the requested completed update")
+    initializer = None
+    if args.resume_from_step is not None:
+        initialization = metadata["run_contract"]["initialization"]
+        if not isinstance(initialization, dict) or initialization.get("kind") not in (
+            "random", "pretrained_input_token_embedding",
+        ):
+            raise ValueError("The recorded run has invalid initialization provenance")
+    elif args.init_embedding_checkpoint_dir is not None:
+        from nanochat.rlm_initialization import TokenEmbeddingInitialization
+
+        initializer = TokenEmbeddingInitialization.from_checkpoint(
+            args.init_embedding_checkpoint_dir, args.init_embedding_step,
+            args.init_embedding_tokenizer, tokenizer_path,
+        )
+        initialization = initializer.contract()
+    else:
+        initialization = {"kind": "random"}
     model_config = RLMConfig(
         sequence_len=args.text_length + 1 + 2 * args.memory_tokens,
         vocab_size=tokenizer.get_vocab_size(), n_layer=args.depth,
@@ -129,6 +166,7 @@ def run(args, attempt):
         triton_version = None
     contract = {
         "model_config": asdict(model_config), "training_config": asdict(config),
+        "initialization": initialization,
         "source_sha256": source["sha256"], "tokenizer_sha256": tokenizer_sha256,
         "data_inventory_sha256": inventory["sha256"], "compute_dtype": str(COMPUTE_DTYPE),
         "device_type": device.type, "attention_impl": "sdpa",
@@ -161,16 +199,15 @@ def run(args, attempt):
         "prediction_targets_per_update": config.prediction_targets_per_update(args.text_length),
     }), flush=True)
 
-    checkpoint_dir = args.output_dir / "checkpoints"
-    metadata = None
     optimizer_data = None
     model_data = None
     step = 0
     if args.resume_from_step is not None:
-        require_latest_resume_checkpoint(checkpoint_dir, args.resume_from_step)
-        model_data, optimizer_data, metadata = load_checkpoint(
+        model_data, optimizer_data, loaded_metadata = load_checkpoint(
             checkpoint_dir, args.resume_from_step, device, load_optimizer=True,
         )
+        if loaded_metadata != metadata:
+            raise ValueError("Resume checkpoint metadata changed after admission")
         if metadata.get("model_type") != "rlm" or metadata.get("run_contract") != contract:
             raise ValueError("Resume requires matching RLM model, training budget, source, data, tokenizer, and precision")
         step = metadata["step"]
@@ -186,6 +223,11 @@ def run(args, attempt):
     if model_data is not None:
         model.load_state_dict(model_data, strict=True, assign=True)
         del model_data
+    elif initializer is not None:
+        initialization_proof = initializer.initialize(model)
+        write_json(attempt / "embedding-initialization.json", initialization_proof)
+        print(json.dumps({"embedding_initialization": initialization_proof}), flush=True)
+        del initializer
     model.train()
     optimizer, decay = build_optimizer(model, config)
     parameter_counts = model.num_scaling_params()

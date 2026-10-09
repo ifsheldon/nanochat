@@ -1,7 +1,8 @@
 # Recurrent latent memory on DGX Spark
 
 This workflow implements the first version of the [RLM plan](SPARK_RLM_PLAN.md).
-It trains fresh models with differentiable memory between bounded text chunks and provides separate evaluation and sampling entry points.
+It trains models with differentiable memory between bounded text chunks and provides separate evaluation and sampling entry points.
+Initialization defaults to fresh weights; an optional verified transfer initializes only the main input token embedding from an existing checkpoint.
 The existing d24 production artifacts remain under `~/.cache/nanochat/spark-d24`.
 
 ## Model and data contract
@@ -127,6 +128,35 @@ Each invocation writes an `attempts/` subdirectory containing the command, sourc
 Completed measurements go to `result.json`; failures produce `failure.json` and, for failed updates, `failed-update.json` within the attempt, preserving prior attempt artifacts.
 Training checkpoints are under `checkpoints/` within the run directory.
 Checkpoint saving records its own elapsed time, CUDA peaks, and minimum system available memory.
+
+### Four-cycle pretraining with the step-5568 input embedding
+
+The selected full run uses four cycles, batch 32, activation checkpointing, and terminal-summary omission.
+Its 5574-update budget consumes 5,839,054,848 real text targets, with eight accumulation microbatches per update.
+Only `transformer.wte.weight` is copied from the completed d24 checkpoint at step 5568.
+The Transformer, additional value embeddings, LM head, shared summary input, and `<EOM>` input retain their normal fresh initialization, and every parameter remains trainable.
+The new summary and `<EOM>` inputs are separate model parameters, so the existing tokenizer vocabulary is unchanged.
+
+```bash
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_DTYPE=bfloat16 NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 \
+NANOCHAT_CUDA_MEMORY_LIMIT_GB=100 \
+NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=12 \
+NANOCHAT_CHECKPOINT_RESERVE_GB=100 \
+uv run --no-sync python -m scripts.rlm_train \
+    --mode train --num-iterations 5574 --cycles 4 \
+    --device-batch-size 32 --activation-checkpointing \
+    --save-every 10 \
+    --init-embedding-checkpoint-dir "$HOME/.cache/nanochat/spark-d24/base_checkpoints/spark-d24-bf16" \
+    --init-embedding-step 5568 \
+    --init-embedding-tokenizer "$HOME/.cache/nanochat/spark-d24/tokenizer/tokenizer.pkl" \
+    --output-dir "$HOME/.cache/nanochat/spark-rlm/pretrain-u4-b32-20261008"
+```
+
+The initializer requires identical source and target tokenizer bytes, vocabulary, embedding width, padded table shape, and dtype.
+It loads the source table through a CPU mapping and records checkpoint, metadata, tokenizer, and embedding SHA-256 identities in the run contract.
+`embedding-initialization.json` verifies the copied table's exact digest before optimizer construction.
+Resume restores the RLM checkpoint's trained weights and saved initialization provenance without reopening or reapplying the original d24 checkpoint.
 
 ## Evaluation and generation
 
@@ -398,13 +428,13 @@ Matched ordinary 2048-token and independent 1024-token training baselines, longe
 
 ```bash
 CUDA_VISIBLE_DEVICES='' NANOCHAT_DTYPE=float32 NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 \
-uv run --no-sync python -m pytest tests/test_rlm_model.py tests/test_rlm_training.py tests/test_rlm_inference.py tests/test_rlm_data.py tests/test_rlm_profile.py -q
+uv run --no-sync python -m pytest tests/test_rlm_model.py tests/test_rlm_training.py tests/test_rlm_initialization.py tests/test_rlm_inference.py tests/test_rlm_data.py tests/test_rlm_profile.py -q
 
 uv lock --check
 git diff --check
 ```
 
-The targeted tests cover causal isolation, cross-cycle gradients, shifted target accounting, loader buffer lifetime, optimizer/summary state, checkpoint reload, generation rollover, and paired memory interventions.
+The targeted tests cover causal isolation, cross-cycle gradients, shifted target accounting, loader buffer lifetime, optimizer/summary state, input-table-only initialization, checkpoint reload, generation rollover, and paired memory interventions.
 An additional CPU comparison against the pre-refactor ordinary GPT exactly matched logits, parameter gradients, cached prefill/decode, parameter counts, and optimizer groups in FP32/BF16 with full attention and sliding attention with grouped-query heads.
 After removing the freezing option and standalone recall diagnostic on October 8, 2026, `NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 uv run --no-sync python -m pytest -q` completed with 176 passed and 10 skipped, including the available CUDA tests.
 The uv lock check, shell syntax checks for the existing Spark runners, and diff whitespace check also passed.

@@ -16,6 +16,7 @@ Freezing only the main input embedding then saved 0.302 GB of peak allocated mem
 The experimental freezing option was removed after that measurement; all model parameters remain trainable.
 A four-cycle batch-32 probe then completed two updates under the requested 100 GB CUDA cap with 79.56 GB peak reserved memory and a 195.51-second steady update, retaining trainable embeddings and activation checkpointing.
 At the existing 5.84-billion-real-text-token budget, rounded to 5574 updates for `<EOM>`, this projects 12.61 days of training updates versus 10.71 days for optimized two-cycle batch-32 training, before startup, checkpointing, and evaluation overhead.
+The selected full pretraining run uses four cycles and batch 32, initializes only the main input token embedding from d24 step 5568, and keeps all parameters trainable.
 The earlier batch-size measurements and six-update pilot describe the original layout without `<EOM>`; the current contract follows below.
 
 ## Objective and current decisions
@@ -27,7 +28,7 @@ The forward episode length and gradient unroll length must match initially: all 
 | Item | Initial setting |
 | --- | --- |
 | Backbone | Shared d24 Transformer: 24 layers, width 1536, 12 heads |
-| Initialization | Train from scratch; reuse the existing tokenizer |
+| Initialization | Initial probes use fresh weights; selected full run copies only the main input embedding from d24 step 5568 and reuses its tokenizer |
 | Attention and precision | Full causal SDPA, `window_pattern="L"`, BF16 compute |
 | Text per cycle, `C` | 1023 tokens |
 | Memory slots, `K` | 512 continuous vectors |

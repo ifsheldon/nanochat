@@ -599,10 +599,21 @@ On the first four packed validation episodes, first-cycle memory slots had mean 
 The slots remain highly similar after this short run; these diagnostics do not establish useful retention or justify the 512-slot budget.
 A CUDA generation check consumed a 1020-token prompt and generated eight tokens across the 1024-token boundary.
 
-Artifacts are in `~/.cache/nanochat/spark-rlm/learning-6-20261008`, including `result.json`, `evaluation.json`, `evaluation-contiguous.json`, `summary-gradient-check.json`, `slot-diagnostics.json`, `generation-check.json`, and the complete step-6 checkpoint.
+Artifacts are in `~/.cache/nanochat/spark-rlm/learning-6-20261008`, including `result.json`, `evaluation.json`, `evaluation-contiguous.json`, `summary-gradient-check.json`, `slot-diagnostics.json`, and `generation-check.json`.
+The experiment's step-6 model and optimizer files were removed during the October 9 housekeeping described below.
 The invocation's source snapshot is authoritative: later validation, generation, and evaluation-data changes intentionally make the current source fingerprint incompatible with training resume of this pilot.
-These checkpoints also predate the learned `<EOM>` parameter and require their archived source snapshot for inference; the current implementation intentionally has no old-layout compatibility path.
+The pilot also predates the learned `<EOM>` parameter; the current implementation intentionally has no old-layout compatibility path.
 Matched ordinary 2048-token and independent 1024-token training baselines, longer-horizon quality comparisons, and learning-efficiency claims remain future experiments.
+
+## Experiment checkpoint housekeeping
+
+On October 9, 2026, cleanup removed 23 checkpoint tensor files from the completed synchronous/asynchronous comparisons, the pinned-staging comparison, the checkpoint profiler, and the six-update learning pilot, totaling 139.55 GB.
+It also removed 1,170 abandoned pytest checkpoint files totaling 61.26 MB; symlink and hardlink security-test fixtures were left untouched.
+The cleanup reclaimed approximately 139.61 GB while preserving experiment metadata, metrics, input hashes, validation reports, logs, traces, commands, and source snapshots.
+Checks that reload the removed experiment tensors require regenerating those checkpoints.
+All four production checkpoint generations at updates 2, 100, 200, and 300 remain complete, and the production run remains paused.
+The prepared resume source fingerprint and receipt are unchanged by the commits and cleanup.
+The exact deletion manifest, per-file deletion log, and verification receipt are under `~/.cache/nanochat/spark-rlm/housekeeping-20261009T154103Z`.
 
 ## Development checks
 

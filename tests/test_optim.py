@@ -61,6 +61,66 @@ def test_adamw_matches_torch_reference():
     torch.testing.assert_close(p_ours, p_ref, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("shape", [ADAMW_SMALL_SHAPE, ADAMW_LARGE_SHAPE])
+def test_adamw_frozen_parameter_skips_decay_and_initializes_state_on_unfreeze(shape):
+    hypers = dict(lr=0.02, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.1)
+    active = torch.nn.Parameter(torch.ones(ADAMW_SMALL_SHAPE, device=DEVICE))
+    frozen = torch.nn.Parameter(torch.full(shape, 0.5, device=DEVICE), requires_grad=False)
+    active_ref = torch.nn.Parameter(active.detach().clone())
+    frozen_ref = torch.nn.Parameter(frozen.detach().clone(), requires_grad=False)
+    initial_frozen = frozen.detach().clone()
+    optimizer = MuonAdamW([dict(kind="adamw", params=[active, frozen], **hypers)])
+    reference = torch.optim.AdamW([active_ref, frozen_ref], **hypers)
+
+    for step in range(4):
+        active.grad = torch.full_like(active, 0.1 + step * 0.05)
+        active_ref.grad = active.grad.clone()
+        if step >= 2:
+            frozen.requires_grad_(True)
+            frozen_ref.requires_grad_(True)
+            frozen.grad = torch.full_like(frozen, 0.2 + step * 0.05)
+            frozen_ref.grad = frozen.grad.clone()
+        optimizer.step()
+        reference.step()
+        torch.testing.assert_close(active, active_ref, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(frozen, frozen_ref, rtol=1e-5, atol=1e-6)
+        if step < 2:
+            assert torch.equal(frozen, initial_frozen)
+            assert frozen not in optimizer.state
+        else:
+            assert not torch.equal(frozen, initial_frozen)
+            assert optimizer.state[frozen]["step"] == step - 1
+            torch.testing.assert_close(
+                optimizer.state[frozen]["exp_avg"], reference.state[frozen_ref]["exp_avg"],
+            )
+            torch.testing.assert_close(
+                optimizer.state[frozen]["exp_avg_sq"], reference.state[frozen_ref]["exp_avg_sq"],
+            )
+        optimizer.zero_grad(set_to_none=True)
+        reference.zero_grad(set_to_none=True)
+
+
+@pytest.mark.parametrize("failure", ["missing_trainable_gradient", "stale_frozen_gradient"])
+def test_adamw_gradient_contract_failure_aborts_before_any_update(failure):
+    active = torch.nn.Parameter(torch.ones(ADAMW_SMALL_SHAPE, device=DEVICE))
+    invalid = torch.nn.Parameter(torch.full(ADAMW_SMALL_SHAPE, 0.5, device=DEVICE))
+    active.grad = torch.full_like(active, 0.2)
+    if failure == "stale_frozen_gradient":
+        invalid.requires_grad_(False)
+        invalid.grad = torch.full_like(invalid, 0.3)
+    before = [parameter.detach().clone() for parameter in (active, invalid)]
+    optimizer = MuonAdamW([dict(
+        kind="adamw", params=[active, invalid], lr=0.02,
+        betas=(0.8, 0.995), eps=1e-10, weight_decay=0.1,
+    )])
+
+    with pytest.raises(RuntimeError, match="[Gg]radient"):
+        optimizer.step()
+    for parameter, original in zip((active, invalid), before):
+        assert torch.equal(parameter, original)
+        assert parameter not in optimizer.state
+
+
 def test_determinism():
     """Two identical runs must produce bitwise identical parameters."""
     results = []

@@ -172,6 +172,133 @@ def test_fresh_transfer_retention_and_resume_match_uninterrupted_training(traini
     assert result["status"] == "completed" and result["attempt_updates"] == 1
 
 
+def test_frozen_pretrained_embedding_resumes_exactly_before_and_after_unfreezing(
+    training_environment, tmp_path, monkeypatch, capsys,
+):
+    from nanochat.rlm_latest import LatestCheckpoint
+
+    source_dir, source_tokenizer, source_embedding = training_environment
+    init_args = source_arguments(source_dir, source_tokenizer)
+    policy_args = ("--freeze-input-embedding", "--num-iterations", "20", "--total-batch-size", "32")
+    initialized_models = []
+    parameter_ids = []
+    build_optimizer = training_module.build_optimizer
+
+    def capture_initialization(model, config):
+        optimizer, decay = build_optimizer(model, config)
+        initialized_models.append({name: value.detach().clone() for name, value in model.state_dict().items()})
+        saved_groups = optimizer.state_dict()["param_groups"]
+        ids = {
+            id(parameter): saved_id
+            for group, saved_group in zip(optimizer.param_groups, saved_groups)
+            for parameter, saved_id in zip(group["params"], saved_group["params"])
+        }
+        parameter_ids.append({name: ids[id(parameter)] for name, parameter in model.named_parameters()})
+        return optimizer, decay
+
+    def assert_logged_updates(attempt):
+        output = capsys.readouterr().out
+        printed = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+        printed_updates = [item for item in printed if "completed_updates" in item and "loss" in item]
+        updates = [json.loads(line) for line in (attempt / "updates.jsonl").read_text().splitlines()]
+        report = json.loads((attempt / "result.json").read_text())
+        assert printed_updates == updates == report["updates"]
+        for update in updates:
+            assert update["input_embedding_frozen"] is (update["completed_updates"] <= 18)
+        return updates
+
+    monkeypatch.setattr(training_module, "build_optimizer", capture_initialization)
+    reference_dir = tmp_path / "frozen-reference"
+    reference_attempt = run_attempt(arguments(monkeypatch, reference_dir, *init_args, *policy_args), "complete")
+    assert_logged_updates(reference_attempt)
+    expected_model, expected_optimizer, expected_metadata = LatestCheckpoint(
+        reference_dir / "checkpoints",
+    ).load(torch.device("cpu"))
+
+    resumed_dir = tmp_path / "frozen-resumed"
+    latest = LatestCheckpoint(resumed_dir / "checkpoints")
+    first = run_attempt(arguments(
+        monkeypatch, resumed_dir, *init_args, *policy_args, "--stop-after-step", "18",
+    ), "frozen")
+    frozen_updates = assert_logged_updates(first)
+    assert len(frozen_updates) == 18 and all(item["input_embedding_frozen"] for item in frozen_updates)
+    frozen_model, frozen_optimizer, frozen_metadata = latest.load(torch.device("cpu"))
+    assert_state_equal(frozen_model["transformer.wte.weight"], source_embedding)
+    wte_id = parameter_ids[-1]["transformer.wte.weight"]
+    assert wte_id not in frozen_optimizer["state"]
+    for name in ("eom_embedding", "summary_embedding"):
+        assert not torch.equal(frozen_model[name], initialized_models[-1][name])
+        assert frozen_optimizer["state"][parameter_ids[-1][name]]["step"] == 18
+    saved_contract = json.loads((resumed_dir / "run.json").read_text())["contract"]
+    assert saved_contract["training_config"]["freeze_input_embedding"] is True
+    assert saved_contract["training_config"]["num_iterations"] == 20
+    assert frozen_metadata["run_contract"] == saved_contract
+    assert frozen_metadata["dataloader_state_dict"] == {"consumed": 36}
+
+    # Continuation restores checkpoint provenance and the full-horizon schedule.
+    for path in source_dir.iterdir():
+        path.unlink()
+    source_dir.rmdir()
+    source_tokenizer.unlink()
+    crossing = run_attempt(arguments(
+        monkeypatch, resumed_dir, *policy_args, "--resume-latest", "--stop-after-step", "19",
+    ), "cross-boundary")
+    assert len(assert_logged_updates(crossing)) == 1
+    unfrozen_model, unfrozen_optimizer, _ = latest.load(torch.device("cpu"))
+    assert not torch.equal(unfrozen_model["transformer.wte.weight"], source_embedding)
+    assert unfrozen_optimizer["state"][wte_id]["step"] == 1
+    assert not (crossing / "embedding-initialization.json").exists()
+
+    final = run_attempt(arguments(
+        monkeypatch, resumed_dir, *policy_args, "--resume-latest",
+    ), "after-boundary")
+    assert len(assert_logged_updates(final)) == 1
+    actual_model, actual_optimizer, actual_metadata = latest.load(torch.device("cpu"))
+    assert_state_equal(actual_model, expected_model)
+    assert_state_equal(actual_optimizer, expected_optimizer)
+    assert actual_optimizer["state"][wte_id]["step"] == 2
+    assert actual_metadata["rng_state"] == expected_metadata["rng_state"]
+    assert actual_metadata["dataloader_state_dict"] == {"consumed": 40}
+    assert actual_metadata["run_contract"] == saved_contract
+
+
+def test_resume_rejects_freezing_random_initialization(training_environment, tmp_path, monkeypatch):
+    from nanochat.rlm_latest import LatestCheckpoint
+
+    output_dir = tmp_path / "random-freeze"
+    run_attempt(arguments(monkeypatch, output_dir, "--stop-after-step", "1"), "random")
+    latest = LatestCheckpoint(output_dir / "checkpoints")
+    previous_metadata = latest.metadata()
+    with pytest.raises(ValueError, match="pretrained"):
+        run_attempt(arguments(
+            monkeypatch, output_dir, "--resume-latest", "--freeze-input-embedding",
+        ), "reject-freeze")
+    assert latest.metadata() == previous_metadata
+
+
+@pytest.mark.parametrize("initially_frozen", [False, True])
+def test_resume_requires_matching_embedding_freeze_schedule(
+    training_environment, tmp_path, monkeypatch, initially_frozen,
+):
+    from nanochat.rlm_latest import LatestCheckpoint
+
+    source_dir, source_tokenizer, _ = training_environment
+    output_dir = tmp_path / "freeze-mismatch"
+    freeze_args = ("--freeze-input-embedding",) if initially_frozen else ()
+    run_attempt(arguments(
+        monkeypatch, output_dir, *source_arguments(source_dir, source_tokenizer), *freeze_args,
+        "--num-iterations", "10", "--stop-after-step", "1",
+    ), "original")
+    latest = LatestCheckpoint(output_dir / "checkpoints")
+    previous_metadata = latest.metadata()
+    changed_args = () if initially_frozen else ("--freeze-input-embedding",)
+    with pytest.raises(ValueError, match="matching|training|freeze"):
+        run_attempt(arguments(
+            monkeypatch, output_dir, *changed_args, "--num-iterations", "10", "--resume-latest",
+        ), "reject-changed-schedule")
+    assert latest.metadata() == previous_metadata
+
+
 def test_training_saves_update_two_before_final_without_periodic_saves(training_environment, tmp_path, monkeypatch):
     output_dir = tmp_path / "early-checkpoint"
     attempt = run_attempt(arguments(monkeypatch, output_dir, "--save-every", "0"), "complete")
@@ -619,8 +746,8 @@ def test_async_save_overlaps_backward_and_finishes_before_optimizer_mutation(tra
             first_save_finished.set()
         return result
 
-    def mark_second_backward(model, step):
-        require_gradients(model, step)
+    def mark_second_backward(model, step, *, frozen_parameter=None):
+        require_gradients(model, step, frozen_parameter=frozen_parameter)
         if step == 1:
             assert saving.wait(timeout=10), "the checkpoint worker never started"
             assert not first_save_finished.is_set()
@@ -688,6 +815,7 @@ def test_probe_does_not_publish_checkpoints(training_environment, tmp_path, monk
 
 
 @pytest.mark.parametrize("extra,match", [
+    (("--freeze-input-embedding",), "embedding"),
     (("--init-embedding-checkpoint-dir", "source"), "requires checkpoint directory, step, and source tokenizer together"),
     (("--init-embedding-step", "7", "--init-embedding-tokenizer", "tokenizer.pkl"), "requires checkpoint directory, step, and source tokenizer together"),
     (("--init-embedding-checkpoint-dir", "source", "--init-embedding-step", "7", "--init-embedding-tokenizer", "tokenizer.pkl", "--resume-from-step", "3"), "fresh-run only"),

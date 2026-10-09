@@ -32,6 +32,7 @@ class TrainingConfig:
     weight_decay: float = 0.28
     seed: int = 42
     compile: bool = True
+    freeze_input_embedding: bool = False
 
     def __post_init__(self):
         for name in ("device_batch_size", "total_batch_size", "num_iterations"):
@@ -65,6 +66,11 @@ class TrainingConfig:
     def prediction_targets_per_update(self, text_length):
         self.accumulation_steps(text_length)
         return self.total_batch_size + self.total_batch_size // text_length
+
+    @property
+    def input_embedding_frozen_updates(self):
+        """Leave the final ceil(budget / 10) complete updates trainable."""
+        return 9 * self.num_iterations // 10 if self.freeze_input_embedding else 0
 
     def lr_multiplier(self, step):
         if step < self.warmup_steps:
@@ -120,6 +126,15 @@ def apply_schedule(optimizer, config, step, initial_decay):
     return multiplier
 
 
+def apply_input_embedding_schedule(model, config, step):
+    frozen = step < config.input_embedding_frozen_updates
+    if config.freeze_input_embedding:
+        # Fixed groups preserve parameter identities on resume. Adam state is
+        # created only when the table first receives a trainable gradient.
+        model.transformer.wte.weight.requires_grad_(not frozen)
+    return frozen
+
+
 def episode_loss(forward_cycle, inputs, targets, text_length, cycles, timings=None):
     """Unroll one stable episode buffer with full gradients across every handoff."""
     if inputs.ndim != 2 or inputs.shape != targets.shape:
@@ -160,9 +175,13 @@ def episode_loss(forward_cycle, inputs, targets, text_length, cycles, timings=No
     return cycle_sums.sum() / count, cycle_sums.detach(), cycle_counts
 
 
-def require_finite_gradients(model, step):
+def require_finite_gradients(model, step, *, frozen_parameter=None):
     checks = []
     for name, parameter in model.named_parameters():
+        if parameter is frozen_parameter:
+            if parameter.requires_grad or parameter.grad is not None:
+                raise RuntimeError(f"Frozen input embedding has trainable state or a gradient at optimizer step {step}; update aborted")
+            continue
         if parameter.grad is None:
             raise RuntimeError(f"Missing gradient for {name} at optimizer step {step}; update aborted")
         checks.append(torch.isfinite(parameter.grad).all())
@@ -195,6 +214,8 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
     """Consume, backpropagate, then release each loader view before requesting another."""
     text_length = model.config.text_length
     accumulation = config.accumulation_steps(text_length)
+    input_embedding = model.transformer.wte.weight
+    input_embedding_frozen = apply_input_embedding_schedule(model, config, step)
     optimizer.zero_grad(set_to_none=True)
     cycle_sums = torch.zeros(config.cycles, device=model.get_device())
     cycle_counts = torch.zeros(config.cycles, dtype=torch.int64, device=model.get_device())
@@ -229,7 +250,9 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
         useful_positions += continuation
         # No loader prefetch can occur before the entire unroll's backward above.
         del loss, inputs, targets
-    require_finite_gradients(model, step)
+    require_finite_gradients(
+        model, step, frozen_parameter=input_embedding if input_embedding_frozen else None,
+    )
     checkpoint_wait = 0.0
     if before_optimizer_step is not None:
         waiting_started = time.monotonic()
@@ -244,6 +267,7 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
         memory_monitor.require_available(step)
     possible_handoffs = accumulation * config.device_batch_size * (config.cycles - 1)
     return {
+        "input_embedding_frozen": input_embedding_frozen,
         "checkpoint_wait_seconds": checkpoint_wait,
         "loss": (cycle_sums.sum() / cycle_counts.sum()).item(),
         "cycle_losses": (cycle_sums / cycle_counts).tolist(),

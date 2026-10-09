@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument("--init-embedding-checkpoint-dir", type=Path, help="fresh runs only: checkpoint directory providing transformer.wte.weight")
     parser.add_argument("--init-embedding-step", type=int, help="published source checkpoint step for input embedding initialization")
     parser.add_argument("--init-embedding-tokenizer", type=Path, help="source tokenizer.pkl; must exactly match the training tokenizer")
+    parser.add_argument("--freeze-input-embedding", action="store_true", help="freeze the pretrained input table for the first 90%% of the full update budget; EOM and summary inputs stay trainable")
     parser.add_argument("--save-every", type=int, help="training only; numbered checkpoint interval (default: 10), plus update 2 and the final/paused update; 0 disables periodic numbered saves")
     parser.add_argument("--keep-checkpoints", type=int, help="training only: numbered checkpoints to retain (default: 10), in addition to rolling latest")
     parser.add_argument("--checkpoint-mode", choices=("sync", "async"), default="async", help="async overlaps checkpoint writing with the next forward/backward; both modes warn and continue on save errors")
@@ -83,6 +84,8 @@ def parse_args():
             parser.error("--init-embedding-step must be nonnegative")
         if resuming:
             parser.error("embedding initialization is fresh-run only; resume restores its saved initialization provenance and trained weights")
+    if args.freeze_input_embedding and not resuming and args.init_embedding_checkpoint_dir is None:
+        parser.error("--freeze-input-embedding requires pretrained embedding initialization for a fresh run")
     if args.resume_from_step is not None and args.resume_from_step <= 0:
         parser.error("--resume-from-step must name a completed positive optimizer update")
     if args.stop_after_step is not None and not 0 < args.stop_after_step <= args.num_iterations:
@@ -207,6 +210,8 @@ def run(args, attempt):
         initialization = initializer.contract()
     else:
         initialization = {"kind": "random"}
+    if config.freeze_input_embedding and initialization["kind"] != "pretrained_input_token_embedding":
+        raise ValueError("Freezing the input embedding requires pretrained initialization provenance")
     model_config = RLMConfig(
         sequence_len=args.text_length + 1 + 2 * args.memory_tokens,
         vocab_size=tokenizer.get_vocab_size(), n_layer=args.depth,
@@ -273,6 +278,10 @@ def run(args, attempt):
         + [args.text_length + 1 + 2 * args.memory_tokens] * (args.cycles - 2)
         + [args.text_length + 1 + args.memory_tokens],
         "prediction_targets_per_update": config.prediction_targets_per_update(args.text_length),
+        "input_embedding_freeze": {
+            "frozen_updates": config.input_embedding_frozen_updates,
+            "first_trainable_update": config.input_embedding_frozen_updates + 1,
+        } if config.freeze_input_embedding else None,
     }), flush=True)
 
     optimizer_data = None

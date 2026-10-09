@@ -7,6 +7,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import nanochat.gpt as gpt_module
+import nanochat.rlm as rlm_module
 from nanochat.checkpoint_manager import find_last_step, load_checkpoint, save_checkpoint
 from nanochat.rlm import RecurrentGPT, RLMConfig
 from nanochat.rlm_training import (
@@ -140,11 +142,62 @@ def test_update_reports_text_and_eom_predictions_separately():
     assert metrics["text_tokens_per_second"] == pytest.approx(16 / metrics["duration_seconds"])
 
 
-@pytest.mark.parametrize("failure", ["missing_gradient", "nonfinite_gradient", "nonfinite_loss"])
+@pytest.fixture
+def isolated_cpu_compiler():
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    torch.compiler.reset()
+    try:
+        yield
+    finally:
+        torch.compiler.reset()
+        torch.set_num_threads(previous_threads)
+
+
+def test_compiled_update_unfreezes_input_embedding_at_final_tenth(monkeypatch, isolated_cpu_compiler):
+    monkeypatch.setattr(gpt_module, "COMPUTE_DTYPE", torch.float32)
+    monkeypatch.setattr(rlm_module, "COMPUTE_DTYPE", torch.float32)
+    model = small_model()
+    model.config.activation_checkpointing = True
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=0.1)
+    forward = torch.compile(model.forward_cycle, backend="aot_eager", dynamic=False)
+    config = TrainingConfig(
+        device_batch_size=2, total_batch_size=16, num_iterations=10,
+        freeze_input_embedding=True,
+    )
+    input_embedding = model.transformer.wte.weight
+    initial_input_embedding = input_embedding.detach().clone()
+    loader = ReusingLoader(episode_batches(2))
+
+    for step, expected_frozen in ((8, True), (9, False)):
+        extra_embeddings = {
+            name: parameter.detach().clone()
+            for name, parameter in (
+                ("summary_embedding", model.summary_embedding),
+                ("eom_embedding", model.eom_embedding),
+            )
+        }
+        metrics, _ = train_update(model, forward, optimizer, loader, config, step, 0)
+        assert metrics["input_embedding_frozen"] is expected_frozen
+        for name, before in extra_embeddings.items():
+            assert not torch.equal(getattr(model, name), before), name
+        if expected_frozen:
+            assert torch.equal(input_embedding, initial_input_embedding)
+            assert input_embedding not in optimizer.state
+        else:
+            assert not torch.equal(input_embedding, initial_input_embedding)
+            assert optimizer.state[input_embedding]["step"].item() == 1
+
+
+@pytest.mark.parametrize("failure", [
+    "missing_gradient", "unexpectedly_frozen_parameter", "nonfinite_gradient", "nonfinite_loss",
+])
 def test_invalid_episode_never_updates_parameters(failure):
     model = small_model()
     if failure == "missing_gradient":
         model.register_parameter("unused_parameter", torch.nn.Parameter(torch.ones(1)))
+    elif failure == "unexpectedly_frozen_parameter":
+        model.lm_head.weight.requires_grad_(False)
     elif failure == "nonfinite_gradient":
         model.summary_embedding.register_hook(lambda gradient: torch.full_like(gradient, float("inf")))
     original_forward = model.forward_cycle
@@ -157,8 +210,11 @@ def test_invalid_episode_never_updates_parameters(failure):
 
     before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
     optimizer = RecordingSGD(model.parameters())
-    config = TrainingConfig(device_batch_size=2, total_batch_size=16, compile=False)
-    error = RuntimeError if failure == "missing_gradient" else FloatingPointError
+    config = TrainingConfig(
+        device_batch_size=2, total_batch_size=16, compile=False,
+        freeze_input_embedding=failure == "unexpectedly_frozen_parameter",
+    )
+    error = RuntimeError if failure in ("missing_gradient", "unexpectedly_frozen_parameter") else FloatingPointError
     with pytest.raises(error, match="[Mm]issing gradient|[Nn]on-finite"):
         train_update(model, forward, optimizer, ReusingLoader(episode_batches(1)), config, 0, 0)
     assert optimizer.steps == 0

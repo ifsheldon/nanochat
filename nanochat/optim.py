@@ -276,6 +276,12 @@ class MuonAdamW(torch.optim.Optimizer):
         param_infos = {}
         for p in group['params']:
             grad = p.grad
+            if not p.requires_grad:
+                if grad is not None:
+                    raise RuntimeError("Frozen AdamW parameter has a gradient; optimizer step aborted")
+                continue
+            if grad is None:
+                raise RuntimeError("Missing gradient for trainable AdamW parameter; optimizer step aborted")
             if world_size == 1:
                 # Single rank: no communication, update the full param in place
                 param_infos[p] = dict(future=None, grad_slice=grad, is_small=True)
@@ -320,8 +326,7 @@ class MuonAdamW(torch.optim.Optimizer):
     def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
         param_infos = info['param_infos']
-        for p in group['params']:
-            pinfo = param_infos[p]
+        for p, pinfo in param_infos.items():
             if pinfo['future'] is not None:
                 pinfo['future'].wait()
             grad_slice = pinfo['grad_slice']

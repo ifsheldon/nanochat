@@ -25,7 +25,9 @@ The existing additional value embeddings apply only to text; memory, `<EOM>`, an
 Input normalization, smear, and the initial residual operate across the combined sequence; memory is extracted after backout and final normalization.
 RoPE positions restart at zero each cycle.
 The summary and `<EOM>` parameters use AdamW groups with the embedding learning-rate policy.
-All model parameters remain trainable, including the main input embedding, additional value embeddings, and untied LM head.
+By default all model parameters remain trainable, including the main input embedding, additional value embeddings, and untied LM head.
+For a run initialized from a pretrained input table, `--freeze-input-embedding` holds only that table fixed until the final 10% of the full training budget.
+The separate `<EOM>` and summary inputs, additional value embeddings, LM head, and Transformer stay trainable throughout; the tokenizer vocabulary is unchanged.
 The other proposed boundary/type tokens and auxiliary classification loss remain deferred.
 
 The existing BOS best-fit loader packs an entire episode before splitting its input and target tensors into chunks.
@@ -89,6 +91,7 @@ Production amortizes the optimizer and update health checks over all accumulatio
 Use ordinary unprofiled multi-update probes for speed comparisons.
 
 Artifacts include a Chrome trace, CPU/device operator tables, structured operator and device-event timings, per-phase scopes, memory measurements, and source/configuration fingerprints.
+When the recorded configuration enables scheduled input-embedding freezing, profiling applies the same policy at its first two diagnostic optimizer steps and records `input_embedding_frozen`.
 CUDA profiling fails explicitly if no CUDA device events were captured.
 The default records input shapes; `--no-record-shapes` avoids the additional tensor-reference retention associated with shape recording.
 Resource limits use the same environment variables and defaults as training.
@@ -165,6 +168,41 @@ The system-memory sampler spans training and checkpointing; async per-update CUD
 Writer durations overlap update durations in async mode and must not be added to estimate total runtime.
 Numbered saves add another write on their scheduled updates.
 
+### New run with scheduled input-embedding freezing
+
+Use `--freeze-input-embedding` together with the three `--init-embedding-*` options for a fresh run.
+Only the pretrained `transformer.wte.weight` table is frozen; copying happens before the freeze is applied, and the new `<EOM>` and summary parameters retain their fresh, trainable initialization.
+The table receives no gradient, weight decay, or Adam state updates while frozen.
+Its optimizer group remains in place, and its Adam moments are created on the first trainable update, using the learning rate at that point in the original schedule.
+The schedule freezes the first `floor(9 * num_iterations / 10)` completed updates and trains the table for the final `ceil(num_iterations / 10)` updates.
+For a 5574-update run, updates 1–5016 are frozen and update 5017 is the first trainable update.
+The initial configuration logs this boundary, and each update logs `input_embedding_frozen`.
+The compiled forward/backward may compile again when the table becomes trainable.
+
+The freeze policy is part of the saved training configuration.
+Resume keeps `--freeze-input-embedding` and the original full `--num-iterations`, restores trained weights and optimizer state, and omits the three initialization options.
+The completed checkpoint step determines the current phase; an early stop or a resumed invocation does not restart or shorten the freeze schedule.
+Freezing a run without pretrained initialization provenance or changing its freeze policy on resume is rejected.
+
+The next run can use the following command with a new output directory; it has not been launched:
+
+```bash
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_DTYPE=bfloat16 NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 \
+NANOCHAT_CUDA_MEMORY_LIMIT_GB=100 \
+NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=12 \
+NANOCHAT_CHECKPOINT_RESERVE_GB=100 \
+uv run --no-sync python -m scripts.rlm_train \
+    --mode train --num-iterations 5574 --cycles 4 \
+    --device-batch-size 32 --activation-checkpointing \
+    --save-every 10 --keep-checkpoints 10 --checkpoint-mode async \
+    --init-embedding-checkpoint-dir "$HOME/.cache/nanochat/spark-d24/base_checkpoints/spark-d24-bf16" \
+    --init-embedding-step 5568 \
+    --init-embedding-tokenizer "$HOME/.cache/nanochat/spark-d24/tokenizer/tokenizer.pkl" \
+    --freeze-input-embedding \
+    --output-dir "$HOME/.cache/nanochat/spark-rlm/pretrain-u4-b32-frozen-20261010"
+```
+
 ### Four-cycle pretraining with the step-5568 input embedding
 
 The selected full run uses four cycles, batch 32, activation checkpointing, and terminal-summary omission.
@@ -219,7 +257,8 @@ The latest complete checkpoint at that stop was update 300, so resuming will rep
 The subsequent rolling-checkpoint change bounds future loss while saves succeed; it cannot recover those already discarded weights, and warning-only save failures can increase the unsaved gap.
 `pause.json` records the stopped state, verified checkpoint files, environment, and resume arguments preserving the 5574-update horizon and latest-ten numbered-checkpoint policy.
 The first resume from the saved update 300 uses its reviewed source-transition receipt; after a new rolling checkpoint is published, use `--resume-latest` without that receipt.
-The prepared receipt and updated source snapshot are under this run's `resume-preparation/`; `pause.json` identifies the current source-bound receipt and complete first-resume command.
+The prepared receipt and source snapshot for the earlier pinned-staging implementation are under this run's `resume-preparation/`; `pause.json` preserves that source-bound receipt and first-resume command.
+The subsequent scheduled-freezing changes alter the source fingerprint, so resuming this older paused run with current sources requires a new explicit review and receipt.
 Preparing this change did not restart training or alter checkpoint 300 and the founding run record.
 
 The rolling save path was validated on October 9 using checkpoint 300 loaded on the GPU, without executing training updates.
@@ -455,7 +494,7 @@ The run, full source snapshot, explicit resource settings, and three-way `compar
 ### Historical frozen main input embedding probe
 
 The optional freezing policy and its CLI flag were removed after this experiment found no measurable speed benefit.
-Current training keeps all parameters trainable; the recorded results below describe the archived experiment.
+The recorded results below describe that archived experiment; the later pretrained-input policy above freezes the table on a schedule and has not undergone a full-size pretraining run.
 
 A subsequent two-update probe froze only `transformer.wte.weight` and kept the optimized `<EOM>` layout, batch 32, two cycles, activation checkpointing, seed, data, tokenizer, runtime, and resource limits above.
 The comparison uses update 2 from each run, after compilation and with optimizer state resident.
@@ -633,4 +672,5 @@ The subsequent pretrained-input initialization, retention, and integrated resume
 The rolling-checkpoint and interrupted-retention changes passed the full command on October 9 with 329 passed and 10 skipped, including the available CUDA tests, as well as the lock, runner syntax, and diff checks above.
 The subsequent async writer, warning-and-continue policy, ten-update defaults, and recoverable numbered publication passed the full command with 388 passed and 10 skipped, including actual CUDA copy-stream and state-round-trip tests.
 The pinned-staging follow-up passed with 392 tests and 10 skipped, including actual CUDA snapshot reuse, shared storage and strided views, exact latest/numbered state, failed-copy drainage, and the optimizer mutation barrier.
+The scheduled-freezing checks cover compiled unfreezing with activation checkpointing, exact resume across the freeze boundary, delayed Adam state in pinned checkpoints, and profiler freeze behavior.
 Run the project's full required checks before committing.

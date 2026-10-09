@@ -27,13 +27,16 @@ def parse_args():
     return args
 
 
-def diagnostic_episode(model, forward_cycle, optimizer, loader, config, monitor, optimizer_step):
+def diagnostic_episode(model, forward_cycle, optimizer, loader, config, monitor, optimizer_step, *, step):
     """Keep the loader's reusable storage alive until the entire unroll backpropagates."""
     import torch
-    from nanochat.rlm_training import episode_loss, require_finite_gradients, require_finite_state
+    from nanochat.rlm_training import (
+        apply_input_embedding_schedule, episode_loss, require_finite_gradients, require_finite_state,
+    )
     from nanochat.training_runtime import require_finite_loss
 
-    monitor.require_available(0)
+    monitor.require_available(step)
+    input_embedding_frozen = apply_input_embedding_schedule(model, config, step)
     optimizer.zero_grad(set_to_none=True)
     with torch.profiler.record_function("rlm.data.next_episode"):
         inputs, targets, loader_state = next(loader)
@@ -55,19 +58,22 @@ def diagnostic_episode(model, forward_cycle, optimizer, loader, config, monitor,
             scoped_cycle, inputs, targets, model.config.text_length, config.cycles,
         )
     with torch.profiler.record_function("rlm.health.loss"):
-        require_finite_loss(loss, 0)
+        require_finite_loss(loss, step)
     accumulation = config.accumulation_steps(model.config.text_length)
     with torch.profiler.record_function("rlm.episode.backward"):
         (loss / accumulation).backward()
     with torch.profiler.record_function("rlm.health.gradients"):
-        require_finite_gradients(model, 0)
-    monitor.require_available(0)
+        require_finite_gradients(
+            model, step,
+            frozen_parameter=model.transformer.wte.weight if input_embedding_frozen else None,
+        )
+    monitor.require_available(step)
     if optimizer_step:
         with torch.profiler.record_function("rlm.optimizer.step"):
             optimizer.step()
         with torch.profiler.record_function("rlm.health.model_optimizer_state"):
-            require_finite_state(model, optimizer, 0)
-    monitor.require_available(0)
+            require_finite_state(model, optimizer, step)
+    monitor.require_available(step)
     result = {
         "loss": loss.item(), "cycle_losses": (sums / counts).tolist(),
         "real_text_tokens": inputs.numel(), "supervised_predictions": counts.sum().item(),
@@ -75,6 +81,7 @@ def diagnostic_episode(model, forward_cycle, optimizer, loader, config, monitor,
             model.config.text_length, model.config.memory_tokens,
         ),
         "optimizer_step": optimizer_step, "dataloader_state": dict(loader_state),
+        "input_embedding_frozen": input_embedding_frozen,
     }
     with torch.profiler.record_function("rlm.gradients.release"):
         optimizer.zero_grad(set_to_none=True)
@@ -152,7 +159,7 @@ def profile_workload(model, forward_cycle, optimizer, loader, config, initial_de
                 started = time.monotonic()
                 result = diagnostic_episode(
                     model, forward_cycle, optimizer, loader, config, monitor,
-                    optimizer_step=index == 0,
+                    optimizer_step=index == 0, step=0 if index == 0 else 1,
                 )
                 synchronize(device)
                 result["duration_seconds"] = time.monotonic() - started
@@ -174,7 +181,7 @@ def profile_workload(model, forward_cycle, optimizer, loader, config, initial_de
             ) as profiler:
                 started = time.monotonic()
                 result = diagnostic_episode(
-                    model, forward_cycle, optimizer, loader, config, monitor, optimizer_step=True,
+                    model, forward_cycle, optimizer, loader, config, monitor, optimizer_step=True, step=1,
                 )
                 synchronize(device)
                 result["profiled_work_seconds"] = time.monotonic() - started

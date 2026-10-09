@@ -388,6 +388,50 @@ def test_async_staging_setup_failure_warns_without_publishing(tmp_path, monkeypa
     assert not (tmp_path / "latest.pt").exists()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned staging requires CUDA")
+def test_reused_cuda_stager_includes_adam_state_created_after_unfreezing(tmp_path):
+    model = torch.nn.Linear(4, 2, device="cuda")
+    model.weight.requires_grad_(False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.02)
+    writer = CheckpointWriter(tmp_path, mode="async", keep_last=2)
+    stager = None
+    try:
+        for step in (1, 2):
+            if step == 2:
+                model.weight.requires_grad_(True)
+            model(torch.ones(2, 4, device="cuda")).square().mean().backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            saved_metadata = metadata(step)
+            saved_metadata["run_contract"]["device_type"] = "cuda"
+            saved_metadata["rng_state"]["cuda"] = torch.cuda.get_rng_state().tolist()
+            writer.submit(model.state_dict(), optimizer.state_dict(), saved_metadata, numbered=True)
+            result = writer.wait(step)
+            assert result["status"] == "saved"
+            if step == 1:
+                assert model.weight not in optimizer.state
+                stager = writer._stager
+            else:
+                assert writer._stager is stager
+                assert optimizer.state[model.weight]["step"].item() == 1
+            expected_optimizer = optimizer.state_dict()
+            for saved_model, saved_optimizer, actual_metadata in (
+                LatestCheckpoint(tmp_path).load("cpu"),
+                load_checkpoint(tmp_path, step, "cpu", load_optimizer=True),
+            ):
+                assert actual_metadata == saved_metadata
+                for name, expected in model.state_dict().items():
+                    torch.testing.assert_close(saved_model[name], expected.cpu(), rtol=0, atol=0)
+                assert saved_optimizer["param_groups"] == expected_optimizer["param_groups"]
+                assert saved_optimizer["state"].keys() == expected_optimizer["state"].keys()
+                for index, state in expected_optimizer["state"].items():
+                    for name, expected in state.items():
+                        torch.testing.assert_close(saved_optimizer["state"][index][name], expected.cpu(), rtol=0, atol=0)
+    finally:
+        writer.close(2)
+
+
 def test_staging_future_completes_before_checkpoint_publication(tmp_path, monkeypatch):
     model, optimizer = initialized_model()
     staging_started, published = Event(), Event()

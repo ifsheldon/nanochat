@@ -13,7 +13,7 @@ Training also omits the final cycle's unused summary suffix after measuring the 
 At batch 32, the fresh original control averaged 195.11 seconds/update and the full-summary `<EOM>` run averaged 194.51 seconds; terminal-summary omission reduced this to 165.99 seconds and 55.90 GB peak reserved memory.
 The optimization preserved the objective and handoff, increased measured text throughput by 17.18% over full-summary `<EOM>`, and passed CPU equivalence tests; the workflow report records the small BF16 GPU gradient differences and the one failed near-zero scalar relative-tolerance check.
 Freezing only the main input embedding then saved 0.302 GB of peak allocated memory, or 0.54%, and produced no measurable speedup in a two-update batch-32 probe: update 2 took 165.94 seconds versus 165.90 seconds with trainable input embeddings.
-The experimental freezing option was removed after that measurement; all model parameters remain trainable.
+The experimental freezing option was removed after that measurement; the subsequent October 8 run kept all model parameters trainable.
 A four-cycle batch-32 probe then completed two updates under the requested 100 GB CUDA cap with 79.56 GB peak reserved memory and a 195.51-second steady update, retaining trainable embeddings and activation checkpointing.
 At the existing 5.84-billion-real-text-token budget, rounded to 5574 updates for `<EOM>`, this projects 12.61 days of training updates versus 10.71 days for optimized two-cycle batch-32 training, before startup, checkpointing, and evaluation overhead.
 The selected full pretraining run uses four cycles and batch 32, initializes only the main input token embedding from d24 step 5568, and keeps all parameters trainable.
@@ -28,6 +28,9 @@ A subsequent bounded Nsight profile found that GPU-to-CPU storage copies consume
 The pinned-staging follow-up reduced the same three-update total to 610.68 seconds, 14.56% below the previous async writer, and the warm non-final update to 198.69 seconds, an 8.64% reduction.
 Its checkpoint matched the final live state exactly; CUDA reservation stayed at 79.85 GB and minimum system available memory was 24.60 GB with the additional pinned host buffers.
 The production run remains paused at checkpoint 300 with a refreshed source-bound resume receipt; the workflow report includes the short-trial limits.
+The next requested run will load the same pretrained input table and freeze it until the final 10% of its full update budget, keeping the separate `<EOM>` and summary inputs and all other parameters trainable without changing the tokenizer vocabulary.
+The scheduled policy is implemented behind `--freeze-input-embedding`, with its phase reconstructed from the full budget and completed checkpoint step on resume; the new run has not started.
+The older run's saved receipt predates these source changes and requires renewed review before resuming with current code.
 The earlier batch-size measurements and six-update pilot describe the original layout without `<EOM>`; the current contract follows below.
 
 ## Objective and current decisions
@@ -50,7 +53,7 @@ The forward episode length and gradient unroll length must match initially: all 
 | Objective | Shifted text cross-entropy plus `<EOM>` predicting each chunk's first token |
 | Memory boundary tokens | Learned `<EOM>` every cycle; defer `<bom>`, `<bosum>`, and `<eosum>` |
 | Memory type objective | Defer `<M>` / `<S>` classification; initial auxiliary weight is zero |
-| Input embedding policy | All parameters remain trainable, including main input and value embeddings, LM head, `<EOM>`, and summary |
+| Input embedding policy | Next run freezes only the pretrained main input table for the first 90% of the full update budget, then trains it for the final 10%; value embeddings, LM head, `<EOM>`, summary, and Transformer stay trainable |
 
 These choices build on the [d24 configuration](SPARK_D24.md) and the [RLM proposal](../../recurrent-latent-memory/README.md).
 The RLM proposal is in a neighboring repository; the relative link assumes both repositories share a parent directory.

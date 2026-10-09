@@ -1,6 +1,7 @@
 """The diagnostic profile must contain a real warmed recurrent backward/update."""
 
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -50,8 +51,13 @@ def fixture():
     return model, optimizer, config, ReusingEpisodes()
 
 
-def test_profile_warms_resident_state_and_exports_real_backward_and_optimizer_events(tmp_path):
+@pytest.mark.parametrize("freeze_input_embedding", [False, True])
+def test_profile_warms_resident_state_and_exports_real_backward_and_optimizer_events(tmp_path, freeze_input_embedding):
     model, optimizer, config, loader = fixture()
+    config = replace(config, num_iterations=10, freeze_input_embedding=freeze_input_embedding)
+    initial_embedding = model.transformer.wte.weight.detach().clone()
+    initial_eom = model.eom_embedding.detach().clone()
+    initial_summary = model.summary_embedding.detach().clone()
     result = profile_workload(
         model, model.forward_cycle, optimizer, loader, config, 0.0, tmp_path,
         warmup_episodes=2,
@@ -72,6 +78,15 @@ def test_profile_warms_resident_state_and_exports_real_backward_and_optimizer_ev
     trace = json.loads((tmp_path / "trace.json").read_text())
     assert any(event.get("name") == "rlm.episode.backward" for event in trace["traceEvents"])
     assert all(parameter.grad is None for parameter in model.parameters())
+    assert result["input_embedding_frozen"] is freeze_input_embedding
+    assert not torch.equal(model.eom_embedding, initial_eom)
+    assert not torch.equal(model.summary_embedding, initial_summary)
+    if freeze_input_embedding:
+        assert torch.equal(model.transformer.wte.weight, initial_embedding)
+        assert model.transformer.wte.weight not in optimizer.state
+    else:
+        assert not torch.equal(model.transformer.wte.weight, initial_embedding)
+        assert model.transformer.wte.weight in optimizer.state
 
 
 def test_profile_rejects_nonfinite_warmup_without_creating_optimizer_state(tmp_path):

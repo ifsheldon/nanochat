@@ -236,6 +236,7 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
             timings=first_episode_timings if microstep == 0 else None,
         )
         require_finite_loss(loss, step)
+        last_batch_loss = loss.detach()
         if microstep == 0:
             synchronize(inputs.device)
             backward_started = time.monotonic()
@@ -266,11 +267,14 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
     if memory_monitor is not None:
         memory_monitor.require_available(step)
     possible_handoffs = accumulation * config.device_batch_size * (config.cycles - 1)
+    cycle_losses = (cycle_sums / cycle_counts).tolist()
     return {
         "input_embedding_frozen": input_embedding_frozen,
         "checkpoint_wait_seconds": checkpoint_wait,
         "loss": (cycle_sums.sum() / cycle_counts.sum()).item(),
-        "cycle_losses": (cycle_sums / cycle_counts).tolist(),
+        "last_batch_loss": last_batch_loss.item(),
+        "cycle_losses": cycle_losses,
+        **{f"cycle_{cycle}_loss": loss for cycle, loss in enumerate(cycle_losses, start=1)},
         "within_document_handoff_fraction": handoffs.item() / possible_handoffs,
         "continuation_text_fraction": useful_positions.item() / (possible_handoffs * text_length),
         "finite_loss_and_gradients": True,

@@ -204,13 +204,18 @@ def test_frozen_pretrained_embedding_resumes_exactly_before_and_after_unfreezing
         report = json.loads((attempt / "result.json").read_text())
         assert printed_updates == updates == report["updates"]
         for update in updates:
+            assert isinstance(update["last_batch_loss"], float)
+            assert update["cycle_1_loss"] == update["cycle_losses"][0]
+            assert update["cycle_2_loss"] == update["cycle_losses"][1]
+            assert update["loss"] == pytest.approx(sum(update["cycle_losses"]) / 2, rel=1e-6)
             assert update["input_embedding_frozen"] is (update["completed_updates"] <= 18)
         return updates
 
     monkeypatch.setattr(training_module, "build_optimizer", capture_initialization)
     reference_dir = tmp_path / "frozen-reference"
     reference_attempt = run_attempt(arguments(monkeypatch, reference_dir, *init_args, *policy_args), "complete")
-    assert_logged_updates(reference_attempt)
+    reference_updates = assert_logged_updates(reference_attempt)
+    assert any(abs(item["last_batch_loss"] - item["loss"]) > 1e-5 for item in reference_updates)
     expected_model, expected_optimizer, expected_metadata = LatestCheckpoint(
         reference_dir / "checkpoints",
     ).load(torch.device("cpu"))

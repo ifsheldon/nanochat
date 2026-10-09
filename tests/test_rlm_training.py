@@ -33,11 +33,11 @@ def small_model():
     return model
 
 
-def episode_batches(number, batch_size=2):
+def episode_batches(number, batch_size=2, cycles=2):
     generator = torch.Generator().manual_seed(901)
     result = []
     for _ in range(number):
-        tokens = torch.randint(1, 32, (batch_size, 9), generator=generator)
+        tokens = torch.randint(1, 32, (batch_size, 4 * cycles + 1), generator=generator)
         tokens[:, 0] = 0
         result.append((tokens[:, :-1].clone(), tokens[:, 1:].clone()))
     return result
@@ -75,10 +75,16 @@ class ReusingLoader:
 
 
 def manual_episode_loss(model, inputs, targets):
-    first = model.forward_cycle(inputs[:, :4])
-    second = model.forward_cycle(inputs[:, 4:], memory=first.memory)
-    logits = torch.cat((first.logits, second.logits), dim=1)
-    labels = torch.cat((inputs[:, :1], targets[:, :4], inputs[:, 4:5], targets[:, 4:]), dim=1)
+    memory = None
+    logits = []
+    labels = []
+    for start in range(0, inputs.shape[1], 4):
+        result = model.forward_cycle(inputs[:, start:start + 4], memory=memory)
+        memory = result.memory
+        logits.append(result.logits)
+        labels.extend((inputs[:, start:start + 1], targets[:, start:start + 4]))
+    logits = torch.cat(logits, dim=1)
+    labels = torch.cat(labels, dim=1)
     return F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-1)
 
 
@@ -99,17 +105,30 @@ def test_episode_loss_weights_valid_targets_and_preserves_handoff_gradients():
         torch.testing.assert_close(parameter.grad, expected_parameter.grad, msg=lambda message: f"{name}: {message}")
 
 
-def test_train_update_finishes_backward_before_reusing_loader_and_consumes_exact_batch():
+@pytest.mark.parametrize("cycles", [2, 3])
+def test_train_update_finishes_backward_before_reusing_loader_and_consumes_exact_batch(cycles):
     model = small_model()
     reference = copy.deepcopy(model)
-    batches = episode_batches(3)
+    batches = episode_batches(3, cycles=cycles)
     loader = ReusingLoader(batches)
     optimizer = RecordingSGD(model.parameters())
     reference_optimizer = RecordingSGD(reference.parameters())
-    config = TrainingConfig(device_batch_size=2, total_batch_size=48, compile=False)
+    config = TrainingConfig(cycles=cycles, device_batch_size=2, total_batch_size=24 * cycles, compile=False)
 
     expected_losses = []
+    expected_cycle_losses = []
     for inputs, targets in batches:
+        with torch.no_grad():
+            memory = None
+            cycle_losses = []
+            for start in range(0, inputs.shape[1], 4):
+                result = reference.forward_cycle(inputs[:, start:start + 4], memory=memory)
+                memory = result.memory
+                cycle_losses.append(F.cross_entropy(
+                    result.logits.reshape(-1, result.logits.size(-1)),
+                    torch.cat((inputs[:, start:start + 1], targets[:, start:start + 4]), dim=1).reshape(-1),
+                ))
+            expected_cycle_losses.append(torch.stack(cycle_losses))
         loss = manual_episode_loss(reference, inputs, targets)
         expected_losses.append(loss.detach())
         (loss / 3).backward()
@@ -122,6 +141,13 @@ def test_train_update_finishes_backward_before_reusing_loader_and_consumes_exact
     loader.state["consumed"] = 99
     assert loader_state["consumed"] == 3  # Returned progress owns its snapshot.
     assert metrics["loss"] == pytest.approx(torch.stack(expected_losses).mean().item(), rel=1e-6)
+    assert metrics["last_batch_loss"] == pytest.approx(expected_losses[-1].item(), rel=1e-6)
+    assert metrics["last_batch_loss"] != pytest.approx(metrics["loss"], rel=1e-5)
+    cycle_means = torch.stack(expected_cycle_losses).mean(dim=0).tolist()
+    assert metrics["cycle_losses"] == pytest.approx(cycle_means, rel=1e-6)
+    for cycle, expected in enumerate(cycle_means, start=1):
+        assert metrics[f"cycle_{cycle}_loss"] == pytest.approx(expected, rel=1e-6)
+        assert metrics[f"cycle_{cycle}_loss"] != pytest.approx(expected_cycle_losses[-1][cycle - 1].item(), rel=1e-5)
     for (name, parameter), (_, expected_parameter) in zip(model.named_parameters(), reference.named_parameters()):
         torch.testing.assert_close(parameter, expected_parameter, msg=lambda message: f"{name}: {message}")
         assert parameter.grad is None

@@ -70,6 +70,10 @@ The workflow retains a 72 GB peak-reserved acceptance target, including measured
 If batch 16 fails, keep its output directory and run a separately named case with `--device-batch-size 8`, or explicitly enable `--activation-checkpointing`.
 No automatic batch reduction conceals the requested configuration's result.
 Reports include per-update time, text throughput, internal-position throughput, cycle losses, compiler counters, memory peaks, and document-continuation statistics.
+Each update keeps `loss`, the mean over all supervised predictions in all accumulation batches, and adds `last_batch_loss`, the unscaled mean for the final accumulation batch across all cycles.
+It also logs one scalar per cycle, `cycle_1_loss` through `cycle_C_loss`, averaged over every batch in that update, alongside the existing `cycle_losses` list.
+These losses include `<EOM>` predictions and shifted text targets; equal-sized packed batches give each batch equal weight.
+The additional loss fields total `1 + C` and appear in the structured console output, `updates.jsonl`, and the result's per-update records.
 They do not estimate RLM FLOPs using the ordinary GPT token estimator.
 
 ## Operator profiling
@@ -258,7 +262,7 @@ The subsequent rolling-checkpoint change bounds future loss while saves succeed;
 `pause.json` records the stopped state, verified checkpoint files, environment, and resume arguments preserving the 5574-update horizon and latest-ten numbered-checkpoint policy.
 The first resume from the saved update 300 uses its reviewed source-transition receipt; after a new rolling checkpoint is published, use `--resume-latest` without that receipt.
 The prepared receipt and source snapshot for the earlier pinned-staging implementation are under this run's `resume-preparation/`; `pause.json` preserves that source-bound receipt and first-resume command.
-The subsequent scheduled-freezing changes alter the source fingerprint, so resuming this older paused run with current sources requires a new explicit review and receipt.
+The subsequent scheduled-freezing and loss-metric changes alter the source fingerprint, so resuming this older paused run with current sources requires a new explicit review and receipt.
 Preparing this change did not restart training or alter checkpoint 300 and the founding run record.
 
 The rolling save path was validated on October 9 using checkpoint 300 loaded on the GPU, without executing training updates.
@@ -672,5 +676,5 @@ The subsequent pretrained-input initialization, retention, and integrated resume
 The rolling-checkpoint and interrupted-retention changes passed the full command on October 9 with 329 passed and 10 skipped, including the available CUDA tests, as well as the lock, runner syntax, and diff checks above.
 The subsequent async writer, warning-and-continue policy, ten-update defaults, and recoverable numbered publication passed the full command with 388 passed and 10 skipped, including actual CUDA copy-stream and state-round-trip tests.
 The pinned-staging follow-up passed with 392 tests and 10 skipped, including actual CUDA snapshot reuse, shared storage and strided views, exact latest/numbered state, failed-copy drainage, and the optimizer mutation barrier.
-The scheduled-freezing checks cover compiled unfreezing with activation checkpointing, exact resume across the freeze boundary, delayed Adam state in pinned checkpoints, and profiler freeze behavior.
+The scheduled-freezing and additional loss logging changes passed with 406 tests and 10 skipped, including compiled unfreezing with activation checkpointing, exact resume across the freeze boundary, delayed Adam state in pinned checkpoints, profiler freeze behavior, and independent accumulation-loss checks.
 Run the project's full required checks before committing.

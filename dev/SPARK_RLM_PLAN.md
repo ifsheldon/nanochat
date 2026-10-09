@@ -30,6 +30,7 @@ Its checkpoint matched the final live state exactly; CUDA reservation stayed at 
 The production run remains paused at checkpoint 300 with a refreshed source-bound resume receipt; the workflow report includes the short-trial limits.
 The next requested run will load the same pretrained input table and freeze it until the final 10% of its full update budget, keeping the separate `<EOM>` and summary inputs and all other parameters trainable without changing the tokenizer vocabulary.
 The scheduled policy is implemented behind `--freeze-input-embedding`, with its phase reconstructed from the full budget and completed checkpoint step on resume; the new run has not started.
+Update logging adds the final accumulation batch's unscaled loss plus one scalar cycle mean across all accumulation batches, preserving the existing aggregate loss.
 The older run's saved receipt predates these source changes and requires renewed review before resuming with current code.
 The earlier batch-size measurements and six-update pilot describe the original layout without `<EOM>`; the current contract follows below.
 

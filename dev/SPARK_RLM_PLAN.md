@@ -28,8 +28,9 @@ A subsequent bounded Nsight profile found that GPU-to-CPU storage copies consume
 The pinned-staging follow-up reduced the same three-update total to 610.68 seconds, 14.56% below the previous async writer, and the warm non-final update to 198.69 seconds, an 8.64% reduction.
 Its checkpoint matched the final live state exactly; CUDA reservation stayed at 79.85 GB and minimum system available memory was 24.60 GB with the additional pinned host buffers.
 The production run remains paused at checkpoint 300 with a refreshed source-bound resume receipt; the workflow report includes the short-trial limits.
-The next requested run will load the same pretrained input table and freeze it until the final 10% of its full update budget, keeping the separate `<EOM>` and summary inputs and all other parameters trainable without changing the tokenizer vocabulary.
-The scheduled policy is implemented behind `--freeze-input-embedding`, with its phase reconstructed from the full budget and completed checkpoint step on resume; the new run has not started.
+The fresh October 10 run loaded the same pretrained input table and freezes it until the final 10% of its full update budget, keeping the separate `<EOM>` and summary inputs and all other parameters trainable without changing the tokenizer vocabulary.
+The scheduled policy is implemented behind `--freeze-input-embedding`, with its phase reconstructed from the full budget and completed checkpoint step on resume; `pretrain-u4-b32-frozen-20261010` started at 00:57 SGT with 5574 total updates and its first trainable input-table update at 5017.
+Its first two updates and checkpoint 2 passed startup verification: the input table remained bit-exact with no Adam state, `<EOM>` and summary inputs each had two Adam updates, and the second update took 196.11 seconds with loss 10.255392.
 Update logging adds the final accumulation batch's unscaled loss plus one scalar cycle mean across all accumulation batches, preserving the existing aggregate loss.
 RLM progress and checkpoint events use NanoChat's standard Python logger at `INFO`, with recoverable checkpoint errors at `WARNING`; the per-update duration is logged and independently persisted as full-precision `duration_seconds` in `updates.jsonl`.
 The older run's saved receipt predates these source changes and requires renewed review before resuming with current code.
@@ -55,7 +56,7 @@ The forward episode length and gradient unroll length must match initially: all 
 | Objective | Shifted text cross-entropy plus `<EOM>` predicting each chunk's first token |
 | Memory boundary tokens | Learned `<EOM>` every cycle; defer `<bom>`, `<bosum>`, and `<eosum>` |
 | Memory type objective | Defer `<M>` / `<S>` classification; initial auxiliary weight is zero |
-| Input embedding policy | Next run freezes only the pretrained main input table for the first 90% of the full update budget, then trains it for the final 10%; value embeddings, LM head, `<EOM>`, summary, and Transformer stay trainable |
+| Input embedding policy | October 10 run freezes only the pretrained main input table for the first 90% of the full update budget, then trains it for the final 10%; value embeddings, LM head, `<EOM>`, summary, and Transformer stay trainable |
 
 These choices build on the [d24 configuration](SPARK_D24.md) and the [RLM proposal](../../recurrent-latent-memory/README.md).
 The RLM proposal is in a neighboring repository; the relative link assumes both repositories share a parent directory.

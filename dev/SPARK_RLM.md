@@ -194,7 +194,7 @@ Resume keeps `--freeze-input-embedding` and the original full `--num-iterations`
 The completed checkpoint step determines the current phase; an early stop or a resumed invocation does not restart or shorten the freeze schedule.
 Freezing a run without pretrained initialization provenance or changing its freeze policy on resume is rejected.
 
-The next run can use the following command with a new output directory; it has not been launched:
+The fresh run was launched on October 10, 2026 at 00:57 SGT with committed training source `0bd758d2b56d1d8c9fe07bda80c36eb3be327d8f` and the following configuration:
 
 ```bash
 NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
@@ -212,6 +212,24 @@ uv run --no-sync python -m scripts.rlm_train \
     --freeze-input-embedding \
     --output-dir "$HOME/.cache/nanochat/spark-rlm/pretrain-u4-b32-frozen-20261010"
 ```
+
+The persistent user service is `nanochat-rlm-u4-b32-frozen-20261010.service`, using the locked `.venv/bin/python` and recording both output streams in `pretrain-u4-b32-frozen-20261010.log` beside the run directory.
+The adjacent `pretrain-u4-b32-frozen-20261010-launch.json` records the exact command, environment, revision, resource checks, and the passing 406-test suite with 10 skipped tests.
+Automatic restart is disabled; a failure or reboot requires an explicit resume from the latest complete checkpoint with the original budget and freeze policy.
+The older October 8 run remains paused and retains its existing checkpoints.
+
+```bash
+systemctl --user status nanochat-rlm-u4-b32-frozen-20261010.service
+tail -f "$HOME/.cache/nanochat/spark-rlm/pretrain-u4-b32-frozen-20261010.log"
+```
+
+Startup verification passed after two completed updates and publication of both rolling and numbered checkpoint 2.
+The updates had losses 10.369809 and 10.255392 and took 293.66 and 196.11 seconds; the first included compilation, while the second compiled no additional graphs.
+Both records contain `duration_seconds`, `last_batch_loss`, all four cycle means, `input_embedding_frozen: true`, and passing finite-state checks.
+The second update peaked at 77.421 GB allocated and 78.803 GB reserved, with minimum system available memory of 23.139 GB under the configured 100 GB allocator cap and 12 GB system guard.
+CPU mapping of the 9.766 GB numbered checkpoint verified that the input table's SHA-256 still matches the initialized pretrained table exactly and that it has no Adam state, while `<EOM>` and summary inputs each have Adam step 2.
+The check reconstructed parameter identities with a meta-device model and did not allocate a GPU model or interrupt training.
+The run's `startup-verification.json` records these checks, source provenance, and the service's active state at 01:06 SGT.
 
 ### Four-cycle pretraining with the step-5568 input embedding
 
@@ -504,7 +522,7 @@ The run, full source snapshot, explicit resource settings, and three-way `compar
 ### Historical frozen main input embedding probe
 
 The optional freezing policy and its CLI flag were removed after this experiment found no measurable speed benefit.
-The recorded results below describe that archived experiment; the later pretrained-input policy above freezes the table on a schedule and has not undergone a full-size pretraining run.
+The recorded results below describe that archived experiment; the October 10 pretraining run above uses the later pretrained-input policy that freezes the table on a schedule.
 
 A subsequent two-update probe froze only `transformer.wte.weight` and kept the optimized `<EOM>` layout, batch 32, two cycles, activation checkpointing, seed, data, tokenizer, runtime, and resource limits above.
 The comparison uses update 2 from each run, after compilation and with optimizer state resident.
@@ -684,4 +702,5 @@ The subsequent async writer, warning-and-continue policy, ten-update defaults, a
 The pinned-staging follow-up passed with 392 tests and 10 skipped, including actual CUDA snapshot reuse, shared storage and strided views, exact latest/numbered state, failed-copy drainage, and the optimizer mutation barrier.
 The scheduled-freezing and additional loss logging changes passed with 406 tests and 10 skipped, including compiled unfreezing with activation checkpointing, exact resume across the freeze boundary, delayed Adam state in pinned checkpoints, profiler freeze behavior, and independent accumulation-loss checks.
 The standard-library logging follow-up passed all 52 tests in `tests/test_rlm_train_cli.py` and `tests/test_rlm_checkpointing.py`, verifying per-update duration agreement between logs, JSONL, and results across resume, plus warning severity and checkpoint recovery.
+Before the October 10 launch, the complete current tree passed the full suite with 406 tests and 10 skipped, plus the uv lock, runner shell syntax, and diff whitespace checks.
 Run the project's full required checks before committing.

@@ -10,11 +10,15 @@ from datetime import datetime, timezone
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -127,12 +131,12 @@ def record_checkpoint_retention(checkpoint_dir, step, keep_last, attempt):
             stream.write(json.dumps({"published_step": step, **retention}) + "\n")
             stream.flush()
     except Exception as exc:
-        print(json.dumps({"checkpoint_warning": {
+        logger.warning("%s", json.dumps({"checkpoint_warning": {
             "step": step, "phase": "resume_retention", "type": type(exc).__name__,
             "message": str(exc), "training_continues": True,
-        }}), flush=True)
+        }}))
         return
-    print(json.dumps({"checkpoint_retention": retention}), flush=True)
+    logger.info("%s", json.dumps({"checkpoint_retention": retention}))
 
 
 def run(args, attempt):
@@ -184,10 +188,10 @@ def run(args, attempt):
         try:
             recover_numbered_checkpoint(checkpoint_dir)
         except Exception as exc:
-            print(json.dumps({"checkpoint_warning": {
+            logger.warning("%s", json.dumps({"checkpoint_warning": {
                 "step": step, "phase": "resume_publication", "type": type(exc).__name__,
                 "message": str(exc), "training_continues": True,
-            }}), flush=True)
+            }}))
         require_latest_resume_checkpoint(checkpoint_dir, step)
         if metadata is None:
             metadata = json.loads((checkpoint_dir / f"meta_{step:06d}.json").read_text())
@@ -272,7 +276,7 @@ def run(args, attempt):
         "started_at": datetime.now(timezone.utc).isoformat(),
         "resume_transition": transition,
     })
-    print(json.dumps({
+    logger.info("%s", json.dumps({
         "configuration": contract, "accumulation_steps": accumulation,
         "cycle_lengths": [args.text_length + 1 + args.memory_tokens]
         + [args.text_length + 1 + 2 * args.memory_tokens] * (args.cycles - 2)
@@ -282,7 +286,7 @@ def run(args, attempt):
             "frozen_updates": config.input_embedding_frozen_updates,
             "first_trainable_update": config.input_embedding_frozen_updates + 1,
         } if config.freeze_input_embedding else None,
-    }), flush=True)
+    }))
 
     optimizer_data = None
     model_data = None
@@ -308,10 +312,10 @@ def run(args, attempt):
                 try:
                     save_numbered_checkpoint(checkpoint_dir, step, model_data, optimizer_data, metadata)
                 except Exception as exc:
-                    print(json.dumps({"checkpoint_warning": {
+                    logger.warning("%s", json.dumps({"checkpoint_warning": {
                         "step": step, "phase": "resume_numbered", "type": type(exc).__name__,
                         "message": str(exc), "training_continues": True,
-                    }}), flush=True)
+                    }}))
                 else:
                     write_json(attempt / "checkpoint-repair.json", {"step": step, "source": "latest.pt"})
                 synchronize(device)
@@ -331,12 +335,12 @@ def run(args, attempt):
     elif initializer is not None:
         initialization_proof = initializer.initialize(model)
         write_json(attempt / "embedding-initialization.json", initialization_proof)
-        print(json.dumps({"embedding_initialization": initialization_proof}), flush=True)
+        logger.info("%s", json.dumps({"embedding_initialization": initialization_proof}))
         del initializer
     model.train()
     optimizer, decay = build_optimizer(model, config)
     parameter_counts = model.num_scaling_params()
-    print(json.dumps({"parameter_counts": parameter_counts}), flush=True)
+    logger.info("%s", json.dumps({"parameter_counts": parameter_counts}))
     if optimizer_data is not None:
         optimizer.load_state_dict(optimizer_data)
         del optimizer_data
@@ -369,10 +373,10 @@ def run(args, attempt):
                 try:
                     write_json(attempt / "checkpoint-measurements.json", checkpoint_measurements)
                 except OSError as exc:
-                    print(json.dumps({"checkpoint_warning": {
+                    logger.warning("%s", json.dumps({"checkpoint_warning": {
                         "step": step, "phase": "measurements", "type": type(exc).__name__,
                         "message": str(exc), "training_continues": True,
-                    }}), flush=True)
+                    }}))
 
         def before_optimizer_step():
             writer.wait(completed_step=step)
@@ -395,7 +399,8 @@ def run(args, attempt):
                 with metrics_path.open("a") as stream:
                     stream.write(json.dumps(metrics, allow_nan=False) + "\n")
                     stream.flush()
-                print(json.dumps(metrics), flush=True)
+                logger.info("%s", json.dumps(metrics))
+                logger.info("Update %d/%d: %.2f s", step, args.num_iterations, metrics["duration_seconds"])
                 if writer is not None:
                     numbered = step == 2 or step == endpoint or bool(args.save_every and step % args.save_every == 0)
                     synchronize(device)
@@ -405,7 +410,7 @@ def run(args, attempt):
                         saved_metadata["resume_transition"] = transition
                     writer.submit(model.state_dict(), optimizer.state_dict(), saved_metadata, numbered=numbered)
                     record_checkpoint_measurements()
-                    print(json.dumps({"checkpoint_status": writer.status(step)}), flush=True)
+                    logger.info("%s", json.dumps({"checkpoint_status": writer.status(step)}))
         finally:
             if writer is not None:
                 writer.close(completed_step=step)
@@ -437,7 +442,7 @@ def run(args, attempt):
     }
     write_json(attempt / "result.json", report)
     write_json(args.output_dir / "result.json", report)
-    print(json.dumps({"result": str(attempt / "result.json"), "status": report["status"]}), flush=True)
+    logger.info("%s", json.dumps({"result": str(attempt / "result.json"), "status": report["status"]}))
 
 
 def main():

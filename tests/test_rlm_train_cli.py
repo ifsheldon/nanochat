@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import asdict
 import hashlib
 import json
+import logging
 from pathlib import Path
 import sys
 from threading import Event
@@ -173,10 +174,11 @@ def test_fresh_transfer_retention_and_resume_match_uninterrupted_training(traini
 
 
 def test_frozen_pretrained_embedding_resumes_exactly_before_and_after_unfreezing(
-    training_environment, tmp_path, monkeypatch, capsys,
+    training_environment, tmp_path, monkeypatch, caplog,
 ):
     from nanochat.rlm_latest import LatestCheckpoint
 
+    caplog.set_level(logging.INFO, logger=rlm_train.logger.name)
     source_dir, source_tokenizer, source_embedding = training_environment
     init_args = source_arguments(source_dir, source_tokenizer)
     policy_args = ("--freeze-input-embedding", "--num-iterations", "20", "--total-batch-size", "32")
@@ -197,18 +199,27 @@ def test_frozen_pretrained_embedding_resumes_exactly_before_and_after_unfreezing
         return optimizer, decay
 
     def assert_logged_updates(attempt):
-        output = capsys.readouterr().out
-        printed = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
-        printed_updates = [item for item in printed if "completed_updates" in item and "loss" in item]
+        records = [record for record in caplog.records if record.name == rlm_train.logger.name]
+        events = [json.loads(record.getMessage()) for record in records if record.getMessage().startswith("{")]
+        logged_updates = [item for item in events if "completed_updates" in item and "loss" in item]
+        progress = [record for record in records if record.getMessage().startswith("Update ")]
         updates = [json.loads(line) for line in (attempt / "updates.jsonl").read_text().splitlines()]
         report = json.loads((attempt / "result.json").read_text())
-        assert printed_updates == updates == report["updates"]
+        assert logged_updates == updates == report["updates"]
+        assert len(progress) == len(updates)
+        assert all(record.levelno == logging.INFO for record in records)
+        assert [record.getMessage() for record in progress] == [
+            f"Update {update['completed_updates']}/20: {update['duration_seconds']:.2f} s"
+            for update in updates
+        ]
         for update in updates:
+            assert update["duration_seconds"] > 0
             assert isinstance(update["last_batch_loss"], float)
             assert update["cycle_1_loss"] == update["cycle_losses"][0]
             assert update["cycle_2_loss"] == update["cycle_losses"][1]
             assert update["loss"] == pytest.approx(sum(update["cycle_losses"]) / 2, rel=1e-6)
             assert update["input_embedding_frozen"] is (update["completed_updates"] <= 18)
+        caplog.clear()
         return updates
 
     monkeypatch.setattr(training_module, "build_optimizer", capture_initialization)
@@ -388,9 +399,10 @@ def test_latest_saves_every_update_and_resumes_interruption_exactly(training_env
 
 
 @pytest.mark.parametrize("checkpoint_mode", ["sync", "async"])
-def test_latest_save_failure_warns_and_next_update_recovers(training_environment, tmp_path, monkeypatch, capsys, checkpoint_mode):
+def test_latest_save_failure_warns_and_next_update_recovers(training_environment, tmp_path, monkeypatch, caplog, checkpoint_mode):
     from nanochat.rlm_latest import LatestCheckpoint
 
+    caplog.set_level(logging.INFO, logger="nanochat.rlm_checkpointing")
     reference_dir = tmp_path / "reference"
     run_attempt(arguments(
         monkeypatch, reference_dir, "--checkpoint-mode", checkpoint_mode, "--num-iterations", "3",
@@ -398,7 +410,7 @@ def test_latest_save_failure_warns_and_next_update_recovers(training_environment
     expected_model, expected_optimizer, expected_metadata = LatestCheckpoint(
         reference_dir / "checkpoints",
     ).load(torch.device("cpu"))
-    capsys.readouterr()
+    caplog.clear()
     output_dir = tmp_path / "save-failure"
     latest = LatestCheckpoint(output_dir / "checkpoints")
     save = LatestCheckpoint.save
@@ -434,15 +446,17 @@ def test_latest_save_failure_warns_and_next_update_recovers(training_environment
     assert measurements[1]["latest_step"] == 1
     assert measurements[2]["latest_published"] is True
     assert measurements[2]["latest_step"] == 3
-    output = capsys.readouterr().out
-    assert "checkpoint_warning" in output and "simulated checkpoint write failure" in output
-    published = [json.loads(line)["checkpoint_latest"] for line in output.splitlines() if line.startswith('{"checkpoint_latest":')]
+    warnings = [record for record in caplog.records if record.getMessage().startswith('{"checkpoint_warning":')]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert "simulated checkpoint write failure" in warnings[0].getMessage()
+    published = [json.loads(record.getMessage())["checkpoint_latest"] for record in caplog.records
+                 if record.getMessage().startswith('{"checkpoint_latest":')]
     assert [item["step"] for item in published] == [1, 3]
 
 
 @pytest.mark.parametrize("checkpoint_mode", ["sync", "async"])
 @pytest.mark.parametrize("first_failed_step", [1, 2])
-def test_repeated_checkpoint_failures_report_missing_or_stale_latest(training_environment, tmp_path, monkeypatch, capsys, checkpoint_mode, first_failed_step):
+def test_repeated_checkpoint_failures_report_missing_or_stale_latest(training_environment, tmp_path, monkeypatch, caplog, checkpoint_mode, first_failed_step):
     from nanochat.rlm_latest import LatestCheckpoint
 
     output_dir = tmp_path / "stale-latest"
@@ -469,12 +483,13 @@ def test_repeated_checkpoint_failures_report_missing_or_stale_latest(training_en
     for status in (result["checkpoint_measurements"][-1], result["checkpoint_status"]):
         assert status["latest_step"] == expected_latest_step
         assert status["latest_lag_completed_updates"] == expected_lag
-    warnings = [json.loads(line)["checkpoint_warning"] for line in capsys.readouterr().out.splitlines() if line.startswith('{"checkpoint_warning":')]
+    warnings = [record for record in caplog.records if record.getMessage().startswith('{"checkpoint_warning":')]
     assert len(warnings) == 4 - first_failed_step
+    assert all(record.levelno == logging.WARNING for record in warnings)
 
 
 @pytest.mark.parametrize("checkpoint_mode", ["sync", "async"])
-def test_numbered_save_failure_preserves_latest_and_recovers(training_environment, tmp_path, monkeypatch, capsys, checkpoint_mode):
+def test_numbered_save_failure_preserves_latest_and_recovers(training_environment, tmp_path, monkeypatch, caplog, checkpoint_mode):
     import nanochat.rlm_checkpoints as retention_module
     from nanochat.rlm_latest import LatestCheckpoint
 
@@ -503,7 +518,8 @@ def test_numbered_save_failure_preserves_latest_and_recovers(training_environmen
     assert result["completed_updates"] == 3
     assert result["checkpoint_measurements"][1]["latest_published"] is True
     assert result["checkpoint_measurements"][1]["numbered_published"] is False
-    assert "simulated numbered checkpoint write failure" in capsys.readouterr().out
+    assert any(record.levelno == logging.WARNING and "simulated numbered checkpoint write failure" in record.getMessage()
+               for record in caplog.records)
 
 
 def test_latest_resume_repairs_interrupted_numbered_checkpoint(training_environment, tmp_path, monkeypatch):

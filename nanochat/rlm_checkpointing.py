@@ -5,6 +5,7 @@ import copy
 from dataclasses import dataclass
 from enum import Enum
 import json
+import logging
 from pathlib import Path
 import time
 
@@ -13,6 +14,9 @@ from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 
 from nanochat.rlm_checkpoints import prune_checkpoints, save_numbered_checkpoint
 from nanochat.rlm_latest import LatestCheckpoint
+
+
+logger = logging.getLogger(__name__)
 
 
 class CheckpointMode(str, Enum):
@@ -64,8 +68,8 @@ class _CheckpointRequest:
     snapshot_seconds: float
 
 
-def _emit(name, value):
-    print(json.dumps({name: value}, allow_nan=False), flush=True)
+def _emit(name, value, *, level=logging.INFO):
+    logger.log(level, json.dumps({name: value}, allow_nan=False))
 
 
 class CheckpointWriter:
@@ -135,7 +139,7 @@ class CheckpointWriter:
         _emit("checkpoint_warning", {
             "step": result["step"], "latest_path": str(self.store.path),
             "training_continues": True, **detail,
-        })
+        }, level=logging.WARNING)
 
     def submit(self, model_data, optimizer_data, metadata, *, numbered: bool):
         if self._closed:

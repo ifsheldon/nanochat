@@ -70,6 +70,12 @@ The workflow retains a 72 GB peak-reserved acceptance target, including measured
 If batch 16 fails, keep its output directory and run a separately named case with `--device-batch-size 8`, or explicitly enable `--activation-checkpointing`.
 No automatic batch reduction conceals the requested configuration's result.
 Reports include per-update time, text throughput, internal-position throughput, cycle losses, compiler counters, memory peaks, and document-continuation statistics.
+RLM configuration, progress, and checkpoint events use Python's standard `logging` through NanoChat's existing console handler, which writes timestamps, logger names, and severity to stderr and flushes each message.
+Normal events use `INFO`; recoverable checkpoint errors use `WARNING`.
+After each completed update, an `INFO` message reports `Update <step>/<full budget>: <seconds> s`, rounded to two decimal places from the synchronized `duration_seconds`.
+The full-precision numeric `duration_seconds` is written and flushed to the attempt's `updates.jsonl` after every completed update and retained in the result's per-update records, independently of console log filtering.
+The JSONL file contains raw JSON without log prefixes; console JSON messages carry the handler's timestamp and severity prefix.
+This includes data loading, forward/backward, optimizer work, health checks, and checkpoint waiting inside that update; current checkpoint submission/writing and final writer draining are measured separately.
 Each update keeps `loss`, the mean over all supervised predictions in all accumulation batches, and adds `last_batch_loss`, the unscaled mean for the final accumulation batch across all cycles.
 It also logs one scalar per cycle, `cycle_1_loss` through `cycle_C_loss`, averaged over every batch in that update, alongside the existing `cycle_losses` list.
 These losses include `<EOM>` predictions and shifted text targets; equal-sized packed batches give each batch equal weight.
@@ -133,7 +139,7 @@ Use `--checkpoint-mode sync` to finish checkpointing before starting the next up
 This single file contains the full model, optimizer, and metadata together; the replacement is written to a temporary file, flushed and fsynced, atomically published, and followed by a directory fsync.
 The bundle's `metadata.step` identifies its completed update; publication logs and the result's `checkpoint_status` also report the last confirmed durable update and its lag behind completed training.
 While saves succeed, stopping during an update or its save loses at most one completed optimizer update, plus any unfinished computation.
-Checkpoint write and retention errors print structured warnings and training continues; subsequent updates retry saving, so repeated errors can leave `latest` multiple updates behind.
+Checkpoint write and retention errors log structured `WARNING` messages and training continues; subsequent updates retry saving, so repeated errors can leave `latest` multiple updates behind.
 Staging failures also warn and retry after queued copies have drained; if CUDA itself cannot synchronize after a failed stage, training fails because parameter mutation would be unsafe.
 The writer still finishes or fails before the next optimizer step, so warning-and-continue never permits a save to race with parameter mutation.
 Normal completion and explicit update-boundary stops drain the final writer before reporting the saved step.
@@ -262,7 +268,7 @@ The subsequent rolling-checkpoint change bounds future loss while saves succeed;
 `pause.json` records the stopped state, verified checkpoint files, environment, and resume arguments preserving the 5574-update horizon and latest-ten numbered-checkpoint policy.
 The first resume from the saved update 300 uses its reviewed source-transition receipt; after a new rolling checkpoint is published, use `--resume-latest` without that receipt.
 The prepared receipt and source snapshot for the earlier pinned-staging implementation are under this run's `resume-preparation/`; `pause.json` preserves that source-bound receipt and first-resume command.
-The subsequent scheduled-freezing and loss-metric changes alter the source fingerprint, so resuming this older paused run with current sources requires a new explicit review and receipt.
+The subsequent scheduled-freezing and logging changes alter the source fingerprint, so resuming this older paused run with current sources requires a new explicit review and receipt.
 Preparing this change did not restart training or alter checkpoint 300 and the founding run record.
 
 The rolling save path was validated on October 9 using checkpoint 300 loaded on the GPU, without executing training updates.
@@ -677,4 +683,5 @@ The rolling-checkpoint and interrupted-retention changes passed the full command
 The subsequent async writer, warning-and-continue policy, ten-update defaults, and recoverable numbered publication passed the full command with 388 passed and 10 skipped, including actual CUDA copy-stream and state-round-trip tests.
 The pinned-staging follow-up passed with 392 tests and 10 skipped, including actual CUDA snapshot reuse, shared storage and strided views, exact latest/numbered state, failed-copy drainage, and the optimizer mutation barrier.
 The scheduled-freezing and additional loss logging changes passed with 406 tests and 10 skipped, including compiled unfreezing with activation checkpointing, exact resume across the freeze boundary, delayed Adam state in pinned checkpoints, profiler freeze behavior, and independent accumulation-loss checks.
+The standard-library logging follow-up passed all 52 tests in `tests/test_rlm_train_cli.py` and `tests/test_rlm_checkpointing.py`, verifying per-update duration agreement between logs, JSONL, and results across resume, plus warning severity and checkpoint recovery.
 Run the project's full required checks before committing.

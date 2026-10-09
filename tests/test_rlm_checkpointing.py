@@ -3,6 +3,7 @@
 import copy
 from concurrent.futures import Future
 import json
+import logging
 from threading import Event
 
 import pytest
@@ -110,7 +111,8 @@ def test_async_freezes_schedule_loader_rng_and_containers_but_aliases_tensor_sto
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
-def test_failed_latest_warns_keeps_prior_update_and_next_save_recovers(tmp_path, monkeypatch, capsys, mode):
+def test_failed_latest_warns_keeps_prior_update_and_next_save_recovers(tmp_path, monkeypatch, caplog, mode):
+    caplog.set_level(logging.INFO, logger="nanochat.rlm_checkpointing")
     model, optimizer = initialized_model()
     original = LatestCheckpoint.save
 
@@ -137,11 +139,19 @@ def test_failed_latest_warns_keeps_prior_update_and_next_save_recovers(tmp_path,
         writer.close(3)
     assert LatestCheckpoint(tmp_path).metadata()["step"] == 3
     assert writer.measurements[-1]["latest_lag_completed_updates"] == 0
-    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    warnings = [event["checkpoint_warning"] for event in events if "checkpoint_warning" in event]
+    events = [
+        (record, json.loads(record.getMessage()))
+        for record in caplog.records if record.name == "nanochat.rlm_checkpointing"
+    ]
+    warnings = [(record, event["checkpoint_warning"]) for record, event in events if "checkpoint_warning" in event]
     assert len(warnings) == 1
-    assert warnings[0]["training_continues"] is True
-    assert warnings[0]["step"] == 2
+    warning_record, warning = warnings[0]
+    assert warning_record.levelno == logging.WARNING
+    assert warning["training_continues"] is True
+    assert warning["step"] == 2
+    published = [(record, event["checkpoint_latest"]) for record, event in events if "checkpoint_latest" in event]
+    assert [event["step"] for _, event in published] == [1, 3]
+    assert all(record.levelno == logging.INFO for record, _ in published)
 
 
 @pytest.mark.parametrize("phase", ["numbered", "retention"])

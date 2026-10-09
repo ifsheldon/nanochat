@@ -31,6 +31,7 @@ The production run remains paused at checkpoint 300 with a refreshed source-boun
 The next requested run will load the same pretrained input table and freeze it until the final 10% of its full update budget, keeping the separate `<EOM>` and summary inputs and all other parameters trainable without changing the tokenizer vocabulary.
 The scheduled policy is implemented behind `--freeze-input-embedding`, with its phase reconstructed from the full budget and completed checkpoint step on resume; the new run has not started.
 Update logging adds the final accumulation batch's unscaled loss plus one scalar cycle mean across all accumulation batches, preserving the existing aggregate loss.
+RLM progress and checkpoint events use NanoChat's standard Python logger at `INFO`, with recoverable checkpoint errors at `WARNING`; the per-update duration is logged and independently persisted as full-precision `duration_seconds` in `updates.jsonl`.
 The older run's saved receipt predates these source changes and requires renewed review before resuming with current code.
 The earlier batch-size measurements and six-update pilot describe the original layout without `<EOM>`; the current contract follows below.
 

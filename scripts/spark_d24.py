@@ -1,4 +1,4 @@
-"""Staged, local-only d24 training on one DGX Spark. See dev/SPARK_D24.md."""
+"""Staged, local-only d24 training on one DGX Spark. See dev/spark-training/SPARK_D24.md."""
 
 import argparse
 import csv

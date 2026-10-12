@@ -38,7 +38,7 @@ New benchmark outputs default to `training_run/spark-d24/benchmarks/<UTC timesta
 Pass `--output-dir` to choose a different new output directory.
 Datasets default to the project `datasets/` directory; `NANOCHAT_DATASETS_DIR` can select an explicit location.
 Existing benchmark outputs and production checkpoints remain at their historical paths.
-See [project storage](PROJECT_STORAGE.md) for the shared data and run directory contract.
+See [project storage](../PROJECT_STORAGE.md) for the shared data and run directory contract.
 The runner uses a fresh process for each of the eight combinations and writes per-case logs/JSON, aggregate `results.json`, the Git revision/diff, and copies of the benchmark and attention source.
 It continues to the next combination after a failed case and exits nonzero if any case failed.
 It never reduces an individual case's batch size after OOM.

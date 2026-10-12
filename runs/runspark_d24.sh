@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run from the repository root. See dev/SPARK_D24.md.
+# Run from the repository root. See dev/spark-training/SPARK_D24.md.
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/_common.sh" spark-d24 170
 export NANOCHAT_CUDA_MEMORY_LIMIT_GB=80

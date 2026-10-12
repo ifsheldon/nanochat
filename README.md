@@ -119,8 +119,8 @@ The important thing to note is that nanochat is written and configured around on
 
 ## Running on CPU / MPS
 
-For a single-GPU DGX Spark version of the small demo, including a smoke test, see [DGX Spark small experiments](dev/SPARK.md).
-For the complete d24 pipeline with an 80 GB CUDA allocator limit, checkpoint recovery, and full evaluations, see [DGX Spark d24 training](dev/SPARK_D24.md).
+For a single-GPU DGX Spark version of the small demo, including a smoke test, see [DGX Spark small experiments](dev/spark-training/SPARK.md).
+For the complete d24 pipeline with an 80 GB CUDA allocator limit, checkpoint recovery, and full evaluations, see [DGX Spark d24 training](dev/spark-training/SPARK_D24.md).
 
 SFT packs complete conversations when possible and truncates the shortest oversized conversation only when none fits an empty row.
 Examples without assistant targets inside the context window are excluded and counted toward dataset progress; a dataset cycle with no usable targets on a rank raises an error.
@@ -136,7 +136,7 @@ Set `NANOCHAT_ATTENTION_IMPL=sdpa` to bypass remote FA3 discovery; the default `
 Install `uv sync --extra gpu --extra fa4` and set `NANOCHAT_ATTENTION_IMPL=fa4` to require Flash Attention 4 for BF16/FP16 attention on a supported CUDA GPU.
 FA4 is explicitly selected and raises an error when unavailable; `auto` continues to select FA3 or SDPA.
 The `--fp8` pretraining option applies to linear layers while attention retains the selected compute dtype.
-See [the Spark FA4 comparison](dev/SPARK_FA4.md) for the D24 full/sliding-window × SDPA/FA4 × BF16/FP8 benchmark.
+See [the Spark FA4 comparison](dev/spark-training/SPARK_FA4.md) for the D24 full/sliding-window × SDPA/FA4 × BF16/FP8 benchmark.
 
 Checkpoint files are written through temporary files, with metadata published last; checkpoint selection ignores unpublished steps.
 `NANOCHAT_CHECKPOINT_RESERVE_GB` reserves free disk space in addition to the estimated checkpoint size.
@@ -167,6 +167,8 @@ How it works: model weights are stored in fp32 (for optimizer precision), but ou
 Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT supports this too but RL currently does not. Inference in fp16 works fine everywhere.
 
 ## Guides
+
+See the [development documentation index](dev/README.md) for hardware-specific training guides and RLM design documents.
 
 I've published a number of guides that might contain helpful information, most recent to least recent:
 

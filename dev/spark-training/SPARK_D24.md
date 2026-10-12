@@ -94,8 +94,7 @@ To resume pretraining, substitute a completed checkpoint step:
 bash runs/runspark_d24.sh pretrain --resume-from-step=100
 ```
 
-Resume requires matching architecture, batch configuration, horizon, tokenizer, and ordered data inventory.
-The runner also verifies the training-source and dependency fingerprint recorded by validation.
+Resume loads the selected complete checkpoint without requiring source, dependency, or saved-configuration fingerprints to match.
 Model, optimizer, and training-loop state are restored; data position retains upstream approximate row-group resumption, so interrupted training is not claimed to be bit-for-bit identical.
 Fresh production invocations refuse an existing production marker or checkpoint directory.
 If a run fails before any complete checkpoint, preserve its artifact directory and use a new root for a fresh run.

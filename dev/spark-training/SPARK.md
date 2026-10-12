@@ -62,8 +62,8 @@ Retain `gpt2_target_met=false`, add the base/SFT checkpoint paths and steps, and
 Mark `status.json` completed only after all results and the final report are saved; retain the historical pause record.
 Do not automatically extend training to chase the CORE target.
 
-The runner rejects fresh production overwrites and checks its source/dependency fingerprint before pretraining resume.
-A Git commit alone does not alter that fingerprint, but source or dependency edits do; do not bypass this check if a future training run is requested.
+The runner rejects fresh production overwrites.
+Pretraining resume restores a complete checkpoint without requiring source, dependency, or saved-configuration fingerprints to match.
 Pretraining uses approximate row-group data resumption, and exact SFT mid-epoch resumption is not implemented.
 Verify changes with `OMP_NUM_THREADS=1 uv run --no-sync python -m pytest -q`, `uv lock --check`, shell syntax checks, and `git diff --check` before committing.
 

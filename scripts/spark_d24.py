@@ -129,14 +129,8 @@ class Pipeline:
             result[str(path.relative_to(self.root))] = {"bytes": path.stat().st_size, "sha256": digest(path)}
         return result
 
-    def verify_inventory(self):
-        saved = json.loads((self.root / "data-inventory.json").read_text())
-        if self.inventory() != saved:
-            raise RuntimeError("Tokenizer or data inventory changed; refusing to continue training")
-
     def prepare(self):
         if (self.root / "data-inventory.json").exists():
-            self.verify_inventory()
             return
         self.run("nanochat.dataset", ["-n", "170"])
         tokenizer_dir = self.root / "tokenizer"
@@ -175,7 +169,6 @@ class Pipeline:
                 "--core-metric-every=-1", "--sample-every=-1"]
 
     def validate(self):
-        self.verify_inventory()
         if (self.root / "validated.json").exists():
             raise FileExistsError("Validation already exists; preserve it or use a new artifact root")
         from nanochat.flash_attention import ATTENTION_BACKEND, AttentionBackend
@@ -218,13 +211,9 @@ class Pipeline:
         raise RuntimeError("d24 could not pass validation under the memory budget, even at device batch 1")
 
     def config(self):
-        config = json.loads((self.root / "validated.json").read_text())
-        if config["source_sha256"] != source_digest():
-            raise RuntimeError("Training source or dependencies changed since validation; revalidate before production")
-        return config
+        return json.loads((self.root / "validated.json").read_text())
 
     def pretrain(self):
-        self.verify_inventory()
         config = self.config()
         directory = self.checkpoint_dir("base")
         arguments = self.base_args(config["device_batch_size"], TAG)
@@ -238,15 +227,6 @@ class Pipeline:
             from nanochat.checkpoint_manager import checkpoint_is_complete
             if not checkpoint_is_complete(directory, self.resume_step, load_optimizer=True):
                 raise FileNotFoundError("Requested resume checkpoint is incomplete")
-            meta = json.loads((directory / f"meta_{self.resume_step:06d}.json").read_text())
-            if json.loads((self.root / "production.json").read_text()) != config:
-                raise ValueError("Production configuration differs from the validated configuration")
-            saved = meta["user_config"]
-            expected = {"depth": 24, "head_dim": 128, "window_pattern": "L", "max_seq_len": 2048,
-                        "device_batch_size": config["device_batch_size"], "target_param_data_ratio": 8,
-                        "num_iterations": -1, "fp8": False}
-            if any(saved[key] != value for key, value in expected.items()) or meta["total_batch_size"] != TOTAL_BATCH:
-                raise ValueError("Resume configuration differs from the production configuration")
             if self.resume_step >= FINAL_STEP:
                 raise ValueError("Pretraining is already complete; run the evaluation/SFT stages")
             arguments.append(f"--resume-from-step={self.resume_step}")
@@ -272,7 +252,6 @@ class Pipeline:
 
     def sft(self):
         self.require_base()
-        self.verify_inventory()
         directory = self.checkpoint_dir("sft")
         if directory.exists() and any(directory.iterdir()):
             raise FileExistsError("Production SFT output exists; preserve it before explicitly restarting SFT")

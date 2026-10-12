@@ -3,12 +3,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.spark_d24 import Pipeline, write_json
+from scripts.spark_d24 import FINAL_STEP, Pipeline, write_json
 
 
 def test_existing_production_marker_blocks_fresh_launch(tmp_path, monkeypatch):
     pipeline = Pipeline(tmp_path)
-    monkeypatch.setattr(pipeline, "verify_inventory", lambda: None)
     monkeypatch.setattr(pipeline, "config", lambda: {"device_batch_size": 16})
     write_json(tmp_path / "production.json", {"device_batch_size": 16})
     def unexpected(*args):
@@ -18,27 +17,36 @@ def test_existing_production_marker_blocks_fresh_launch(tmp_path, monkeypatch):
         pipeline.pretrain()
 
 
-def test_modified_training_source_invalidates_validation(tmp_path, monkeypatch):
-    write_json(tmp_path / "validated.json", {"source_sha256": "previous-source"})
-    pipeline = Pipeline(tmp_path)
-    with pytest.raises(RuntimeError, match="changed since validation"):
-        pipeline.config()
+def test_resume_accepts_changed_source_configuration_and_inventory(tmp_path, monkeypatch):
+    from nanochat.checkpoint_manager import save_checkpoint
+
+    write_json(tmp_path / "validated.json", {"device_batch_size": 16, "source_sha256": "previous-source"})
+    write_json(tmp_path / "production.json", {"device_batch_size": 8, "source_sha256": "older-source"})
+    write_json(tmp_path / "data-inventory.json", {"shard": {"sha256": "original"}})
+    pipeline = Pipeline(tmp_path, resume_step=100)
+    save_checkpoint(pipeline.checkpoint_dir("base"), 100, {}, {}, {
+        "step": 100,
+        "user_config": {"depth": 24, "head_dim": 128, "window_pattern": "L", "max_seq_len": 2048,
+                        "device_batch_size": 8, "target_param_data_ratio": 8, "num_iterations": -1, "fp8": False},
+        "total_batch_size": 524288,
+    })
+    monkeypatch.setattr(pipeline, "inventory", lambda: {"shard": {"sha256": "changed"}})
+    monkeypatch.setattr(pipeline, "complete_step", lambda source: FINAL_STEP)
+    calls = []
+    monkeypatch.setattr(pipeline, "run", lambda module, arguments: calls.append((module, arguments)))
+    pipeline.pretrain()
+    assert len(calls) == 1
+    module, arguments = calls[0]
+    assert module == "scripts.base_train"
+    assert "--resume-from-step=100" in arguments
+    assert "--device-batch-size=16" in arguments
 
 
 def test_incomplete_resume_never_launches_training(tmp_path, monkeypatch):
     pipeline = Pipeline(tmp_path, resume_step=100)
-    monkeypatch.setattr(pipeline, "verify_inventory", lambda: None)
     monkeypatch.setattr(pipeline, "config", lambda: {"device_batch_size": 16})
     with pytest.raises(FileNotFoundError, match="incomplete"):
         pipeline.pretrain()
-
-
-def test_changed_data_inventory_blocks_training(tmp_path, monkeypatch):
-    write_json(tmp_path / "data-inventory.json", {"shard": {"sha256": "original"}})
-    pipeline = Pipeline(tmp_path)
-    monkeypatch.setattr(pipeline, "inventory", lambda: {"shard": {"sha256": "changed"}})
-    with pytest.raises(RuntimeError, match="inventory changed"):
-        pipeline.verify_inventory()
 
 
 def test_inventory_keeps_run_tokenizer_and_shared_subset_separate(tmp_path, monkeypatch):

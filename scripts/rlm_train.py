@@ -63,7 +63,6 @@ def parse_args():
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume-from-step", type=int, default=None)
     resume.add_argument("--resume-latest", action="store_true", help="resume the complete model/optimizer state in checkpoints/latest.pt")
-    parser.add_argument("--resume-transition", type=Path, help="resume only: receipt binding an explicitly reviewed source/checkpoint-policy change to this checkpoint")
     parser.add_argument("--stop-after-step", type=int, default=None, help="save and stop at a completed update without changing schedule")
     args = parser.parse_args()
     if args.save_every is None:
@@ -88,8 +87,6 @@ def parse_args():
         parser.error("--save-every cannot be negative")
     if args.keep_checkpoints is not None and args.keep_checkpoints <= 0:
         parser.error("--keep-checkpoints must be positive")
-    if args.resume_transition is not None and not resuming:
-        parser.error("--resume-transition requires a resume checkpoint")
     initialization_args = (
         args.init_embedding_checkpoint_dir, args.init_embedding_step, args.init_embedding_tokenizer,
     )
@@ -251,6 +248,16 @@ def run(args, attempt):
         triton_version = version("triton")
     except PackageNotFoundError:
         triton_version = None
+    milestone_step = config.milestone_step
+    if resuming:
+        if latest_checkpoint.milestone_path.exists():
+            milestone_step = latest_checkpoint.verify_milestone()["step"]
+        elif metadata.get("milestone_checkpoint", False):
+            # Finish the first requested preservation even if the horizon changed.
+            milestone_step = step
+        elif milestone_step < step:
+            # A changed horizon cannot recreate a boundary already passed.
+            milestone_step = 0
     contract = {
         "model_config": asdict(model_config), "training_config": asdict(config),
         "initialization": initialization,
@@ -258,7 +265,7 @@ def run(args, attempt):
             "latest_every": 1, "early_step": 2,
             "save_every": args.save_every, "keep_last": args.keep_checkpoints,
             "mode": args.checkpoint_mode, "on_error": "warn",
-            "milestone_step": config.milestone_step or None,
+            "milestone_step": milestone_step or None,
         } if args.mode == "train" else None,
         "source_sha256": source["sha256"], "tokenizer_sha256": tokenizer_sha256,
         "data_inventory_sha256": inventory["sha256"], "compute_dtype": str(COMPUTE_DTYPE),
@@ -268,20 +275,6 @@ def run(args, attempt):
             "cuda": torch.version.cuda, "triton": triton_version,
         },
     }
-    transition = None if metadata is None else metadata.get("resume_transition")
-    if resuming:
-        if args.resume_transition is not None:
-            from nanochat.rlm_resume import ResumeTransition
-
-            transition = ResumeTransition.from_file(args.resume_transition).validate(
-                args.output_dir, metadata, contract,
-            )
-            write_json(attempt / "resume-transition.json", transition)
-        elif metadata.get("run_contract") != contract:
-            raise ValueError(
-                "Resume requires matching RLM model, training budget, source, data, tokenizer, and precision; "
-                "a reviewed source/checkpoint-policy change requires its exact --resume-transition receipt"
-            )
     write_json(attempt / "source.json", source)
     write_json(attempt / "data-inventory.json", inventory)
     repo = Path(__file__).resolve().parents[1]
@@ -297,7 +290,6 @@ def run(args, attempt):
         "argv": sys.argv, "revision": revision, "contract": contract,
         "mode": args.mode, "torch_version": torch.__version__,
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "resume_transition": transition,
     })
     logger.info("%s", json.dumps({
         "configuration": contract, "accumulation_steps": accumulation,
@@ -349,16 +341,10 @@ def run(args, attempt):
             record_checkpoint_retention(checkpoint_dir, step, args.keep_checkpoints, attempt)
     else:
         write_json(args.output_dir / "run.json", {"contract": contract, "revision": revision, "mode": args.mode})
-    if resuming and config.milestone_step and step >= config.milestone_step:
-        if step == config.milestone_step:
-            # A stop after rolling publication can leave the required durable
-            # copy unfinished. Repair it before any trainable-table forward.
-            latest_checkpoint.preserve_milestone(step)
-        milestone_metadata = latest_checkpoint.verify_milestone(config.milestone_step)
-        milestone_contract = milestone_metadata["run_contract"]
-        for field in ("model_config", "training_config", "initialization", "tokenizer_sha256", "data_inventory_sha256"):
-            if milestone_contract.get(field) != contract.get(field):
-                raise ValueError(f"Retained 90% checkpoint does not match the resumed {field}")
+    if resuming and milestone_step and step == milestone_step:
+        # A stop after rolling publication can leave the required durable
+        # copy unfinished. Repair it before any trainable-table forward.
+        latest_checkpoint.preserve_milestone(step)
     with torch.device("meta"):
         model = RecurrentGPT(model_config)
     model.to_empty(device=device)
@@ -399,6 +385,13 @@ def run(args, attempt):
         return
     setup_metrics = cuda_metrics(device)
     updates = []
+    tokens_per_update = {
+        "text_tokens": config.total_batch_size,
+        "supervised_tokens": config.prediction_targets_per_update(args.text_length),
+        "internal_positions": accumulation * config.device_batch_size
+        * config.positions_per_episode(args.text_length, args.memory_tokens),
+    }
+    token_counts = {name: 0 if metadata is None else metadata[name] for name in tokens_per_update}
     writer = None if args.mode == "probe" else CheckpointWriter(
         checkpoint_dir, mode=args.checkpoint_mode, keep_last=args.keep_checkpoints,
         latest_step=latest_checkpoint.metadata()["step"] if latest_checkpoint.exists() else None,
@@ -440,6 +433,8 @@ def run(args, attempt):
                     before_optimizer_step=before_optimizer_step if writer is not None else None,
                 )
                 step += 1
+                for name, count in tokens_per_update.items():
+                    token_counts[name] += count
                 metrics["lr_multiplier"] = lrm
                 updates.append(metrics)
                 with metrics_path.open("a") as stream:
@@ -450,12 +445,10 @@ def run(args, attempt):
                 if writer is not None:
                     numbered = step == 2 or step == endpoint or bool(args.save_every and step % args.save_every == 0)
                     synchronize(device)
-                    saved_metadata = checkpoint_metadata(model, config, step, loader_state, contract)
+                    saved_metadata = checkpoint_metadata(model, config, step, loader_state, contract, token_counts)
                     saved_metadata["numbered_checkpoint"] = numbered
-                    milestone = step == config.milestone_step
+                    milestone = step == milestone_step
                     saved_metadata["milestone_checkpoint"] = milestone
-                    if transition is not None:
-                        saved_metadata["resume_transition"] = transition
                     writer.submit(model.state_dict(), optimizer.state_dict(), saved_metadata,
                                   numbered=numbered, milestone=milestone)
                     if milestone:
@@ -479,8 +472,8 @@ def run(args, attempt):
         "status": "completed" if step == args.num_iterations else "paused",
         "mode": args.mode, "completed_updates": step, "attempt_updates": len(updates),
         "parameter_counts": parameter_counts,
-        "text_tokens": step * config.total_batch_size,
-        "supervised_tokens": step * config.prediction_targets_per_update(args.text_length),
+        "text_tokens": token_counts["text_tokens"],
+        "supervised_tokens": token_counts["supervised_tokens"],
         "peak_cuda_reserved_gb": peak_reserved, "peak_cuda_allocated_gb": peak_allocated,
         "minimum_system_available_gb": monitor.minimum_observed / 1e9,
         "within_72gb_training_reserve_target": training_peak_reserved <= 72 if device.type == "cuda" else None,

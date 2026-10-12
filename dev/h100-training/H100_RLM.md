@@ -95,20 +95,20 @@ Keep these files in the run directory so the launcher can resume from them.
 
 ## Resume after interruption
 
-When the run has a complete `latest.pt`, resume it from the same checkout:
+When the run has a complete `latest.pt`, resume it with:
 
 ```bash
 bash runs/runh100_rlm.sh --resume --run-name pretrain-1
 ```
 
 If the original launch used `--output-dir`, use that same option and path when resuming.
-Keep any custom dataset location and GPU selection consistent with the original launch.
+The launcher uses the saved dataset directory by default; pass `--datasets-dir` to select a different location.
 Resume restores the selected recipe, model, optimizer, data-loader position, and random state, then continues the original 5574-update budget.
 It skips dataset downloading, capacity probes, and embedding initialization, so `--assets` is not needed.
 
-Keep the checkout, run directory, tokenizer, and dataset files unchanged between launch and resume.
-The launcher verifies the saved run configuration and file checksums.
-Do not edit the recorded recipe or switch code versions to bypass a mismatch.
+The saved recipe selects the model and training settings.
+Resume does not require identical source files, a matching saved command line, or matching tokenizer and dataset hashes.
+Checkpoint state is loaded normally, so model tensors and optimizer state must still be loadable by the selected model.
 
 If preparation or a probe failed, or production stopped before publishing a checkpoint, inspect the logs and structured results, fix the cause, and start with a new run name.
 Retain the failed run's files for diagnosis.

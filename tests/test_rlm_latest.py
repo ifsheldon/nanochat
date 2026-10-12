@@ -39,7 +39,12 @@ def payload(monkeypatch):
         "tokenizer_sha256": "a" * 64, "device_type": "cpu",
         "runtime": {"torch": torch.__version__},
     }
-    metadata = checkpoint_metadata(model, config, 1, {"row_group": 7, "epoch": 0}, contract)
+    metadata = checkpoint_metadata(model, config, 1, {"row_group": 7, "epoch": 0}, contract, {
+        "text_tokens": config.total_batch_size,
+        "supervised_tokens": config.prediction_targets_per_update(model.config.text_length),
+        "internal_positions": config.accumulation_steps(model.config.text_length)
+        * config.device_batch_size * config.positions_per_episode(model.config.text_length, model.config.memory_tokens),
+    })
     return model, optimizer, metadata
 
 
@@ -294,7 +299,7 @@ def test_malformed_bundle_is_rejected_on_read_and_before_replacing_good_save(tmp
     elif bad == "step":
         metadata["step"] = True
     elif bad == "token_counts":
-        metadata["text_tokens"] += 1
+        metadata["text_tokens"] = -1
     elif bad == "contract":
         metadata["run_contract"]["training_config"]["total_batch_size"] *= 2
     elif bad == "rng":

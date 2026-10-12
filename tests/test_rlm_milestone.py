@@ -61,7 +61,7 @@ def test_retained_bundle_survives_latest_replacement_and_numbered_retention(tmp_
     finally:
         writer.close(5)
     assert store.metadata()["step"] == 5
-    assert store.verify_milestone(2, run_contract=checkpoint[2]["run_contract"])["step"] == 2
+    assert store.verify_milestone(2)["step"] == 2
     assert store.milestone_path.read_bytes() == preserved
     assert store.milestone_path.stat().st_nlink == store.path.stat().st_nlink == 1
     assert sorted(path.name for path in tmp_path.glob("meta_*.json")) == ["meta_000005.json"]
@@ -107,7 +107,7 @@ def test_existing_milestone_conflicts_are_not_overwritten(tmp_path, checkpoint, 
     assert store.metadata() == metadata
 
 
-def test_wrong_boundary_or_resume_contract_is_rejected(tmp_path, checkpoint):
+def test_wrong_boundary_is_rejected(tmp_path, checkpoint):
     store = LatestCheckpoint(tmp_path)
     store.save(*checkpoint)
     with pytest.raises(LatestCheckpointError, match="Latest checkpoint must be update 2"):
@@ -115,10 +115,6 @@ def test_wrong_boundary_or_resume_contract_is_rejected(tmp_path, checkpoint):
     store.preserve_milestone(1)
     with pytest.raises(LatestCheckpointError, match="must preserve update 2"):
         store.verify_milestone(2)
-    contract = copy.deepcopy(checkpoint[2]["run_contract"])
-    contract["tokenizer_sha256"] = "other"
-    with pytest.raises(LatestCheckpointError, match="different run contract"):
-        store.verify_milestone(1, run_contract=contract)
 
 
 @pytest.mark.parametrize("kind", ["symlink", "hardlink"])

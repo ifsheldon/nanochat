@@ -477,16 +477,13 @@ def restore_rng(state, device):
         torch.cuda.set_rng_state(torch.tensor(state["cuda"], dtype=torch.uint8), device)
 
 
-def checkpoint_metadata(model, config, step, loader_state, contract):
+def checkpoint_metadata(model, config, step, loader_state, contract, token_counts):
     return {
         "model_type": "rlm",
         "model_config": asdict(model.config),
         "training_config": asdict(config),
         "step": step,
-        "text_tokens": step * config.total_batch_size,
-        "supervised_tokens": step * config.prediction_targets_per_update(model.config.text_length),
-        "internal_positions": step * config.accumulation_steps(model.config.text_length)
-        * config.device_batch_size * config.positions_per_episode(model.config.text_length, model.config.memory_tokens),
+        **token_counts,
         "dataloader_state_dict": loader_state,
         "rng_state": rng_state(model.get_device()),
         "tokenizer_sha256": contract["tokenizer_sha256"],

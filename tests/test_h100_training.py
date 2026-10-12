@@ -10,6 +10,7 @@ import nanochat.rlm_training as training_module
 from nanochat.rlm import RecurrentGPT
 from nanochat.rlm_checkpointing import MilestoneCheckpointError
 from nanochat.rlm_latest import LatestCheckpoint
+from scripts import rlm_train
 from test_rlm_train_cli import (
     arguments,
     assert_state_equal,
@@ -196,13 +197,105 @@ def test_failed_milestone_stops_before_unfreezing_and_resume_repairs_exactly(
 
     monkeypatch.setattr(LatestCheckpoint, "preserve_milestone", preserve_before_forward)
     monkeypatch.setattr(RecurrentGPT, "forward_cycle", resumed_forward)
+    monkeypatch.setattr(rlm_train, "dataset_inventory", lambda: {"sha256": "updated-data-record", "files": []})
     resumed = run_attempt(arguments(monkeypatch, output, *policy_args, "--resume-latest"), "resume")
     actual_model, actual_optimizer, actual_metadata = store.load("cpu")
     assert_state_equal(actual_model, expected_model)
     assert_state_equal(actual_optimizer, expected_optimizer)
     assert actual_metadata["rng_state"] == expected_metadata["rng_state"]
     assert actual_metadata["dataloader_state_dict"] == expected_metadata["dataloader_state_dict"] == {"consumed": 4}
+    assert actual_metadata["run_contract"]["data_inventory_sha256"] == "updated-data-record"
+    assert store.verify_milestone(3)["run_contract"]["data_inventory_sha256"] == "fixture-data"
     assert repaired == [3]
     assert forwards == [False] * 6 + [True] * 2
     assert len(updates(resumed)) == 1
     assert published_steps(output) == [4]
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("original_iterations,stop_step,resumed_iterations", [(4, 3, 6), (12, 10, 11)])
+def test_changed_horizon_keeps_first_milestone_and_completes(
+    training_environment, tmp_path, monkeypatch, mode, original_iterations, stop_step, resumed_iterations,
+):
+    source_dir, source_tokenizer, _ = training_environment
+    output = tmp_path / "changed-horizon"
+    policy = ("--input-embedding-freeze", "scheduled", "--checkpoint-mode", mode)
+    run_attempt(arguments(
+        monkeypatch, output, *source_arguments(source_dir, source_tokenizer), *policy,
+        "--num-iterations", original_iterations, "--stop-after-step", stop_step,
+    ), "original")
+    store = LatestCheckpoint(output / "checkpoints")
+    retained = store.milestone_path.read_bytes()
+    resumed = run_attempt(arguments(
+        monkeypatch, output, *policy, "--num-iterations", resumed_iterations, "--resume-latest",
+    ), "resume")
+    metadata = store.metadata()
+    assert metadata["step"] == resumed_iterations
+    assert metadata["run_contract"]["checkpoint_policy"]["milestone_step"] == stop_step
+    assert store.verify_milestone()["step"] == stop_step
+    assert store.milestone_path.read_bytes() == retained
+    assert len(updates(resumed)) == resumed_iterations - stop_step
+    assert updates(resumed)[-1]["input_embedding_frozen"] is False
+
+
+@pytest.mark.parametrize("original_iterations,stop_step,resumed_iterations,expected_milestone", [
+    (20, 10, 11, None), (8, 2, 4, 3),
+])
+def test_changed_horizon_only_preserves_a_reachable_first_milestone(
+    training_environment, tmp_path, monkeypatch,
+    original_iterations, stop_step, resumed_iterations, expected_milestone,
+):
+    source_dir, source_tokenizer, _ = training_environment
+    output = tmp_path / "first-milestone"
+    policy = ("--input-embedding-freeze", "scheduled", "--checkpoint-mode", "sync")
+    run_attempt(arguments(
+        monkeypatch, output, *source_arguments(source_dir, source_tokenizer), *policy,
+        "--num-iterations", original_iterations, "--stop-after-step", stop_step,
+    ), "original")
+    store = LatestCheckpoint(output / "checkpoints")
+    assert not store.milestone_path.exists()
+    run_attempt(arguments(
+        monkeypatch, output, *policy, "--num-iterations", resumed_iterations, "--resume-latest",
+    ), "resume")
+    metadata = store.metadata()
+    assert metadata["step"] == resumed_iterations
+    assert metadata["run_contract"]["checkpoint_policy"]["milestone_step"] == expected_milestone
+    if expected_milestone is None:
+        assert not store.milestone_path.exists()
+    else:
+        assert store.verify_milestone()["step"] == expected_milestone
+
+
+def test_changed_horizon_repairs_interrupted_first_milestone_before_training(
+    training_environment, tmp_path, monkeypatch,
+):
+    source_dir, source_tokenizer, _ = training_environment
+    output = tmp_path / "interrupted-changed-horizon"
+    policy = ("--input-embedding-freeze", "scheduled", "--checkpoint-mode", "sync")
+    store = LatestCheckpoint(output / "checkpoints")
+
+    def fail_milestone(*args, **kwargs):
+        raise OSError("injected retained checkpoint disk failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(LatestCheckpoint, "preserve_milestone", fail_milestone)
+        with pytest.raises(MilestoneCheckpointError):
+            run_attempt(arguments(
+                monkeypatch, output, *source_arguments(source_dir, source_tokenizer), *policy,
+            ), "interrupted")
+    retained = store.path.read_bytes()
+    assert store.metadata()["step"] == 3
+    assert not store.milestone_path.exists()
+    original_forward = RecurrentGPT.forward_cycle
+
+    def require_repaired_before_forward(model, *args, **kwargs):
+        assert store.milestone_path.read_bytes() == retained
+        return original_forward(model, *args, **kwargs)
+
+    monkeypatch.setattr(RecurrentGPT, "forward_cycle", require_repaired_before_forward)
+    run_attempt(arguments(
+        monkeypatch, output, *policy, "--num-iterations", "6", "--resume-latest",
+    ), "resume")
+    assert store.metadata()["step"] == 6
+    assert store.verify_milestone()["step"] == 3
+    assert store.milestone_path.read_bytes() == retained

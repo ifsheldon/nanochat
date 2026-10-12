@@ -1,3 +1,8 @@
+# Implementation scope
+
+When implementing a feature, do not add unnecessary checks or associated features unless the user explicitly requests them.
+If you consider additional checks or related features important, explain them to the user and obtain explicit approval before implementing them.
+
 # Project overview
 
 nanochat is a Python/PyTorch toolkit for language-model tokenization, pretraining, supervised fine-tuning, reinforcement learning, evaluation, and inference.
@@ -25,7 +30,7 @@ RLM reuses a GPT backbone across bounded text chunks and passes learned memory b
 - `nanochat/gpt.py` defines the base transformer; `nanochat/rlm.py` defines the recurrent model.
 - `nanochat/tokenizer.py`, `dataset.py`, and `dataloader.py` handle tokenization and pretraining data; `sft_dataloader.py` handles conversation packing.
 - `nanochat/optim.py` implements optimizers; `training_runtime.py` provides shared training resource checks; `paths.py` resolves run, dataset, and cache locations.
-- `nanochat/rlm_training.py` implements recurrent training; the other `rlm_*.py` modules separate data handling, initialization, freezing policy, capacity probes, inference, checkpoints, and resume validation.
+- `nanochat/rlm_training.py` implements recurrent training; the other `rlm_*.py` modules separate data handling, initialization, freezing policy, capacity probes, inference, and checkpoints.
 - `scripts/base_train.py`, `chat_sft.py`, and `chat_rl.py` drive the base-model and chat training stages.
 - `scripts/rlm_train.py`, `rlm_eval.py`, and `rlm_sample.py` expose recurrent training, evaluation, and generation; `scripts/h100_rlm.py` orchestrates the single-H100 workflow.
 

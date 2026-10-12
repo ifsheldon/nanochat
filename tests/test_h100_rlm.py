@@ -1,4 +1,4 @@
-"""Exercise the H100 handoff's ordered decisions and exact resume contract on CPU."""
+"""Exercise the H100 handoff's ordered decisions and checkpoint resume on CPU."""
 
 from dataclasses import asdict
 import json
@@ -110,6 +110,7 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     assets = tmp_path / "assets"
     assets.mkdir()
     calls = []
+    environments = []
     monkeypatch.setattr(launcher, "get_datasets_dir", lambda: tmp_path / "datasets")
     if destination_kind != "explicit":
         def resolve_run(name):
@@ -144,6 +145,7 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
 
     def run(command, log_path, environment):
         calls.append(command)
+        environments.append(environment)
         if command[2] == "nanochat.dataset":
             assert command[3:] == ["-n", "170"]
             return 0
@@ -171,34 +173,29 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     assert "--init-embedding-bundle" in calls[-1]
     assert argument(calls[-1], "--input-embedding-freeze") == "permanent"
     calls.clear()
+    environments.clear()
+    inventories["dataset"]["shard"] = "changed"
+    inventories["tokenizer"]["tokenizer.pkl"] = "changed"
+    saved["production_arguments"][saved["production_arguments"].index("--num-iterations") + 1] = "10"
+    (output / "selected-recipe.json").write_text(json.dumps(saved))
     monkeypatch.setattr(launcher, "prepare_assets", lambda *_: pytest.fail("resume must not initialize assets"))
+    monkeypatch.setattr(launcher, "verify_dataset", lambda *_: pytest.fail("resume must not scan dataset identity"))
+    monkeypatch.setattr(launcher, "tokenizer_inventory", lambda *_: pytest.fail("resume must not scan tokenizer identity"))
     launcher.launch(launcher.parse_args(["--resume", *destination]))
     assert len(calls) == 1
+    assert calls[0][2] == "scripts.rlm_train"
     assert "--resume-latest" in calls[0]
     assert "--init-embedding-bundle" not in calls[0]
     assert argument(calls[0], "--input-embedding-freeze") == "permanent"
     assert argument(calls[0], "--device-batch-size") == "32"
+    assert argument(calls[0], "--num-iterations") == "5574"
+    assert environments[0]["NANOCHAT_DATASETS_DIR"] == str(tmp_path / "datasets")
     alternate = tmp_path / "other-datasets"
-    alternate.mkdir()
-    with pytest.raises(ValueError, match="Resume must reuse the datasets directory"):
-        launcher.launch(launcher.parse_args(["--resume", *destination, "--datasets-dir", str(alternate)]))
-    assert len(calls) == 1
-    inventories["dataset"]["shard"] = "changed"
-    with pytest.raises(ValueError, match="Dataset content changed"):
-        launcher.launch(launcher.parse_args(["--resume", *destination]))
-    assert len(calls) == 1
-
-
-def test_resume_rejects_modified_saved_arguments(tmp_path):
-    recipe = launcher.RECIPES[0]
-    arguments = launcher.training_arguments(recipe, tmp_path / "train", assets=tmp_path / "assets")
-    arguments[arguments.index("--num-iterations") + 1] = "10"
-    (tmp_path / "selected-recipe.json").write_text(json.dumps({
-        "schema_version": 2, "recipe": asdict(recipe), "assets_directory": str(tmp_path / "assets"),
-        "production_arguments": arguments,
-    }))
-    with pytest.raises(ValueError, match="do not match"):
-        launcher.load_recipe(tmp_path)
+    (tmp_path / "datasets").rename(alternate)
+    launcher.launch(launcher.parse_args(["--resume", *destination, "--datasets-dir", str(alternate)]))
+    assert len(calls) == 2
+    assert calls[1] == calls[0]
+    assert environments[1]["NANOCHAT_DATASETS_DIR"] == str(alternate)
 
 
 def test_dataset_verification_selects_required_shards_from_shared_root_and_hashes_contents(tmp_path):

@@ -293,26 +293,34 @@ def test_resume_rejects_freezing_random_initialization(training_environment, tmp
 
 
 @pytest.mark.parametrize("initially_frozen", [False, True])
-def test_resume_requires_matching_embedding_freeze_schedule(
+def test_resume_uses_changed_embedding_freeze_schedule_and_training_budget(
     training_environment, tmp_path, monkeypatch, initially_frozen,
 ):
     from nanochat.rlm_latest import LatestCheckpoint
 
     source_dir, source_tokenizer, _ = training_environment
-    output_dir = tmp_path / "freeze-mismatch"
+    output_dir = tmp_path / "changed-schedule"
     freeze_args = ("--input-embedding-freeze", "scheduled",) if initially_frozen else ()
     run_attempt(arguments(
         monkeypatch, output_dir, *source_arguments(source_dir, source_tokenizer), *freeze_args,
         "--num-iterations", "10", "--stop-after-step", "1",
     ), "original")
     latest = LatestCheckpoint(output_dir / "checkpoints")
-    previous_metadata = latest.metadata()
+    previous_model, _, _ = latest.load(torch.device("cpu"))
     changed_args = () if initially_frozen else ("--input-embedding-freeze", "scheduled",)
-    with pytest.raises(ValueError, match="matching|training|freeze"):
-        run_attempt(arguments(
-            monkeypatch, output_dir, *changed_args, "--num-iterations", "10", "--resume-latest",
-        ), "reject-changed-schedule")
-    assert latest.metadata() == previous_metadata
+    run_attempt(arguments(
+        monkeypatch, output_dir, *changed_args, "--num-iterations", "12", "--resume-latest",
+        "--stop-after-step", "2",
+    ), "changed-schedule")
+    model, _, metadata = latest.load(torch.device("cpu"))
+    assert metadata["step"] == 2
+    assert metadata["training_config"]["num_iterations"] == 12
+    expected_freeze = "none" if initially_frozen else "scheduled"
+    assert metadata["training_config"]["input_embedding_freeze"] == expected_freeze
+    if initially_frozen:
+        assert not torch.equal(model["transformer.wte.weight"], previous_model["transformer.wte.weight"])
+    else:
+        assert_state_equal(model["transformer.wte.weight"], previous_model["transformer.wte.weight"])
 
 
 def test_training_saves_update_two_before_final_without_periodic_saves(training_environment, tmp_path, monkeypatch):
@@ -628,9 +636,11 @@ def test_latest_resume_finishes_retention_before_next_update(training_environmen
     assert latest.metadata()["step"] == 4
 
 
-def test_reviewed_source_transition_preserves_training_and_allows_strict_resume(training_environment, tmp_path, monkeypatch):
+@pytest.mark.parametrize("resume_flag", ["--resume-latest", "--resume-from-step"])
+def test_resume_after_provenance_and_checkpoint_policy_changes_preserves_training(
+    training_environment, tmp_path, monkeypatch, resume_flag,
+):
     from nanochat.rlm_latest import LatestCheckpoint
-    from nanochat.rlm_resume import ResumeTransition
 
     def manifest(names):
         root = Path(rlm_train.__file__).resolve().parents[1]
@@ -639,7 +649,7 @@ def test_reviewed_source_transition_preserves_training_and_allows_strict_resume(
 
     old_source = manifest(("scripts/rlm_train.py",))
     new_source = manifest(("scripts/rlm_train.py", "nanochat/rlm_latest.py"))
-    output_dir = tmp_path / "transition"
+    output_dir = tmp_path / "changed-provenance"
     latest = LatestCheckpoint(output_dir / "checkpoints")
     monkeypatch.setattr(training_module, "source_manifest", lambda root: old_source)
     run_attempt(arguments(
@@ -647,61 +657,63 @@ def test_reviewed_source_transition_preserves_training_and_allows_strict_resume(
     ), "original")
     origin_record = (output_dir / "run.json").read_bytes()
     original_metadata = latest.metadata()
-    old_contract = original_metadata["run_contract"]
-    new_contract = {
-        **old_contract,
-        "source_sha256": new_source["sha256"],
-        "checkpoint_policy": {**old_contract["checkpoint_policy"], "keep_last": 1},
-    }
-    receipt = ResumeTransition.prepare(
-        output_dir, original_metadata, new_contract, old_source, new_source,
-        "Reviewed checkpoint workflow change; model, optimizer, data, and schedule are unchanged.",
-    )
-    receipt_path = tmp_path / "resume-transition.json"
-    receipt_path.write_text(json.dumps(receipt.to_dict()))
 
+    # Only the serialized identities change; the fixture tokenizer and loader
+    # still produce the same tokens, so resumed training must match exactly.
     monkeypatch.setattr(training_module, "source_manifest", lambda root: new_source)
-    with pytest.raises(ValueError, match="--resume-transition"):
-        run_attempt(arguments(
-            monkeypatch, output_dir, "--keep-checkpoints", "1", "--resume-latest",
-        ), "reject-unreviewed-source")
-    assert latest.metadata() == original_metadata
-
-    reference_dir = tmp_path / "reference-new-contract"
-    run_attempt(arguments(monkeypatch, reference_dir, "--keep-checkpoints", "1"), "complete")
+    monkeypatch.setattr(rlm_train, "dataset_inventory", lambda: {"sha256": "new-data", "files": []})
+    tokenizer_path = tmp_path / "cache" / "tokenizer" / "tokenizer.pkl"
+    tokenizer_path.write_bytes(b"equivalent tokenizer serialization")
+    monkeypatch.setattr(rlm_train, "version", lambda name: "new-runtime-version")
+    policy = ("--keep-checkpoints", "1", "--checkpoint-mode", "sync")
+    reference_dir = tmp_path / "reference"
+    run_attempt(arguments(monkeypatch, reference_dir, *policy), "complete")
     expected_model, expected_optimizer, expected_metadata = LatestCheckpoint(
         reference_dir / "checkpoints",
     ).load(torch.device("cpu"))
-    assert expected_metadata["run_contract"] == new_contract
 
-    transitioned = run_attempt(arguments(
-        monkeypatch, output_dir, "--keep-checkpoints", "1", "--resume-latest",
-        "--resume-transition", receipt_path, "--stop-after-step", "3",
-    ), "reviewed-transition")
-    transition_metadata = latest.metadata()
-    assert transition_metadata["step"] == 3
-    assert transition_metadata["run_contract"] == new_contract
-    evidence = receipt.validate(output_dir, original_metadata, new_contract)
-    assert transition_metadata["resume_transition"] == evidence
-    assert json.loads((transitioned / "resume-transition.json").read_text()) == evidence
+    resume = (resume_flag,) if resume_flag == "--resume-latest" else (resume_flag, "2")
+    run_attempt(arguments(
+        monkeypatch, output_dir, *policy, *resume, "--stop-after-step", "3",
+    ), "changed-provenance")
+    metadata = latest.metadata()
+    assert metadata["step"] == 3
+    assert metadata["run_contract"] == expected_metadata["run_contract"]
+    assert metadata["run_contract"] != original_metadata["run_contract"]
     assert (output_dir / "run.json").read_bytes() == origin_record
 
-    # Once the new contract is checkpointed, subsequent resumes are strict and
-    # retain the original review evidence without requiring its source file.
-    receipt_path.unlink()
     resumed = run_attempt(arguments(
-        monkeypatch, output_dir, "--keep-checkpoints", "1", "--resume-latest",
-    ), "strict-resume")
+        monkeypatch, output_dir, *policy, "--resume-latest",
+    ), "finish")
     actual_model, actual_optimizer, actual_metadata = latest.load(torch.device("cpu"))
     assert_state_equal(actual_model, expected_model)
     assert_state_equal(actual_optimizer, expected_optimizer)
     assert actual_metadata["rng_state"] == expected_metadata["rng_state"]
     assert actual_metadata["dataloader_state_dict"] == {"consumed": 4}
-    assert actual_metadata["run_contract"] == new_contract
-    assert actual_metadata["resume_transition"] == evidence
+    assert actual_metadata["run_contract"] == expected_metadata["run_contract"]
     assert (output_dir / "run.json").read_bytes() == origin_record
     result = json.loads((resumed / "result.json").read_text())
     assert result["status"] == "completed" and result["attempt_updates"] == 1
+
+
+def test_resume_preserves_cumulative_counts_when_batch_and_cycles_change(training_environment, tmp_path, monkeypatch):
+    from nanochat.rlm_latest import LatestCheckpoint
+
+    output_dir = tmp_path / "changed-batch"
+    run_attempt(arguments(monkeypatch, output_dir, "--stop-after-step", "2"), "original")
+    latest = LatestCheckpoint(output_dir / "checkpoints")
+    assert latest.metadata()["text_tokens"] == 32
+    changed = ("--total-batch-size", "32", "--cycles", "4", "--resume-latest")
+    for stop, counts in ((3, (64, 80, 120)), (4, (96, 120, 184))):
+        attempt = run_attempt(arguments(
+            monkeypatch, output_dir, *changed, "--stop-after-step", str(stop),
+        ), f"resume-{stop}")
+        metadata = latest.metadata()
+        assert metadata["step"] == stop
+        assert tuple(metadata[name] for name in ("text_tokens", "supervised_tokens", "internal_positions")) == counts
+        result = json.loads((attempt / "result.json").read_text())
+        assert (result["text_tokens"], result["supervised_tokens"]) == counts[:2]
+        assert result["attempt_updates"] == 1
 
 
 def test_sync_and_async_save_identical_training_state_for_each_update(training_environment, tmp_path, monkeypatch):

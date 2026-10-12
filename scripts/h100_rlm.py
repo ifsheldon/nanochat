@@ -82,7 +82,7 @@ def parse_args(argv=None):
     destination = parser.add_mutually_exclusive_group()
     destination.add_argument("--run-name", type=RunName, help="run name under repository training_run/; default: NANOCHAT_RUN_NAME or pretrain-1")
     destination.add_argument("--output-dir", type=Path, help="explicit run directory instead of training_run/<run-name>")
-    parser.add_argument("--datasets-dir", type=Path, help="shared dataset root; defaults to NANOCHAT_DATASETS_DIR or repository datasets/")
+    parser.add_argument("--datasets-dir", type=Path, help="shared dataset root; defaults to the saved directory on resume, otherwise NANOCHAT_DATASETS_DIR or repository datasets/")
     parser.add_argument("--resume", action="store_true", help="reuse the saved recipe and resume train/checkpoints/latest.pt; no probes or reinitialization")
     args = parser.parse_args(argv)
     if not args.resume and args.assets is None:
@@ -287,9 +287,6 @@ def load_recipe(output_dir):
         raise ValueError("Unsupported selected-recipe.json schema; refusing to resume.")
     for recipe in RECIPES:
         if saved.get("recipe") == asdict(recipe):
-            expected = training_arguments(recipe, output_dir / "train", assets=Path(saved["assets_directory"]))
-            if saved.get("production_arguments") != expected:
-                raise ValueError("Saved production arguments do not match the supported H100 recipe; refusing to resume.")
             return recipe, saved
     raise ValueError("Saved recipe is not one of the three authorized H100 recipes.")
 
@@ -308,9 +305,7 @@ def launch(args):
         saved = None
         if args.resume:
             recipe, saved = load_recipe(output_dir)
-            datasets_dir = checked_path(Path(saved["datasets_directory"]), directory=True)
-            if args.datasets_dir is not None and checked_path(args.datasets_dir, directory=True) != datasets_dir:
-                raise ValueError("Resume must reuse the datasets directory recorded in selected-recipe.json.")
+            datasets_dir = checked_path(args.datasets_dir or Path(saved["datasets_directory"]), directory=True)
             checked_path(output_dir / "train" / "checkpoints" / "latest.pt")
             assets = None
         else:
@@ -329,17 +324,10 @@ def launch(args):
         environment = runtime_environment(output_dir, datasets_dir, gpu)
         require_disk_space(output_dir, datasets_dir)
         write_json(log_dir / "preflight.json", gpu)
-        if args.resume:
-            if tokenizer_inventory(output_dir) != saved["assets"]["tokenizer"]:
-                raise ValueError("Tokenizer changed since recipe selection; refusing to resume.")
-        else:
+        if not args.resume:
             assets_record = prepare_assets(assets, output_dir)
-        dataset_lock = checked_path(datasets_dir / ".h100-datasets.lock", must_exist=False)
-        with FileLock(str(dataset_lock), timeout=0):
-            if args.resume:
-                if verify_dataset(datasets_dir) != saved["dataset"]:
-                    raise ValueError("Dataset content changed since recipe selection; refusing to resume.")
-            else:
+            dataset_lock = checked_path(datasets_dir / ".h100-datasets.lock", must_exist=False)
+            with FileLock(str(dataset_lock), timeout=0):
                 dataset_dir = checked_path(datasets_dir / "base_data_climbmix", directory=True, must_exist=False)
                 dataset_dir.mkdir(exist_ok=True)
                 for name in EXPECTED_SHARDS:
@@ -350,7 +338,6 @@ def launch(args):
                 if code:
                     raise RuntimeError(f"Dataset downloader failed with status {code}; inspect {log_dir}.")
                 dataset = verify_dataset(datasets_dir)
-        if not args.resume:
             recipe = choose_recipe(output_dir, assets, environment, log_dir)
             production_arguments = training_arguments(recipe, output_dir / "train", assets=assets)
             saved = {

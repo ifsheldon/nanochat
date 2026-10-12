@@ -69,20 +69,14 @@ def _metadata(value):
             for name in names:
                 if type(config.get(name)) is not int or config[name] <= 0:
                     raise ValueError(f"{name} must be a positive integer")
-        text, memory = model["text_length"], model["memory_tokens"]
+        text = model["text_length"]
         batch, cycles = training["total_batch_size"], training["cycles"]
         microbatch = training["device_batch_size"] * cycles * text
         if cycles < 2 or batch % microbatch:
             raise ValueError("training batch is inconsistent with complete RLM episodes")
-        counts = {
-            "text_tokens": step * batch,
-            "supervised_tokens": step * (batch + batch // text),
-            "internal_positions": step * batch // (cycles * text)
-            * (cycles * (text + 1) + 2 * (cycles - 1) * memory),
-        }
-        for name, expected in counts.items():
-            if type(value.get(name)) is not int or value[name] != expected:
-                raise ValueError(f"{name} is inconsistent with step and training configuration")
+        for name in ("text_tokens", "supervised_tokens", "internal_positions"):
+            if type(value.get(name)) is not int or value[name] <= 0:
+                raise ValueError(f"{name} must be a positive cumulative count")
         rng = value["rng_state"]
         for name in ("cpu", "cuda"):
             state = rng.get(name)
@@ -245,15 +239,13 @@ class LatestCheckpoint:
         """Read resume metadata without allocating the model/optimizer storage."""
         return self._load(torch.device("cpu"), metadata_only=True)[2]
 
-    def verify_milestone(self, step, *, run_contract=None):
-        """Validate the retained boundary, including the caller's resume contract."""
-        if type(step) is not int or step <= 0:
+    def verify_milestone(self, step=None):
+        """Read the retained checkpoint metadata, optionally requiring an update."""
+        if step is not None and (type(step) is not int or step <= 0):
             raise ValueError("Milestone step must identify a positive completed update")
         metadata = self._load(torch.device("cpu"), metadata_only=True, name=self.milestone_path.name)[2]
-        if metadata["step"] != step:
+        if step is not None and metadata["step"] != step:
             raise LatestCheckpointError(f"Milestone checkpoint must preserve update {step}, found {metadata['step']}")
-        if run_contract is not None and metadata["run_contract"] != run_contract:
-            raise LatestCheckpointError("Milestone checkpoint belongs to a different run contract")
         return metadata
 
     def _matching_milestone(self, directory_fd, source, metadata):

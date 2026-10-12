@@ -5,7 +5,8 @@ The launcher keeps the current Spark model, data selection, token budget, optimi
 It does not need the current Spark run's checkpoints or optimizer state.
 
 The verified seed bundle is included at `assets/h100-seed/`.
-Git LFS stores its three binary files: `model_005568.pt`, `tokenizer.pkl`, and `token_bytes.pt`.
+Git LFS stores its three binary files, `model_005568.pt`, `tokenizer.pkl`, and `token_bytes.pt`, in the public [ifsheldon/nanochat-assets](https://github.com/ifsheldon/nanochat-assets) repository.
+The checked-in `.lfsconfig` directs Git LFS to that repository automatically; running the model does not require a separate asset-repository clone.
 The accompanying `meta_005568.json` and `manifest.json` are ordinary Git files.
 The model file contains only the pretrained input embedding; the full source checkpoint is not included.
 
@@ -19,7 +20,7 @@ Use a persistent terminal session or your machine's normal job scheduler so disc
 
 ```bash
 git lfs install
-git clone --branch h100-rlm git@github.com:ifsheldon/nanochat.git
+git clone --branch h100-rlm https://github.com/ifsheldon/nanochat.git
 cd nanochat
 git lfs pull
 bash runs/runh100_rlm.sh \
@@ -59,6 +60,9 @@ It also checks the final inventory because the existing downloader can report in
 The dataset is approximately 15.7 GB; no separate dataset transfer is required.
 
 ## Optional: rebuild the seed bundle
+
+Maintainers upload the LFS payloads through the SSH endpoint configured in `.lfsconfig`, which requires write access to `ifsheldon/nanochat-assets`.
+Downloads use the public HTTPS endpoint and do not require SSH credentials.
 
 The repository already includes the seed needed for the launch above.
 To reproduce or intentionally replace that seed, export the original pretrained input embedding and its matching tokenizer:

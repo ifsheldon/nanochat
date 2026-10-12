@@ -132,6 +132,7 @@ The base learning-rate policy preserves batch scaling, model-width scaling, and 
 Every run records its complete configuration and source fingerprint.
 
 Checkpoints are saved only after a completed optimizer update, with model, summary, and `<EOM>` parameters, optimizer state, PyTorch RNG state, last-consumed loader progress, and separate real-text, prediction, and internal-position counters.
+Cumulative token and internal-position totals preserve earlier updates when batch size or cycle count changes on resume.
 Training saves `checkpoints/latest.pt` after every completed update.
 The default `--checkpoint-mode async` overlaps the save with the next update's forward and backward passes, then waits for the writer before the next optimizer step can change any saved tensors.
 One writer handles at most one checkpoint request at a time, including its numbered save and retention.
@@ -163,15 +164,15 @@ The default free-space reserve for checkpoint saving is 100 GB.
 
 To pause reproducibly at an update boundary, add `--stop-after-step 10` to the training command.
 Stopping the service uses the most recent fully published rolling checkpoint; it does not invoke a signal-time save.
-To resume, repeat the original model/training and checkpoint-policy options, keep the original `--num-iterations`, and add `--resume-latest` while removing the earlier stop flag and any initialization flags.
+To continue the same training setup, repeat the original model/training and checkpoint-policy options, keep the original `--num-iterations`, and add `--resume-latest` while removing the earlier stop flag and any initialization flags.
 The explicit `--resume-from-step 10` option selects a numbered checkpoint and is mutually exclusive with `--resume-latest`.
 Only the newest published update across rolling and numbered checkpoints can be resumed; choosing an older step is rejected to protect newer published history.
 If a stop interrupted a numbered checkpoint save after the rolling checkpoint was published, latest resume repairs that exact numbered set from the rolling checkpoint and completes pending retention before training continues.
-Resume requires identical model settings, training budget, source/dependency fingerprint, installed Python/PyTorch/CUDA/Triton versions, tokenizer bytes, ordered data paths/sizes/timestamps, device type, and compute precision.
-An explicitly reviewed source or checkpoint-policy change requires a `--resume-transition` receipt binding the exact run directory, checkpoint metadata, old and new contracts, and source manifests.
-Every other contract field must remain identical; a receipt cannot authorize a model, training, data, tokenizer, initialization, precision, or runtime change.
-The old checkpoint and founding `run.json` remain unchanged; the new attempt and checkpoints record the actual source contract and transition provenance.
-Subsequent resumes use the new checkpoint's matching contract without the transition flag, and further source changes invalidate the earlier receipt.
+Resume restores model, optimizer, RNG, and loader state without requiring recorded source, configuration, tokenizer, data, or runtime fingerprints to match the current invocation.
+The optimizer restores saved parameter-group settings, including base learning rates; changing CLI learning-rate options does not override those saved base rates.
+Source edits, including comment and documentation-reference changes, do not require a transition receipt or a separate approval step.
+Ordinary checkpoint loading still requires model tensors and optimizer state that the selected model can load.
+The old checkpoint and founding `run.json` remain unchanged; the new attempt and checkpoints record the current configuration and source provenance.
 Data identity records file metadata rather than rehashing the entire corpus.
 The best-fit loader retains approximate row-group resumption, so resumed training is not claimed to replay the exact uninterrupted token stream.
 
@@ -196,9 +197,10 @@ The initial configuration logs this boundary, and each update logs `input_embedd
 The compiled forward/backward may compile again when the table becomes trainable.
 
 The freeze policy is part of the saved training configuration.
-Resume keeps `--freeze-input-embedding` and the original full `--num-iterations`, restores trained weights and optimizer state, and omits the three initialization options.
-The completed checkpoint step determines the current phase; an early stop or a resumed invocation does not restart or shorten the freeze schedule.
-Freezing a run without pretrained initialization provenance or changing its freeze policy on resume is rejected.
+To preserve this experiment's freeze schedule, resume with `--freeze-input-embedding` and the original full `--num-iterations`, and omit the three initialization options.
+Resume restores trained weights and optimizer state; the current freeze policy, update budget, and completed checkpoint step determine the phase.
+Keeping the policy and budget unchanged preserves the original schedule, while changing them changes the schedule without requiring configuration equality.
+Freezing a run without pretrained initialization provenance is rejected.
 
 The fresh run was launched on October 10, 2026 at 00:57 SGT with committed training source `0bd758d2b56d1d8c9fe07bda80c36eb3be327d8f` and the following configuration:
 
@@ -221,7 +223,8 @@ uv run --no-sync python -m scripts.rlm_train \
 
 The persistent user service is `nanochat-rlm-u4-b32-frozen-20261010.service`, using the locked `.venv/bin/python` and recording both output streams in `pretrain-u4-b32-frozen-20261010.log` beside the run directory.
 The adjacent `pretrain-u4-b32-frozen-20261010-launch.json` records the exact command, environment, revision, resource checks, and the passing 406-test suite with 10 skipped tests.
-Automatic restart is disabled; a failure or reboot requires an explicit resume from the latest complete checkpoint with the original budget and freeze policy.
+Automatic restart is disabled; a failure or reboot requires an explicit resume from the latest complete checkpoint.
+Use the original budget and freeze policy to continue the same experiment schedule.
 The older October 8 run remains paused and retains its existing checkpoints.
 
 ```bash
@@ -290,9 +293,9 @@ The user stopped this run on October 9, 2026 at 19:46 SGT after update 381; the 
 The latest complete checkpoint at that stop was update 300, so resuming will repeat the 81 completed updates that were not checkpointed under the earlier periodic-only policy.
 The subsequent rolling-checkpoint change bounds future loss while saves succeed; it cannot recover those already discarded weights, and warning-only save failures can increase the unsaved gap.
 `pause.json` records the stopped state, verified checkpoint files, environment, and resume arguments preserving the 5574-update horizon and latest-ten numbered-checkpoint policy.
-The first resume from the saved update 300 uses its reviewed source-transition receipt; after a new rolling checkpoint is published, use `--resume-latest` without that receipt.
-The prepared receipt and source snapshot for the earlier pinned-staging implementation are under this run's `resume-preparation/`; `pause.json` preserves that source-bound receipt and first-resume command.
-The subsequent scheduled-freezing and logging changes alter the source fingerprint, so resuming this older paused run with current sources requires a new explicit review and receipt.
+Resume from the saved update 300 with `--resume-from-step 300`; after a new rolling checkpoint is published, use `--resume-latest`.
+The earlier source-transition receipt and source snapshot remain under this run's `resume-preparation/` as historical records.
+When using the recorded command in `pause.json` with current code, omit the obsolete `--resume-transition` option and its receipt path.
 Preparing this change did not restart training or alter checkpoint 300 and the founding run record.
 
 The rolling save path was validated on October 9 using checkpoint 300 loaded on the GPU, without executing training updates.
@@ -334,7 +337,7 @@ The corrected async checkpoint also matched every tensor and scalar in the live 
 CPU/CUDA RNG state, loader progress, configuration, and token counters matched across cases.
 Cross-run model and optimizer values were not bitwise identical, and the largest loss difference was 0.00002503; GPU deterministic algorithms were not enabled, so these tests do not claim exact cross-run numerical reproducibility.
 The production run remained paused throughout all nine independent benchmark updates, and its checkpoint 300 and founding `run.json` were preserved.
-Its prepared resume command now selects asynchronous checkpointing, numbered saves every ten updates, and ten retained numbered checkpoints, using a new source-bound receipt recorded in `pause.json`.
+At that time, its prepared resume command selected asynchronous checkpointing, numbered saves every ten updates, and ten retained numbered checkpoints, using a source-bound receipt recorded in `pause.json`.
 
 Update 302 is the only warm, non-final update in this comparison.
 Its reconstructed synchronous cycle took 232.81 seconds: 196.17 seconds of computation, 36.64 seconds saving, and 0.0017 seconds preparing the checkpoint state containers.
@@ -704,7 +707,7 @@ A CUDA generation check consumed a 1020-token prompt and generated eight tokens 
 
 Artifacts are in `~/.cache/nanochat/spark-rlm/learning-6-20261008`, including `result.json`, `evaluation.json`, `evaluation-contiguous.json`, `summary-gradient-check.json`, `slot-diagnostics.json`, and `generation-check.json`.
 The experiment's step-6 model and optimizer files were removed during the October 9 housekeeping described below.
-The invocation's source snapshot is authoritative: later validation, generation, and evaluation-data changes intentionally make the current source fingerprint incompatible with training resume of this pilot.
+The invocation's source snapshot records the implementation used for this pilot.
 The pilot also predates the learned `<EOM>` parameter; the current implementation intentionally has no old-layout compatibility path.
 Matched ordinary 2048-token and independent 1024-token training baselines, longer-horizon quality comparisons, and learning-efficiency claims remain future experiments.
 
@@ -722,13 +725,13 @@ The exact deletion manifest, per-file deletion log, and verification receipt are
 
 ```bash
 CUDA_VISIBLE_DEVICES='' NANOCHAT_DTYPE=float32 NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 \
-uv run --no-sync python -m pytest tests/test_rlm_model.py tests/test_rlm_training.py tests/test_rlm_initialization.py tests/test_rlm_checkpoints.py tests/test_rlm_latest.py tests/test_rlm_resume.py tests/test_rlm_checkpointing.py tests/test_rlm_train_cli.py tests/test_rlm_inference.py tests/test_rlm_data.py tests/test_rlm_profile.py -q
+uv run --no-sync python -m pytest tests/test_rlm_model.py tests/test_rlm_training.py tests/test_rlm_initialization.py tests/test_rlm_checkpoints.py tests/test_rlm_latest.py tests/test_rlm_checkpointing.py tests/test_rlm_train_cli.py tests/test_rlm_inference.py tests/test_rlm_data.py tests/test_rlm_profile.py -q
 
 uv lock --check
 git diff --check
 ```
 
-The targeted tests cover causal isolation, cross-cycle gradients, shifted target accounting, loader buffer lifetime, optimizer/summary state, input-table-only initialization, interrupted rolling saves and retention, reviewed source transitions, exact fixture training/resume, generation rollover, and paired memory interventions.
+The targeted tests cover causal isolation, cross-cycle gradients, shifted target accounting, loader buffer lifetime, optimizer/summary state, input-table-only initialization, interrupted rolling saves and retention, exact fixture training/resume, generation rollover, and paired memory interventions.
 An additional CPU comparison against the pre-refactor ordinary GPT exactly matched logits, parameter gradients, cached prefill/decode, parameter counts, and optimizer groups in FP32/BF16 with full attention and sliding attention with grouped-query heads.
 After removing the freezing option and standalone recall diagnostic on October 8, 2026, `NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 uv run --no-sync python -m pytest -q` completed with 176 passed and 10 skipped, including the available CUDA tests.
 The uv lock check, shell syntax checks for the existing Spark runners, and diff whitespace check also passed.

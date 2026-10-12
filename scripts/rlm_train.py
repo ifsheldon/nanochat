@@ -59,7 +59,6 @@ def parse_args():
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume-from-step", type=int, default=None)
     resume.add_argument("--resume-latest", action="store_true", help="resume the complete model/optimizer state in checkpoints/latest.pt")
-    parser.add_argument("--resume-transition", type=Path, help="resume only: receipt binding an explicitly reviewed source/checkpoint-policy change to this checkpoint")
     parser.add_argument("--stop-after-step", type=int, default=None, help="save and stop at a completed update without changing schedule")
     args = parser.parse_args()
     if args.save_every is None:
@@ -79,8 +78,6 @@ def parse_args():
         parser.error("--save-every cannot be negative")
     if args.keep_checkpoints is not None and args.keep_checkpoints <= 0:
         parser.error("--keep-checkpoints must be positive")
-    if args.resume_transition is not None and not resuming:
-        parser.error("--resume-transition requires a resume checkpoint")
     initialization_args = (
         args.init_embedding_checkpoint_dir, args.init_embedding_step, args.init_embedding_tokenizer,
     )
@@ -248,20 +245,6 @@ def run(args, attempt):
             "cuda": torch.version.cuda, "triton": triton_version,
         },
     }
-    transition = None if metadata is None else metadata.get("resume_transition")
-    if resuming:
-        if args.resume_transition is not None:
-            from nanochat.rlm_resume import ResumeTransition
-
-            transition = ResumeTransition.from_file(args.resume_transition).validate(
-                args.output_dir, metadata, contract,
-            )
-            write_json(attempt / "resume-transition.json", transition)
-        elif metadata.get("run_contract") != contract:
-            raise ValueError(
-                "Resume requires matching RLM model, training budget, source, data, tokenizer, and precision; "
-                "a reviewed source/checkpoint-policy change requires its exact --resume-transition receipt"
-            )
     write_json(attempt / "source.json", source)
     write_json(attempt / "data-inventory.json", inventory)
     repo = Path(__file__).resolve().parents[1]
@@ -277,7 +260,6 @@ def run(args, attempt):
         "argv": sys.argv, "revision": revision, "contract": contract,
         "mode": args.mode, "torch_version": torch.__version__,
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "resume_transition": transition,
     })
     logger.info("%s", json.dumps({
         "configuration": contract, "accumulation_steps": accumulation,
@@ -356,6 +338,13 @@ def run(args, attempt):
     )
     setup_metrics = cuda_metrics(device)
     updates = []
+    tokens_per_update = {
+        "text_tokens": config.total_batch_size,
+        "supervised_tokens": config.prediction_targets_per_update(args.text_length),
+        "internal_positions": accumulation * config.device_batch_size
+        * config.positions_per_episode(args.text_length, args.memory_tokens),
+    }
+    token_counts = {name: 0 if metadata is None else metadata[name] for name in tokens_per_update}
     writer = None if args.mode == "probe" else CheckpointWriter(
         checkpoint_dir, mode=args.checkpoint_mode, keep_last=args.keep_checkpoints,
         latest_step=latest_checkpoint.metadata()["step"] if latest_checkpoint.exists() else None,
@@ -397,6 +386,8 @@ def run(args, attempt):
                     before_optimizer_step=before_optimizer_step if writer is not None else None,
                 )
                 step += 1
+                for name, count in tokens_per_update.items():
+                    token_counts[name] += count
                 metrics["lr_multiplier"] = lrm
                 updates.append(metrics)
                 with metrics_path.open("a") as stream:
@@ -407,10 +398,8 @@ def run(args, attempt):
                 if writer is not None:
                     numbered = step == 2 or step == endpoint or bool(args.save_every and step % args.save_every == 0)
                     synchronize(device)
-                    saved_metadata = checkpoint_metadata(model, config, step, loader_state, contract)
+                    saved_metadata = checkpoint_metadata(model, config, step, loader_state, contract, token_counts)
                     saved_metadata["numbered_checkpoint"] = numbered
-                    if transition is not None:
-                        saved_metadata["resume_transition"] = transition
                     writer.submit(model.state_dict(), optimizer.state_dict(), saved_metadata, numbered=numbered)
                     record_checkpoint_measurements()
                     logger.info("%s", json.dumps({"checkpoint_status": writer.status(step)}))
@@ -429,8 +418,8 @@ def run(args, attempt):
         "status": "completed" if step == args.num_iterations else "paused",
         "mode": args.mode, "completed_updates": step, "attempt_updates": len(updates),
         "parameter_counts": parameter_counts,
-        "text_tokens": step * config.total_batch_size,
-        "supervised_tokens": step * config.prediction_targets_per_update(args.text_length),
+        "text_tokens": token_counts["text_tokens"],
+        "supervised_tokens": token_counts["supervised_tokens"],
         "peak_cuda_reserved_gb": peak_reserved, "peak_cuda_allocated_gb": peak_allocated,
         "minimum_system_available_gb": monitor.minimum_observed / 1e9,
         "within_72gb_training_reserve_target": training_peak_reserved <= 72 if device.type == "cuda" else None,

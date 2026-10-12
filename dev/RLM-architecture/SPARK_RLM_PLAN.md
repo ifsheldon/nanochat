@@ -31,13 +31,13 @@ Its warm non-final update took 232.81 seconds synchronously versus 217.48 second
 A subsequent bounded Nsight profile found that GPU-to-CPU storage copies consumed 83–84% of checkpoint time and that overlapping saves both prolonged training kernels and blocked training threads on Python's GIL during storage copying; the workflow report records the attribution and measurement limits.
 The pinned-staging follow-up reduced the same three-update total to 610.68 seconds, 14.56% below the previous async writer, and the warm non-final update to 198.69 seconds, an 8.64% reduction.
 Its checkpoint matched the final live state exactly; CUDA reservation stayed at 79.85 GB and minimum system available memory was 24.60 GB with the additional pinned host buffers.
-The production run remains paused at checkpoint 300 with a refreshed source-bound resume receipt; the workflow report includes the short-trial limits and unpublished storage-copy GIL reproducer.
+The production run remains paused at checkpoint 300; the workflow report includes the short-trial limits and unpublished storage-copy GIL reproducer.
 The fresh October 10 run loaded the same pretrained input table and freezes it until the final 10% of its full update budget, keeping the separate `<EOM>` and summary inputs and all other parameters trainable without changing the tokenizer vocabulary.
 The scheduled policy is implemented behind `--freeze-input-embedding`, with its phase reconstructed from the full budget and completed checkpoint step on resume; `pretrain-u4-b32-frozen-20261010` started at 00:57 SGT with 5574 total updates and its first trainable input-table update at 5017.
 Its first two updates and checkpoint 2 passed startup verification: the input table remained bit-exact with no Adam state, `<EOM>` and summary inputs each had two Adam updates, and the second update took 196.11 seconds with loss 10.255392.
 Update logging adds the final accumulation batch's unscaled loss plus one scalar cycle mean across all accumulation batches, preserving the existing aggregate loss.
 RLM progress and checkpoint events use NanoChat's standard Python logger at `INFO`, with recoverable checkpoint errors at `WARNING`; the per-update duration is logged and independently persisted as full-precision `duration_seconds` in `updates.jsonl`.
-The older run's saved receipt predates these source changes and requires renewed review before resuming with current code.
+Current resume commands do not require source-transition receipts; the older run's saved receipt remains a historical record.
 The earlier batch-size measurements and six-update pilot describe the original layout without `<EOM>`; the current contract follows below.
 
 ## Objective and current decisions

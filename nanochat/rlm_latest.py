@@ -44,20 +44,14 @@ def _metadata(value):
             for name in names:
                 if type(config.get(name)) is not int or config[name] <= 0:
                     raise ValueError(f"{name} must be a positive integer")
-        text, memory = model["text_length"], model["memory_tokens"]
+        text = model["text_length"]
         batch, cycles = training["total_batch_size"], training["cycles"]
         microbatch = training["device_batch_size"] * cycles * text
         if cycles < 2 or batch % microbatch:
             raise ValueError("training batch is inconsistent with complete RLM episodes")
-        counts = {
-            "text_tokens": step * batch,
-            "supervised_tokens": step * (batch + batch // text),
-            "internal_positions": step * batch // (cycles * text)
-            * (cycles * (text + 1) + 2 * (cycles - 1) * memory),
-        }
-        for name, expected in counts.items():
-            if type(value.get(name)) is not int or value[name] != expected:
-                raise ValueError(f"{name} is inconsistent with step and training configuration")
+        for name in ("text_tokens", "supervised_tokens", "internal_positions"):
+            if type(value.get(name)) is not int or value[name] <= 0:
+                raise ValueError(f"{name} must be a positive cumulative count")
         rng = value["rng_state"]
         for name in ("cpu", "cuda"):
             state = rng.get(name)

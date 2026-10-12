@@ -4,40 +4,31 @@ This branch packages a fresh RLM pretraining run for one H100 80 GB GPU.
 The launcher keeps the current Spark model, data selection, token budget, optimizer settings, and learning-rate schedule, and chooses among exactly three authorized batch/freezing recipes using one-update capacity probes.
 It does not need the current Spark run's checkpoints or optimizer state.
 
-## Prepare the seed bundle on the source machine
-
-Export only the original pretrained input embedding and its matching tokenizer:
-
-```bash
-CUDA_VISIBLE_DEVICES='' uv run --no-sync python -m scripts.rlm_export_embedding \
-    --checkpoint-dir /path/to/base_checkpoints/spark-d24-bf16 \
-    --step 5568 \
-    --tokenizer-dir /path/to/tokenizer \
-    --output-dir /path/to/h100-seed
-```
-
-The destination must be new and its parent must exist.
-Copy the entire resulting directory to the H100 machine using your usual file-transfer method.
-The five files are `model_005568.pt`, `meta_005568.json`, `tokenizer.pkl`, `token_bytes.pt`, and `manifest.json`.
-The model file contains only `transformer.wte.weight`; it retains the checkpoint naming convention so the existing initialization loader can read it.
-The `--init-embedding-checkpoint-dir`, `--init-embedding-step`, and `--init-embedding-tokenizer` options accept both original full checkpoints and compact checkpoints through the same loader.
-The H100 launcher uses `--init-embedding-bundle` to additionally verify the exported manifest and tokenizer assets.
-The tensor is cloned before saving, preventing its serialization from retaining the full source checkpoint's storage.
-The bundle preserves the source model's provenance and records SHA-256 checksums for every payload file and for the embedding tensor.
-Only the input table is copied into the new RLM; the remaining model weights, `<EOM>`, summary inputs, and optimizer start fresh.
+The verified seed bundle is included at `assets/h100-seed/`.
+Git LFS stores its three binary files: `model_005568.pt`, `tokenizer.pkl`, and `token_bytes.pt`.
+The accompanying `meta_005568.json` and `manifest.json` are ordinary Git files.
+The model file contains only the pretrained input embedding; the full source checkpoint is not included.
 
 ## Start on the H100 machine
 
-Clone this repository, check out `h100-rlm`, and install `uv` if it is not already available.
+Install Git LFS and `uv` on the H100 machine if they are not already available.
+Initialize Git LFS before cloning so the binary seed files are downloaded correctly.
 The machine needs Linux, a working NVIDIA driver compatible with the locked CUDA 13.2 PyTorch build, internet access for dependencies and the original dataset, and at least 32 GB of host RAM currently available before launch.
 The launcher does not install or upgrade the NVIDIA driver.
 Use a persistent terminal session or your machine's normal job scheduler so disconnecting SSH does not terminate training.
 
 ```bash
+git lfs install
+git clone --branch h100-rlm git@github.com:ifsheldon/nanochat.git
+cd nanochat
+git lfs pull
 bash runs/runh100_rlm.sh \
-    --assets /path/to/h100-seed \
+    --assets assets/h100-seed \
     --run-name pretrain-1
 ```
+
+For an existing checkout, run `git lfs install`, `git fetch origin`, `git switch h100-rlm`, `git pull --ff-only`, and `git lfs pull`, then use the same launch command.
+The launcher verifies the manifest checksums and rejects missing payloads or unexpanded LFS pointer files.
 
 The script uses `uv.lock`, Python 3.10.21, and the repository's GPU extra to create or synchronize the local environment.
 Before invoking uv, its standard-library bootstrap sets run-local defaults for package and runtime download caches, including uv and Hugging Face Xet.
@@ -66,6 +57,29 @@ Additional shards belonging to other runs can remain in the shared directory.
 `NANOCHAT_TRAIN_SHARDS=170` constrains the training loader to the same 170 training shards and validation shard `06542`, so additional shared files do not change this run's data selection.
 It also checks the final inventory because the existing downloader can report individual download failures without returning a failed process status.
 The dataset is approximately 15.7 GB; no separate dataset transfer is required.
+
+## Optional: rebuild the seed bundle
+
+The repository already includes the seed needed for the launch above.
+To reproduce or intentionally replace that seed, export the original pretrained input embedding and its matching tokenizer:
+
+```bash
+CUDA_VISIBLE_DEVICES='' uv run --no-sync python -m scripts.rlm_export_embedding \
+    --checkpoint-dir /path/to/base_checkpoints/spark-d24-bf16 \
+    --step 5568 \
+    --tokenizer-dir /path/to/tokenizer \
+    --output-dir /path/to/h100-seed
+```
+
+The destination must be new and its parent must exist.
+This produces a separate candidate bundle; normal H100 setup obtains the published bundle through Git LFS.
+The five files are `model_005568.pt`, `meta_005568.json`, `tokenizer.pkl`, `token_bytes.pt`, and `manifest.json`.
+The model file contains only `transformer.wte.weight`; it retains the checkpoint naming convention so the existing initialization loader can read it.
+The `--init-embedding-checkpoint-dir`, `--init-embedding-step`, and `--init-embedding-tokenizer` options accept both original full checkpoints and compact checkpoints through the same loader.
+The H100 launcher uses `--init-embedding-bundle` to additionally verify the exported manifest and tokenizer assets.
+The tensor is cloned before saving, preventing its serialization from retaining the full source checkpoint's storage.
+The bundle preserves the source model's provenance and records SHA-256 checksums for every payload file and for the embedding tensor.
+Only the input table is copied into the new RLM; the remaining model weights, `<EOM>`, summary inputs, and optimizer start fresh.
 
 ## Capacity decision
 

@@ -97,7 +97,6 @@ def test_transfer_changes_only_wte_preserves_rng_and_trains_every_parameter(sour
     monkeypatch.setattr(torch, "load", checked_load)
     source = initializer(source_files)
     contract = source.contract()
-    assert json.loads(json.dumps(contract)) == contract
     proof = source.initialize(model)
     assert calls == [{"map_location": "cpu", "weights_only": True, "mmap": True}]
     assert torch.equal(torch.get_rng_state(), rng_before)

@@ -19,6 +19,7 @@ import sys
 import time
 
 from nanochat.paths import configure_runtime_paths, get_run_dir
+from nanochat.rlm_policy import InputEmbeddingFreeze
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +53,12 @@ def parse_args():
     parser.add_argument("--init-embedding-checkpoint-dir", type=Path, help="fresh runs only: checkpoint directory providing transformer.wte.weight")
     parser.add_argument("--init-embedding-step", type=int, help="published source checkpoint step for input embedding initialization")
     parser.add_argument("--init-embedding-tokenizer", type=Path, help="source tokenizer.pkl; must exactly match the training tokenizer")
-    parser.add_argument("--freeze-input-embedding", action="store_true", help="freeze the pretrained input table for the first 90%% of the full update budget; EOM and summary inputs stay trainable")
+    parser.add_argument("--input-embedding-freeze", type=InputEmbeddingFreeze,
+                        choices=list(InputEmbeddingFreeze), default=InputEmbeddingFreeze.NONE,
+                        help="none, scheduled (first 90%%), or permanent; EOM and summary inputs stay trainable")
     parser.add_argument("--save-every", type=int, help="training only; numbered checkpoint interval (default: 10), plus update 2 and the final/paused update; 0 disables periodic numbered saves")
     parser.add_argument("--keep-checkpoints", type=int, help="training only: numbered checkpoints to retain (default: 10), in addition to rolling latest")
-    parser.add_argument("--checkpoint-mode", choices=("sync", "async"), default="async", help="async overlaps checkpoint writing with the next forward/backward; both modes warn and continue on save errors")
+    parser.add_argument("--checkpoint-mode", choices=("sync", "async"), default="async", help="async overlaps checkpoint writing with the next forward/backward; ordinary save errors warn, but a required 90%% checkpoint failure stops training")
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume-from-step", type=int, default=None)
     resume.add_argument("--resume-latest", action="store_true", help="resume the complete model/optimizer state in checkpoints/latest.pt")
@@ -91,8 +94,9 @@ def parse_args():
             parser.error("--init-embedding-step must be nonnegative")
         if resuming:
             parser.error("embedding initialization is fresh-run only; resume restores its saved initialization provenance and trained weights")
-    if args.freeze_input_embedding and not resuming and args.init_embedding_checkpoint_dir is None:
-        parser.error("--freeze-input-embedding requires pretrained embedding initialization for a fresh run")
+    if (args.input_embedding_freeze is not InputEmbeddingFreeze.NONE and not resuming
+            and args.init_embedding_checkpoint_dir is None):
+        parser.error("--input-embedding-freeze requires pretrained embedding initialization for a fresh run")
     if args.resume_from_step is not None and args.resume_from_step <= 0:
         parser.error("--resume-from-step must name a completed positive optimizer update")
     if args.stop_after_step is not None and not 0 < args.stop_after_step <= args.num_iterations:
@@ -217,7 +221,7 @@ def run(args, attempt):
         initialization = initializer.contract()
     else:
         initialization = {"kind": "random"}
-    if config.freeze_input_embedding and initialization["kind"] != "pretrained_input_token_embedding":
+    if config.input_embedding_freeze is not InputEmbeddingFreeze.NONE and initialization["kind"] != "pretrained_input_token_embedding":
         raise ValueError("Freezing the input embedding requires pretrained initialization provenance")
     model_config = RLMConfig(
         sequence_len=args.text_length + 1 + 2 * args.memory_tokens,
@@ -239,6 +243,7 @@ def run(args, attempt):
             "latest_every": 1, "early_step": 2,
             "save_every": args.save_every, "keep_last": args.keep_checkpoints,
             "mode": args.checkpoint_mode, "on_error": "warn",
+            "milestone_step": config.milestone_step or None,
         } if args.mode == "train" else None,
         "source_sha256": source["sha256"], "tokenizer_sha256": tokenizer_sha256,
         "data_inventory_sha256": inventory["sha256"], "compute_dtype": str(COMPUTE_DTYPE),
@@ -287,8 +292,9 @@ def run(args, attempt):
         "prediction_targets_per_update": config.prediction_targets_per_update(args.text_length),
         "input_embedding_freeze": {
             "frozen_updates": config.input_embedding_frozen_updates,
-            "first_trainable_update": config.input_embedding_frozen_updates + 1,
-        } if config.freeze_input_embedding else None,
+            "first_trainable_update": (None if config.input_embedding_freeze is InputEmbeddingFreeze.PERMANENT
+                                       else config.input_embedding_frozen_updates + 1),
+        } if config.input_embedding_freeze is not InputEmbeddingFreeze.NONE else None,
     }))
 
     optimizer_data = None
@@ -328,6 +334,16 @@ def run(args, attempt):
             record_checkpoint_retention(checkpoint_dir, step, args.keep_checkpoints, attempt)
     else:
         write_json(args.output_dir / "run.json", {"contract": contract, "revision": revision, "mode": args.mode})
+    if resuming and config.milestone_step and step >= config.milestone_step:
+        if step == config.milestone_step:
+            # A stop after rolling publication can leave the required durable
+            # copy unfinished. Repair it before any trainable-table forward.
+            latest_checkpoint.preserve_milestone(step)
+        milestone_metadata = latest_checkpoint.verify_milestone(config.milestone_step)
+        milestone_contract = milestone_metadata["run_contract"]
+        for field in ("model_config", "training_config", "initialization", "tokenizer_sha256", "data_inventory_sha256"):
+            if milestone_contract.get(field) != contract.get(field):
+                raise ValueError(f"Retained 90% checkpoint does not match the resumed {field}")
     with torch.device("meta"):
         model = RecurrentGPT(model_config)
     model.to_empty(device=device)
@@ -409,9 +425,16 @@ def run(args, attempt):
                     synchronize(device)
                     saved_metadata = checkpoint_metadata(model, config, step, loader_state, contract)
                     saved_metadata["numbered_checkpoint"] = numbered
+                    milestone = step == config.milestone_step
+                    saved_metadata["milestone_checkpoint"] = milestone
                     if transition is not None:
                         saved_metadata["resume_transition"] = transition
-                    writer.submit(model.state_dict(), optimizer.state_dict(), saved_metadata, numbered=numbered)
+                    writer.submit(model.state_dict(), optimizer.state_dict(), saved_metadata,
+                                  numbered=numbered, milestone=milestone)
+                    if milestone:
+                        # Unfreezing happens at the start of the next forward,
+                        # earlier than the usual pre-optimizer writer barrier.
+                        writer.wait(completed_step=step)
                     record_checkpoint_measurements()
                     logger.info("%s", json.dumps({"checkpoint_status": writer.status(step)}))
         finally:

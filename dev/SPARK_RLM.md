@@ -34,7 +34,8 @@ Input normalization, smear, and the initial residual operate across the combined
 RoPE positions restart at zero each cycle.
 The summary and `<EOM>` parameters use AdamW groups with the embedding learning-rate policy.
 By default all model parameters remain trainable, including the main input embedding, additional value embeddings, and untied LM head.
-For a run initialized from a pretrained input table, `--freeze-input-embedding` holds only that table fixed until the final 10% of the full training budget.
+For a run initialized from a pretrained input table, `--input-embedding-freeze scheduled` holds only that table fixed until the final 10% of the full training budget.
+Use `--input-embedding-freeze permanent` to keep the table frozen for the entire budget, or `none` to train it throughout.
 The separate `<EOM>` and summary inputs, additional value embeddings, LM head, and Transformer stay trainable throughout; the tokenizer vocabulary is unchanged.
 The other proposed boundary/type tokens and auxiliary classification loss remain deferred.
 
@@ -161,6 +162,13 @@ A durable retirement record permits an interrupted deletion to finish safely on 
 There is no live episode memory or partial gradient accumulation at this boundary.
 The default free-space reserve for checkpoint saving is 100 GB.
 
+Runs using either pretrained input-table freeze policy also preserve `checkpoints/pretrain-90pct.pt` at `floor(9 * num_iterations / 10)` completed updates, provided that boundary is positive.
+For 5574 updates, this is update 5016, before the scheduled policy enables gradients at update 5017; a permanent-freeze run retains the same progress milestone without unfreezing.
+The writer durably copies the complete published rolling bundle, retaining model, optimizer, RNG, loader progress, and metadata while keeping `latest.pt` available.
+This immutable file survives numbered-checkpoint retention and requires space for one additional full checkpoint.
+Training waits for its durable publication before beginning the next forward; a failure stops training rather than proceeding without the requested milestone.
+Resuming at that boundary repairs an interrupted copy from `latest.pt`; later resumes verify the retained milestone and its training identity.
+
 To pause reproducibly at an update boundary, add `--stop-after-step 10` to the training command.
 Stopping the service uses the most recent fully published rolling checkpoint; it does not invoke a signal-time save.
 To resume, repeat the original model/training and checkpoint-policy options, keep the original `--num-iterations`, and add `--resume-latest` while removing the earlier stop flag and any initialization flags.
@@ -206,7 +214,7 @@ Resume uses the saved RLM checkpoint and omits initialization flags.
 
 ### New run with scheduled input-embedding freezing
 
-Use `--freeze-input-embedding` together with the three `--init-embedding-*` options for a fresh run.
+Use `--input-embedding-freeze scheduled` together with the three `--init-embedding-*` options for a fresh run.
 Only the pretrained `transformer.wte.weight` table is frozen; copying happens before the freeze is applied, and the new `<EOM>` and summary parameters retain their fresh, trainable initialization.
 The table receives no gradient, weight decay, or Adam state updates while frozen.
 Its optimizer group remains in place, and its Adam moments are created on the first trainable update, using the learning rate at that point in the original schedule.
@@ -216,7 +224,8 @@ The initial configuration logs this boundary, and each update logs `input_embedd
 The compiled forward/backward may compile again when the table becomes trainable.
 
 The freeze policy is part of the saved training configuration.
-Resume keeps `--freeze-input-embedding` and the original full `--num-iterations`, restores trained weights and optimizer state, and omits the three initialization options.
+The current CLI expresses it with `--input-embedding-freeze`; historical Spark invocations used the former scheduled-only `--freeze-input-embedding` flag and retain their original source snapshots.
+Resume keeps `--input-embedding-freeze scheduled` and the original full `--num-iterations`, restores trained weights and optimizer state, and omits the three initialization options.
 The completed checkpoint step determines the current phase; an early stop or a resumed invocation does not restart or shorten the freeze schedule.
 Freezing a run without pretrained initialization provenance or changing its freeze policy on resume is rejected.
 

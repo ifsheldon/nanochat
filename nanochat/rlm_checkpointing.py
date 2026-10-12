@@ -28,6 +28,10 @@ class CheckpointStagingSynchronizationError(RuntimeError):
     """CUDA could not drain a failed copy, so mutating live tensors is unsafe."""
 
 
+class MilestoneCheckpointError(RuntimeError):
+    """The required pre-unfreeze checkpoint was not durably preserved."""
+
+
 def _snapshot_state(value):
     """Copy mutable containers and scalars while retaining tensor storage.
 
@@ -65,6 +69,7 @@ class _CheckpointRequest:
     optimizer: dict
     metadata: dict
     numbered: bool
+    milestone: bool
     snapshot_seconds: float
 
 
@@ -86,6 +91,8 @@ class CheckpointWriter:
 
     Ordinary snapshot/save/retention errors are warning results. The next update
     can retry publication, so durable latest may lag by more than one update.
+    A requested milestone is mandatory: wait raises if it was not preserved,
+    preventing subsequent optimizer updates or embedding unfreezing.
     KeyboardInterrupt and other BaseException subclasses still propagate.
     """
 
@@ -119,17 +126,20 @@ class CheckpointWriter:
             "pending_step": self._pending_step,
         }
 
-    def _measurement(self, step, numbered, snapshot_seconds):
+    def _measurement(self, step, numbered, snapshot_seconds, milestone=False):
         return {
             "step": step, "mode": self.mode.value, "numbered": numbered,
+            "milestone": milestone,
             "status": "saved", "errors": [],
             "snapshot_duration_seconds": snapshot_seconds,
             "duration_seconds": snapshot_seconds,
             "staging_duration_seconds": 0.0,
             "latest_duration_seconds": 0.0,
+            "milestone_duration_seconds": 0.0,
             "numbered_duration_seconds": 0.0,
             "retention_duration_seconds": 0.0,
             "latest_published": False, "numbered_published": False,
+            "milestone_published": False,
         }
 
     def _warning(self, result, phase, error):
@@ -138,10 +148,10 @@ class CheckpointWriter:
         result["errors"].append(detail)
         _emit("checkpoint_warning", {
             "step": result["step"], "latest_path": str(self.store.path),
-            "training_continues": True, **detail,
+            "training_continues": not (result["milestone"] and not result["milestone_published"]), **detail,
         }, level=logging.WARNING)
 
-    def submit(self, model_data, optimizer_data, metadata, *, numbered: bool):
+    def submit(self, model_data, optimizer_data, metadata, *, numbered: bool, milestone: bool = False):
         if self._closed:
             raise RuntimeError("Cannot submit a checkpoint after the writer is closed")
         if self._pending is not None:
@@ -158,11 +168,11 @@ class CheckpointWriter:
             phase = "staging"
             self._prepare_stager(model_snapshot)
             request = _CheckpointRequest(
-                step, model_snapshot, optimizer_snapshot, metadata_snapshot, numbered,
+                step, model_snapshot, optimizer_snapshot, metadata_snapshot, numbered, milestone,
                 time.monotonic() - started,
             )
         except Exception as exc:
-            result = self._measurement(step, numbered, time.monotonic() - started)
+            result = self._measurement(step, numbered, time.monotonic() - started, milestone)
             self._warning(result, phase, exc)
             self._pending = Future()
             self._pending.set_result(result)
@@ -175,7 +185,7 @@ class CheckpointWriter:
                 try:
                     self._pending = self._executor.submit(self._write, request)
                 except Exception as exc:
-                    result = self._measurement(step, numbered, request.snapshot_seconds)
+                    result = self._measurement(step, numbered, request.snapshot_seconds, milestone)
                     self._warning(result, "submit", exc)
                     self._pending = Future()
                     self._pending.set_result(result)
@@ -227,7 +237,7 @@ class CheckpointWriter:
         return staged["model"], staged["optimizer"]
 
     def _write(self, request):
-        result = self._measurement(request.step, request.numbered, request.snapshot_seconds)
+        result = self._measurement(request.step, request.numbered, request.snapshot_seconds, request.milestone)
         started = time.monotonic()
         phase = "staging"
         phase_started = started
@@ -242,6 +252,15 @@ class CheckpointWriter:
             _emit("checkpoint_latest", {
                 "step": request.step, "path": str(self.store.path), "durable": True,
             })
+            if request.milestone:
+                phase = "milestone"
+                phase_started = time.monotonic()
+                self.store.preserve_milestone(request.step)
+                result["milestone_published"] = True
+                result["milestone_duration_seconds"] = time.monotonic() - phase_started
+                _emit("checkpoint_milestone", {
+                    "step": request.step, "path": str(self.store.milestone_path), "durable": True,
+                })
             if request.numbered:
                 phase = "numbered"
                 phase_started = time.monotonic()
@@ -282,6 +301,12 @@ class CheckpointWriter:
         result.update(self.status(completed_step))
         self.measurements.append(result)
         _emit("checkpoint_status", result)
+        if result["milestone"] and not result["milestone_published"]:
+            detail = "; ".join(error["message"] for error in result["errors"])
+            raise MilestoneCheckpointError(
+                f"Required milestone at update {result['step']} was not durably preserved; "
+                f"training stopped before the next update: {detail}"
+            )
         return result
 
     def close(self, completed_step: int):

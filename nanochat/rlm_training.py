@@ -13,6 +13,7 @@ import torch
 
 from nanochat.checkpoint_manager import _atomic_write, find_last_step
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.rlm_policy import InputEmbeddingFreeze
 from nanochat.training_runtime import positive_gb, require_finite_loss
 
 
@@ -32,9 +33,10 @@ class TrainingConfig:
     weight_decay: float = 0.28
     seed: int = 42
     compile: bool = True
-    freeze_input_embedding: bool = False
+    input_embedding_freeze: InputEmbeddingFreeze = InputEmbeddingFreeze.NONE
 
     def __post_init__(self):
+        object.__setattr__(self, "input_embedding_freeze", InputEmbeddingFreeze(self.input_embedding_freeze))
         for name in ("device_batch_size", "total_batch_size", "num_iterations"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -69,8 +71,17 @@ class TrainingConfig:
 
     @property
     def input_embedding_frozen_updates(self):
-        """Leave the final ceil(budget / 10) complete updates trainable."""
-        return 9 * self.num_iterations // 10 if self.freeze_input_embedding else 0
+        """Number of complete updates that keep the input table fixed."""
+        if self.input_embedding_freeze is InputEmbeddingFreeze.PERMANENT:
+            return self.num_iterations
+        if self.input_embedding_freeze is InputEmbeddingFreeze.SCHEDULED:
+            return 9 * self.num_iterations // 10
+        return 0
+
+    @property
+    def milestone_step(self):
+        """Retain the 90% boundary for either pretrained-table freeze policy."""
+        return 9 * self.num_iterations // 10 if self.input_embedding_freeze is not InputEmbeddingFreeze.NONE else 0
 
     def lr_multiplier(self, step):
         if step < self.warmup_steps:
@@ -128,7 +139,7 @@ def apply_schedule(optimizer, config, step, initial_decay):
 
 def apply_input_embedding_schedule(model, config, step):
     frozen = step < config.input_embedding_frozen_updates
-    if config.freeze_input_embedding:
+    if config.input_embedding_freeze is not InputEmbeddingFreeze.NONE:
         # Fixed groups preserve parameter identities on resume. Adam state is
         # created only when the table first receives a trainable gradient.
         model.transformer.wte.weight.requires_grad_(not frozen)

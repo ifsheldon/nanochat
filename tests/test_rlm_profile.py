@@ -54,7 +54,7 @@ def fixture():
 @pytest.mark.parametrize("freeze_input_embedding", [False, True])
 def test_profile_warms_resident_state_and_exports_real_backward_and_optimizer_events(tmp_path, freeze_input_embedding):
     model, optimizer, config, loader = fixture()
-    config = replace(config, num_iterations=10, freeze_input_embedding=freeze_input_embedding)
+    config = replace(config, num_iterations=10, input_embedding_freeze="scheduled" if freeze_input_embedding else "none")
     initial_embedding = model.transformer.wte.weight.detach().clone()
     initial_eom = model.eom_embedding.detach().clone()
     initial_summary = model.summary_embedding.detach().clone()

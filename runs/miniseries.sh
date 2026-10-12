@@ -5,9 +5,7 @@
 # Example: ./miniseries.sh jan11
 # Default series name is today's date (e.g., jan11)
 
-export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
+source "$(dirname -- "${BASH_SOURCE[0]}")/_common.sh" miniseries 1000 || exit $?
 
 # Setup (skip with SKIP_SETUP=1)
 if [ -z "$SKIP_SETUP" ]; then

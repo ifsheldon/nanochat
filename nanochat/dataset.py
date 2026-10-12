@@ -9,12 +9,14 @@ For details of how the dataset was prepared, see `repackage_data_reference.py`.
 
 import os
 import argparse
+from pathlib import Path
 import time
 import requests
 import pyarrow.parquet as pq
 from multiprocessing import Pool
+from filelock import FileLock
 
-from nanochat.common import get_base_dir
+from nanochat.common import get_datasets_dir
 
 # -----------------------------------------------------------------------------
 # The specifics of the current pretraining dataset
@@ -23,45 +25,39 @@ from nanochat.common import get_base_dir
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
 MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
 index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
-base_dir = get_base_dir()
-DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
+DATA_DIR = os.path.join(get_datasets_dir(), "base_data_climbmix")
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
 
-def list_parquet_files(data_dir=None, warn_on_legacy=False):
-    """ Looks into a data dir and returns full paths to all parquet files. """
-    data_dir = DATA_DIR if data_dir is None else data_dir
+def list_parquet_files(data_dir=None):
+    """List an explicit training subset plus validation, or every parquet file.
 
-    # Legacy-supporting code due to the upgrade from FinewebEdu-100B to ClimbMix-400B
-    # This code will eventually be deleted.
-    if not os.path.exists(data_dir):
-        if warn_on_legacy:
-            print()
-            print("=" * 80)
-            print("  WARNING: DATASET UPGRADE REQUIRED")
-            print("=" * 80)
-            print()
-            print(f"  Could not find: {data_dir}")
-            print()
-            print("  nanochat recently switched from FinewebEdu-100B to ClimbMix-400B.")
-            print("  Everyone who does `git pull` as of March 4, 2026 is expected to see this message.")
-            print("  To upgrade to the new ClimbMix-400B dataset, run these two commands:")
-            print()
-            print("    python -m nanochat.dataset -n 170     # download ~170 shards, enough for GPT-2, adjust as desired")
-            print("    python -m scripts.tok_train           # re-train tokenizer on new ClimbMix data")
-            print()
-            print("  For now, falling back to your old FinewebEdu-100B dataset...")
-            print("=" * 80)
-            print()
-        # attempt a fallback to the legacy data directory
-        data_dir = os.path.join(base_dir, "base_data")
+    NANOCHAT_TRAIN_SHARDS selects the first N canonical ClimbMix training shards
+    and always uses shard_06542.parquet for validation. Other cached shards never
+    enlarge a run's selected dataset. Without the variable, all parquet files in
+    the requested directory are returned in sorted order.
+    """
+    data_dir = Path(DATA_DIR if data_dir is None else data_dir)
+    selected_count = os.environ.get("NANOCHAT_TRAIN_SHARDS")
+    if selected_count is not None:
+        try:
+            count = int(selected_count)
+        except ValueError as exc:
+            raise ValueError(f"NANOCHAT_TRAIN_SHARDS must be an integer from 1 to {MAX_SHARD}") from exc
+        if not 1 <= count <= MAX_SHARD:
+            raise ValueError(f"NANOCHAT_TRAIN_SHARDS must be an integer from 1 to {MAX_SHARD}")
+        selected = [data_dir / index_to_filename(index) for index in (*range(count), MAX_SHARD)]
+        for path in selected:
+            if not path.is_file():
+                raise FileNotFoundError(f"Selected ClimbMix shard is missing or is not a regular file: {path}")
+        return [str(path) for path in selected]
 
     parquet_files = sorted([
         f for f in os.listdir(data_dir)
         if f.endswith('.parquet') and not f.endswith('.tmp')
     ])
-    parquet_paths = [os.path.join(data_dir, f) for f in parquet_files]
+    parquet_paths = [str(data_dir / f) for f in parquet_files]
     return parquet_paths
 
 def parquets_iter_batched(split, start=0, step=1):
@@ -87,50 +83,52 @@ def download_single_file(index):
     # Construct the local filepath for this file and skip if it already exists
     filename = index_to_filename(index)
     filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        print(f"Skipping {filepath} (already exists)")
-        return True
-
-    # Construct the remote URL for this file
-    url = f"{BASE_URL}/{filename}"
-    print(f"Downloading {filename}...")
-
-    # Download with retries
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            # Write to temporary file first
-            temp_path = filepath + f".tmp"
-            with open(temp_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
-                    if chunk:
-                        f.write(chunk)
-            # Move temp file to final location
-            os.rename(temp_path, filepath)
-            print(f"Successfully downloaded {filename}")
+    # Runs share this cache, so only one process may publish a shard at a time.
+    with FileLock(filepath + ".lock"):
+        if os.path.exists(filepath):
+            print(f"Skipping {filepath} (already exists)")
             return True
 
-        except (requests.RequestException, IOError) as e:
-            print(f"Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            # Clean up any partial files
-            for path in [filepath + f".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except:
-                        pass
-            # Try a few times with exponential backoff: 2^attempt seconds
-            if attempt < max_attempts:
-                wait_time = 2 ** attempt
-                print(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-            else:
-                print(f"Failed to download {filename} after {max_attempts} attempts")
-                return False
+        # Construct the remote URL for this file
+        url = f"{BASE_URL}/{filename}"
+        print(f"Downloading {filename}...")
 
-    return False
+        # Download with retries
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = requests.get(url, stream=True, timeout=30)
+                response.raise_for_status()
+                # Write to temporary file first
+                temp_path = filepath + f".tmp"
+                with open(temp_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                        if chunk:
+                            f.write(chunk)
+                # Move temp file to final location
+                os.rename(temp_path, filepath)
+                print(f"Successfully downloaded {filename}")
+                return True
+
+            except (requests.RequestException, IOError) as e:
+                print(f"Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
+                # Clean up any partial files
+                for path in [filepath + f".tmp", filepath]:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except:
+                            pass
+                # Try a few times with exponential backoff: 2^attempt seconds
+                if attempt < max_attempts:
+                    wait_time = 2 ** attempt
+                    print(f"Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"Failed to download {filename} after {max_attempts} attempts")
+                    return False
+
+        return False
 
 
 if __name__ == "__main__":

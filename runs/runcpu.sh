@@ -11,8 +11,7 @@
 # You may also want to run this script manually and one by one, copy pasting commands into your terminal.
 
 # all the setup stuff
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
+source "$(dirname -- "${BASH_SOURCE[0]}")/_common.sh" cpu 8 || exit $?
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 [ -d ".venv" ] || uv venv
 uv sync --extra cpu

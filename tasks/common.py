@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from filelock import FileLock
 
-from nanochat.common import get_base_dir
+from nanochat.common import get_datasets_dir
 
 
 class HubDataset:
@@ -49,7 +49,7 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
     shards via the hub API, download them (once) into the local cache directory, and
     read them with pyarrow. Under torchrun, only one rank downloads, the others wait.
     """
-    base_dir = get_base_dir()
+    base_dir = get_datasets_dir()
     slug = repo_id.replace("/", "--")
     shards_dir = os.path.join(base_dir, "task_data", slug, subset, split)
     # the manifest is written last, so its existence means the download completed

@@ -32,6 +32,8 @@ from datasets import load_dataset
 import pyarrow.parquet as pq
 import pyarrow as pa
 
+from nanochat.common import get_datasets_dir
+
 # You can change these:
 dataset_tag = "climbmix"
 upload_to_hf = True
@@ -63,7 +65,8 @@ else:
     raise ValueError(f"Unknown dataset tag: {dataset_tag}")
 
 # Source dataset
-ds = load_dataset(**dataset_kwargs)
+datasets_dir = get_datasets_dir()
+ds = load_dataset(**dataset_kwargs, cache_dir=os.path.join(datasets_dir, "huggingface"))
 
 # Shuffle to scramble the order
 ds = ds.shuffle(seed=42)
@@ -71,7 +74,7 @@ ndocs = len(ds) # total number of documents to process
 print(f"Total number of documents: {ndocs}")
 
 # Repackage into parquet files
-output_dir = f"/home/ubuntu/.cache/nanochat/base_data_{output_dirname}"
+output_dir = os.path.join(datasets_dir, f"base_data_{output_dirname}")
 os.makedirs(output_dir, exist_ok=True)
 
 # Write to parquet files

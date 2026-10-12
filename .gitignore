@@ -11,3 +11,9 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+
+# Keep project-local storage roots, but never version runtime artifacts or data.
+/training_run/*
+!/training_run/.gitkeep
+/datasets/*
+!/datasets/.gitkeep

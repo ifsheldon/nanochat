@@ -12,7 +12,7 @@ The locked environment uses PyTorch 2.14.0+cu132 and Triton 3.8.0.
 Training uses BF16 compute, existing parameter/optimizer precision, 24 layers, width 1536, 12 heads, 2048-token context, and full-context SDPA.
 The runner sets `NANOCHAT_ATTENTION_IMPL=sdpa` to bypass remote FA3 kernel discovery throughout the run; the default `auto` retains upstream detection for other workflows.
 The separate [FA4 benchmark workflow](SPARK_FA4.md) compares alternative attention and linear precision settings without resuming this production run.
-The tokenizer is copied from the validated small Spark experiment, without retraining.
+Each run owns its tokenizer; preparation trains a 32,768-token tokenizer when the new run has none and validates any complete tokenizer already supplied in that run.
 The global batch is 1,048,576 tokens, the target tokens-to-scaling-parameters ratio is 8, and the production horizon is 5,568 optimizer updates, or 5,838,471,168 tokens.
 Initial device batch 16 requires 32 accumulation microbatches per update.
 Validation halves the device batch if necessary while preserving the global batch and context.
@@ -34,7 +34,11 @@ tmux attach -t nanochat-d24
 ```
 
 Detach with Ctrl-b followed by d.
-The artifact root defaults to `~/.cache/nanochat/spark-d24`; override `NANOCHAT_BASE_DIR` to select a different run directory.
+The artifact root defaults to this project's `training_run/spark-d24/`; set `NANOCHAT_RUN_NAME` for another named run or `NANOCHAT_BASE_DIR` for an explicit artifact directory.
+Checkpoints, tokenizer files, console and command logs, metrics, and runtime caches stay in that run directory.
+Raw ClimbMix shards, SFT task data, and CORE evaluation data are shared under the project's `datasets/`, or an explicit `NANOCHAT_DATASETS_DIR`.
+The d24 run selects training shards 0 through 169 and the fixed validation shard; extra shared shards do not change its training set.
+Existing data, logs, and checkpoints under `~/.cache/nanochat` are preserved in place and are not migrated or copied automatically.
 The model tag is `spark-d24-bf16`, and validation uses separate tags.
 The runner takes an exclusive file lock, records each command and source revision/diff/untracked source, and writes timestamped command logs and JSON memory/error results.
 `status.json` identifies the current stage and its log directory.
@@ -42,7 +46,7 @@ W&B is disabled.
 
 | Stage | Behavior |
 | --- | --- |
-| `prepare` | Copy the existing tokenizer and cached data, download 170 training shards plus validation, preload SFT/evaluation data, verify Parquet metadata, and record SHA-256 checksums. |
+| `prepare` | Reuse or download 170 shared training shards plus validation, train the run tokenizer if absent, preload shared SFT/evaluation data, verify Parquet metadata, and record SHA-256 checksums. |
 | `validate` | Run two accumulated d24 updates, pause, resume to update four with the same horizon, inspect finite model/optimizer tensors, reload for inference, and run two accumulated SFT updates. |
 | `pretrain` | Start fresh production pretraining, or explicitly resume a complete checkpoint. |
 | `base-eval` | Run full CORE, 20,971,520-token BPB on each split, and standard generated samples. |
@@ -107,7 +111,7 @@ Chat evaluation uses temperature 0, one sample, and 512 maximum new tokens, star
 A score below the target is reported explicitly; SFT and chat evaluation still complete.
 
 ```bash
-NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_RUN_NAME=spark-d24 \
 NANOCHAT_CUDA_MEMORY_LIMIT_GB=80 \
 NANOCHAT_ATTENTION_IMPL=sdpa \
 uv run --no-sync python -m scripts.chat_cli --device-type=cuda --model-tag=spark-d24-bf16

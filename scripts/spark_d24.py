@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 
 from filelock import FileLock
+from nanochat.paths import configure_runtime_paths, get_datasets_dir, get_run_dir
 
 
 TAG = "spark-d24-bf16"
@@ -39,7 +40,7 @@ def digest(path):
 
 def source_digest():
     paths = [*Path("nanochat").glob("*.py"), *Path("scripts").glob("*.py"),
-             Path("runs/runspark_d24.sh"), Path("pyproject.toml"), Path("uv.lock")]
+             Path("runs/runspark_d24.sh"), Path("runs/_common.sh"), Path("pyproject.toml"), Path("uv.lock")]
     fingerprint = hashlib.sha256()
     for path in sorted(paths):
         fingerprint.update(str(path).encode())
@@ -56,6 +57,7 @@ class CommandFailure(RuntimeError):
 class Pipeline:
     def __init__(self, root, resume_step=None):
         self.root = root
+        self.datasets_dir = get_datasets_dir()
         self.resume_step = resume_step
         self.log_dir = root / "logs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         self.log_dir.mkdir(parents=True)
@@ -115,15 +117,13 @@ class Pipeline:
         from nanochat.dataset import MAX_SHARD, index_to_filename
         result = {}
         expected = [index_to_filename(i) for i in [*range(170), MAX_SHARD]]
-        directory = self.root / "base_data_climbmix"
-        if sorted(p.name for p in directory.glob("*.parquet")) != expected:
-            raise RuntimeError("Training directory must contain exactly shards 0..169 and the designated validation shard")
+        directory = self.datasets_dir / "base_data_climbmix"
         for name in expected:
             path = directory / name
             parquet = pq.ParquetFile(path)
             if not parquet.metadata.num_rows or "text" not in parquet.schema.names:
                 raise ValueError(f"Empty or invalid training shard: {path}")
-            result[str(path.relative_to(self.root))] = {"bytes": path.stat().st_size, "sha256": digest(path)}
+            result[str(Path("datasets") / path.relative_to(self.datasets_dir))] = {"bytes": path.stat().st_size, "sha256": digest(path)}
         for name in ("tokenizer.pkl", "token_bytes.pt"):
             path = self.root / "tokenizer" / name
             result[str(path.relative_to(self.root))] = {"bytes": path.stat().st_size, "sha256": digest(path)}
@@ -135,21 +135,16 @@ class Pipeline:
             raise RuntimeError("Tokenizer or data inventory changed; refusing to continue training")
 
     def prepare(self):
-        from nanochat.dataset import MAX_SHARD, index_to_filename
-        old = Path.home() / ".cache/nanochat/spark"
         if (self.root / "data-inventory.json").exists():
             self.verify_inventory()
             return
-        for directory in ("tokenizer", "task_data", "eval_bundle"):
-            if (old / directory).exists() and not (self.root / directory).exists():
-                shutil.copytree(old / directory, self.root / directory)
-        data = self.root / "base_data_climbmix"
-        data.mkdir(exist_ok=True)
-        for i in [*range(170), MAX_SHARD]:
-            name = index_to_filename(i)
-            if (old / "base_data_climbmix" / name).exists() and not (data / name).exists():
-                shutil.copyfile(old / "base_data_climbmix" / name, data / name)
         self.run("nanochat.dataset", ["-n", "170"])
+        tokenizer_dir = self.root / "tokenizer"
+        tokenizer_files = tuple(tokenizer_dir / name for name in ("tokenizer.pkl", "token_bytes.pt"))
+        if not any(path.exists() for path in tokenizer_files):
+            self.run("scripts.tok_train", ["--max-chars=2000000000", "--vocab-size=32768"])
+        elif not all(path.is_file() for path in tokenizer_files):
+            raise ValueError("The run tokenizer is incomplete; preserve it and use a fresh run directory")
         from nanochat.tokenizer import get_tokenizer
         if get_tokenizer().get_vocab_size() != 32768:
             raise ValueError("d24 requires the validated 32768-token tokenizer")
@@ -168,7 +163,7 @@ class Pipeline:
         for subset in ("ARC-Easy", "ARC-Challenge"):
             ARC(subset=subset, split="test")
         HumanEval()
-        if not (self.root / "eval_bundle").exists():
+        if not (self.datasets_dir / "eval_bundle").exists():
             download_file_with_lock(EVAL_BUNDLE_URL, "eval_bundle.zip", postprocess_fn=place_eval_bundle)
         write_json(self.root / "data-inventory.json", self.inventory())
 
@@ -321,7 +316,10 @@ def main():
     args = parser.parse_args()
     if args.resume_from_step is not None and args.stage != "pretrain":
         parser.error("--resume-from-step is only valid for the pretrain stage")
-    root = Path(os.environ["NANOCHAT_BASE_DIR"]).expanduser().resolve()
+    os.environ.setdefault("NANOCHAT_RUN_NAME", "spark-d24")
+    os.environ["NANOCHAT_TRAIN_SHARDS"] = "170"
+    root = get_run_dir()
+    configure_runtime_paths(root)
     root.mkdir(parents=True, exist_ok=True)
     with FileLock(root / "pipeline.lock", timeout=0):
         pipeline = Pipeline(root, args.resume_from_step)

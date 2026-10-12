@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run from the repository root. See dev/SPARK_D24.md.
 set -euo pipefail
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat/spark-d24}"
+source "$(dirname -- "${BASH_SOURCE[0]}")/_common.sh" spark-d24 170
 export NANOCHAT_CUDA_MEMORY_LIMIT_GB=80
 export NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=16
 export NANOCHAT_CHECKPOINT_RESERVE_GB=100

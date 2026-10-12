@@ -405,6 +405,37 @@ The maximum loss difference from that control was 0.00000644.
 The comparison, input hashes, exact-state validation, source fingerprints, and commands are under `~/.cache/nanochat/spark-rlm/checkpoint-comparison-pinned-20261009T141227Z`.
 The production run remained paused at checkpoint 300 throughout all twelve independent comparison updates; its source-bound resume receipt and `pause.json` were refreshed for the validated pinned-staging implementation without altering the founding run record or checkpoint.
 
+A separate minimal reproducer isolates the blocking storage-copy GIL behavior using a one-byte copy after deliberately queued GPU work, without changing PyTorch's CPU thread count.
+Ten fresh-process runs, including five with reversed case order, consistently recorded one heartbeat during blocking `Storage.copy_` versus 18–19 during blocking `Tensor.copy_`, with both calls taking approximately 20 ms.
+The storage heartbeat can occur at the return boundary; a separate validation checked both copied bytes outside the timed interval.
+This isolates interpreter blocking during a GPU wait rather than measuring copy bandwidth.
+The compact script, captured output, additional cases, and an unpublished issue draft are under `~/.cache/nanochat/spark-rlm/storage-copy-gil-issue-20261009`.
+
+The same directory preserves the original 77-line application comparison under `training-benchmark-source/repro_training_checkpoint.py`, with real CUDA forward/backward, AdamW state, and background `torch.save` to a temporary file.
+It uses four 4096-wide linear layers with GELU, FP32 parameters, BF16 computation, and 16 gradient-accumulation passes over one fixed batch; the resulting checkpoint contains approximately 805.31 MB of actual model and optimizer state.
+The writer uses a separate stream while the next backward pass runs, then the training thread waits for saving before applying the next optimizer update, matching the production snapshot boundary.
+It contains no artificial GPU delay, heartbeat thread, or unrelated checkpoint payload.
+Three fresh processes per mode ran in rotating order; the following medians use five warm updates per process, excluding each invocation's first save.
+
+| Application example | Forward/backward interval | Save barrier before optimizer | Complete update and save |
+| --- | ---: | ---: | ---: |
+| No checkpoint | 0.1689 s | 0.0000 s | 0.1778 s |
+| Background `torch.save` of CUDA state | 0.7404 s | 1.6120 s | 2.3735 s |
+| Background pinned staging, then `torch.save` | 0.2087 s | 0.2352 s | 0.4525 s |
+
+The forward/backward interval starts before writer submission and includes gradient clearing and synchronization of the training stream only, so the explicit save barrier remains separately measured.
+Separate reload checks verified all 16 saved tensors and all optimizer metadata exactly for both saving modes, before the next optimizer mutation; those checks are excluded from the benchmark.
+This example demonstrates interference in a real training loop, while the one-byte reproducer and earlier Nsight trace identify the GIL mechanism.
+Pinned staging also changes allocation and transfer behavior, so its full speedup cannot be attributed solely to the GIL.
+The example spends more time checkpointing than computing, uses buffered file writes without `fsync`, and does not predict production throughput; temporary checkpoints are removed on exit.
+The exact script fingerprint, raw output, medians, and correctness results are in `results-training-runs.json`, `results-training-summary.json`, and `results-training-validation.json` in the containing artifact directory.
+
+The current `repro_training_checkpoint.py` is a smaller 45-line demonstration with one default 4096-wide linear layer and AdamW, comparing training alone with background saving.
+It removes the seed, command-line modes, pinned-staging implementation, mixed precision, fused optimizer selection, and secondary timing metrics; one initial training update still creates the optimizer state, and the dedicated copy stream and pre-optimizer writer barrier preserve the original concurrency contract.
+Five fresh processes each ran two alternating pairs without fixing random values; the second-pair medians were 0.066 seconds without saving and 0.558 seconds during saving.
+Separate reload checks verified all eight saved tensors and all optimizer metadata for both checkpoints in the validation run.
+The new measurements and source fingerprint are in `results-training-minimal.json`, with representative output in `results-training-minimal.txt`; the older three-mode benchmark above remains separate historical evidence.
+
 ## Evaluation and generation
 
 Use the dedicated RLM entry points so checkpoint loading preserves the recurrent contract.

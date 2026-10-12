@@ -94,6 +94,7 @@ Changing directory defaults does not change precision, model parameters, batch s
 Existing runs and downloaded files remain at their original paths.
 To reuse an existing cache with current code, set both `NANOCHAT_BASE_DIR` to its tokenizer/run root and `NANOCHAT_DATASETS_DIR` to the directory containing its datasets.
 For example, a run previously using `~/.cache/nanochat/spark-d24` for both requires both variables to point there.
-Keep its explicit output and checkpoint paths, shard selection, and other recorded arguments; RLM source and resume-contract checks still apply.
+Keep its explicit output and checkpoint paths, shard selection, and other recorded arguments when continuing the same experiment.
+RLM resume restores checkpoint state without requiring source or configuration fingerprints to match.
 Do not move existing files while training is active.
 These defaults apply to future launches, and no automatic migration or copying from an old cache directory is performed.

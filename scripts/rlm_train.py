@@ -2,7 +2,7 @@
 
 NANOCHAT_RUN_NAME selects training_run/<name>; NANOCHAT_BASE_DIR overrides that
 artifact root, including its tokenizer. Shared data uses NANOCHAT_DATASETS_DIR.
-Training output defaults to <run>/train. See dev/SPARK_RLM.md for contracts.
+Training output defaults to <run>/train. See dev/spark-training/SPARK_RLM.md for contracts.
 """
 
 import argparse

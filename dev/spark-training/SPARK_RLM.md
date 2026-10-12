@@ -1,6 +1,6 @@
 # Recurrent latent memory on DGX Spark
 
-This workflow implements the first version of the [RLM plan](SPARK_RLM_PLAN.md).
+This workflow implements the first version of the [RLM plan](../RLM-architecture/SPARK_RLM_PLAN.md).
 It trains models with differentiable memory between bounded text chunks and provides separate evaluation and sampling entry points.
 Initialization defaults to fresh weights; an optional verified transfer initializes only the main input token embedding from an existing checkpoint.
 The existing d24 production artifacts remain under `~/.cache/nanochat/spark-d24`.

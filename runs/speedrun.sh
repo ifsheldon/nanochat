@@ -6,14 +6,12 @@
 # 1) Example launch (simplest):
 # bash runs/speedrun.sh
 # 2) Example launch in a screen session (because the run takes ~1.5 hours):
-# screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
+# screen -S speedrun bash runs/speedrun.sh
 # 3) Example launch with wandb logging, but see below for setting up wandb first:
-# WANDB_RUN=speedrun screen -L -Logfile runs/speedrun.log -S speedrun bash runs/speedrun.sh
+# WANDB_RUN=speedrun screen -S speedrun bash runs/speedrun.sh
 
-# Default intermediate artifacts directory is in ~/.cache/nanochat
-export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
+# The run gets its own artifacts and console log; datasets are shared.
+source "$(dirname -- "${BASH_SOURCE[0]}")/_common.sh" speedrun 170 || exit $?
 
 # -----------------------------------------------------------------------------
 # Python venv setup with uv
@@ -54,9 +52,9 @@ python -m nanochat.dataset -n 8
 python -m nanochat.dataset -n 170 &
 DATASET_DOWNLOAD_PID=$!
 # train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
-python -m scripts.tok_train
+NANOCHAT_TRAIN_SHARDS=8 python -m scripts.tok_train
 # evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+NANOCHAT_TRAIN_SHARDS=8 python -m scripts.tok_eval
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)

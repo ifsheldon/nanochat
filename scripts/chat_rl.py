@@ -19,6 +19,10 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import argparse
 import os
 import itertools
+from nanochat.paths import configure_runtime_paths
+
+configure_runtime_paths()
+
 import wandb
 import torch
 import torch.distributed as dist
@@ -68,7 +72,7 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config, dir=os.environ["WANDB_DIR"])
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)

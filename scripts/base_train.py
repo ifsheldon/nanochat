@@ -21,6 +21,10 @@ import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
 
+from nanochat.paths import configure_runtime_paths
+
+configure_runtime_paths()
+
 import wandb
 import torch
 import torch.distributed as dist
@@ -97,7 +101,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config, dir=os.environ["WANDB_DIR"])
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3

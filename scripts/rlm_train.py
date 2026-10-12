@@ -28,7 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=get_run_dir() / "train",
                         help="new training/probe directory (default: selected run's train directory)")
-    parser.add_argument("--mode", choices=("probe", "train"), default="probe")
+    parser.add_argument("--mode", choices=("probe", "capacity-probe", "train"), default="probe")
     parser.add_argument("--device-type", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--depth", type=int, default=24)
     parser.add_argument("--width", type=int, default=None, help="default: depth * 64, rounded to head dimension")
@@ -78,6 +78,11 @@ def parse_args():
                                   or args.stop_after_step is not None or args.save_every
                                   or args.keep_checkpoints is not None):
         parser.error("probe requires at least two updates, with no resume, early stop, checkpoint saving, or retention")
+    if args.mode == "capacity-probe":
+        if resuming or args.stop_after_step is not None or args.save_every or args.keep_checkpoints is not None:
+            parser.error("capacity-probe executes one fresh update without resume, early stop, or checkpoint saving")
+        if args.input_embedding_freeze is InputEmbeddingFreeze.SCHEDULED:
+            parser.error("capacity-probe requires input-embedding-freeze none or permanent")
     if args.save_every < 0:
         parser.error("--save-every cannot be negative")
     if args.keep_checkpoints is not None and args.keep_checkpoints <= 0:
@@ -370,6 +375,18 @@ def run(args, attempt):
         split="train", device=device.type,
         resume_state_dict=None if metadata is None else metadata["dataloader_state_dict"],
     )
+    if args.mode == "capacity-probe":
+        from nanochat.rlm_capacity import capacity_probe
+
+        report = capacity_probe(
+            model, forward_cycle, optimizer, loader, config, decay,
+            tokenizer.get_bos_token_id(), attempt,
+        )
+        write_json(attempt / "result.json", report)
+        write_json(args.output_dir / "result.json", report)
+        (attempt / "updates.jsonl").write_text(json.dumps(report["updates"][0], allow_nan=False) + "\n")
+        logger.info("%s", json.dumps(report))
+        return
     setup_metrics = cuda_metrics(device)
     updates = []
     writer = None if args.mode == "probe" else CheckpointWriter(
@@ -498,10 +515,12 @@ def main():
             run(args, attempt)
         except BaseException as exc:
             import torch
+            from nanochat.rlm_capacity import is_cuda_out_of_memory
             from nanochat.rlm_training import cuda_metrics
             device = torch.device(args.device_type)
             status = {
                 "status": "failed", "error_type": type(exc).__name__, "error": str(exc),
+                "failure_kind": "cuda_out_of_memory" if is_cuda_out_of_memory(exc) else "error",
                 "memory": cuda_metrics(device) if device.type == "cpu" or torch.cuda.is_initialized() else {},
             }
             write_json(attempt / "failure.json", status)

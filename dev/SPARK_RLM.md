@@ -66,6 +66,9 @@ uv run --no-sync python -m scripts.rlm_train \
 ```
 
 The probe completes two full optimizer updates without evaluation or checkpoint saving.
+The separate `--mode capacity-probe` executes exactly one complete optimizer update with optimizer state allocated before its first forward and, on CUDA, reusable pinned checkpoint buffers already resident.
+It accepts only explicit `none` or `permanent` input-embedding policies, discards its updated weights, and writes a structured result.
+This measures capacity with the required persistent allocations; it does not measure warmed throughput or checkpoint disk-writing time.
 It starts without activation checkpointing and compiles the cycle forward with separate first-cycle and recurrent shapes.
 Optimizer kernels also compile, even with `--no-compile` for the model.
 The first update includes compilation and lazy optimizer-state creation; the second includes resident optimizer state throughout forward/backward.

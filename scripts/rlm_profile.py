@@ -7,17 +7,23 @@ These artifacts measure operator costs, not full-update throughput or learning.
 
 import argparse
 from dataclasses import asdict
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import sys
 import time
 
+from nanochat.paths import configure_runtime_paths, get_run_dir
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-config", type=Path, required=True, help="run.json from the training/probe configuration to profile")
-    parser.add_argument("--output-dir", type=Path, required=True, help="new directory for Chrome trace, operator tables, and measurements")
+    parser.add_argument("--run-config", type=Path, default=get_run_dir() / "train" / "run.json",
+                        help="recorded training/probe configuration (default: selected run's train/run.json)")
+    parser.add_argument("--output-dir", type=Path,
+                        default=get_run_dir() / "profiles" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ"),
+                        help="new artifact directory (default: selected run's profiles/<UTC timestamp>)")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--warmup-episodes", type=int, default=3, help="at least two; the first initializes optimizer state")
     parser.add_argument("--record-shapes", action=argparse.BooleanOptionalAction, default=True)
@@ -282,6 +288,7 @@ def run(args):
 
 def main():
     args = parse_args()
+    configure_runtime_paths()
     args.run_config = args.run_config.expanduser().absolute()
     args.output_dir = args.output_dir.expanduser().absolute()
     args.output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)

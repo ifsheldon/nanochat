@@ -1,7 +1,8 @@
 """Train or measure recurrent latent memory with explicit text-token budgets.
 
-Use NANOCHAT_BASE_DIR for the existing tokenizer/data cache and --output-dir
-for a new, independent run. See dev/SPARK_RLM.md for commands and contracts.
+NANOCHAT_RUN_NAME selects training_run/<name>; NANOCHAT_BASE_DIR overrides that
+artifact root, including its tokenizer. Shared data uses NANOCHAT_DATASETS_DIR.
+Training output defaults to <run>/train. See dev/SPARK_RLM.md for contracts.
 """
 
 import argparse
@@ -17,13 +18,15 @@ import subprocess
 import sys
 import time
 
+from nanochat.paths import configure_runtime_paths, get_run_dir
 
 logger = logging.getLogger(__name__)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=get_run_dir() / "train",
+                        help="new training/probe directory (default: selected run's train directory)")
     parser.add_argument("--mode", choices=("probe", "train"), default="probe")
     parser.add_argument("--device-type", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--depth", type=int, default=24)
@@ -447,6 +450,7 @@ def run(args, attempt):
 
 def main():
     args = parse_args()
+    configure_runtime_paths()
     os.environ["NANOCHAT_ATTENTION_IMPL"] = "sdpa"
     os.environ.setdefault("NANOCHAT_DTYPE", "bfloat16" if args.device_type == "cuda" else "float32")
     os.environ.setdefault("NANOCHAT_CUDA_MEMORY_LIMIT_GB", "80")

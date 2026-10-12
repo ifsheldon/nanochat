@@ -4,6 +4,14 @@ This workflow implements the first version of the [RLM plan](SPARK_RLM_PLAN.md).
 It trains models with differentiable memory between bounded text chunks and provides separate evaluation and sampling entry points.
 Initialization defaults to fresh weights; an optional verified transfer initializes only the main input token embedding from an existing checkpoint.
 The existing d24 production artifacts remain under `~/.cache/nanochat/spark-d24`.
+New runs use the repository's `training_run/<name>/`, selected with `NANOCHAT_RUN_NAME`; the default name is `pretrain-1`.
+The tokenizer lives in `<run>/tokenizer`, training and probe outputs default to `<run>/train`, and profiles default to `<run>/profiles/<UTC timestamp>`.
+`NANOCHAT_BASE_DIR` overrides the run root; `--output-dir` overrides only the particular command's output directory and does not relocate its tokenizer.
+Shared pretraining, task, and evaluation datasets default to the repository's `datasets/`, independently overridden by `NANOCHAT_DATASETS_DIR`.
+Set `NANOCHAT_TRAIN_SHARDS=170` for the Spark RLM recipe to select training shards 0–169 and validation shard 6542 even when the shared directory contains more shards.
+The dated measurements and historical commands below retain their original paths; existing files are not moved or copied automatically.
+To evaluate, profile, or explicitly resume an existing cached run with current code, set both `NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24"` and `NANOCHAT_DATASETS_DIR="$HOME/.cache/nanochat/spark-d24"`, retain `NANOCHAT_TRAIN_SHARDS=170`, and pass the run's original `--checkpoint-dir`, `--run-config`, or `--output-dir` as appropriate.
+The old run root alone no longer selects its dataset, and changing the defaults does not modify an already running process.
 
 ## Model and data contract
 
@@ -44,15 +52,15 @@ Unroll lengths that do not divide the global text batch require an explicit batc
 
 ## Memory probe
 
-Use the existing tokenizer and training data by setting `NANOCHAT_BASE_DIR` to their cache root.
-Write each new run to a fresh output directory; the trainer refuses to overwrite an existing directory.
+Prepare the shared shards with `uv run --no-sync python -m nanochat.dataset -n 170` and install or train the tokenizer under the selected run's `tokenizer/` directory before starting a probe.
+Pretrained input-table initialization requires the original matching tokenizer; do not retrain that tokenizer.
+Use a fresh run name or explicit output directory for each new attempt; the trainer refuses to overwrite an existing training/probe directory.
 Run from the repository root using the locked uv environment.
 
 ```bash
-NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_RUN_NAME=spark-rlm-probe-b16 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_train \
     --mode probe \
-    --output-dir "$HOME/.cache/nanochat/spark-rlm/probe-b16" \
     --device-batch-size 16
 ```
 
@@ -87,13 +95,12 @@ They do not estimate RLM FLOPs using the ordinary GPT token estimator.
 Profile a recorded run's model and training configuration using real training data and a fresh model:
 
 ```bash
-NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_RUN_NAME=spark-rlm-probe-b16 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_profile \
-    --run-config "$HOME/.cache/nanochat/spark-rlm/probe-b32/run.json" \
-    --output-dir "$HOME/.cache/nanochat/spark-rlm/profile-b32" \
     --no-record-shapes
 ```
 
+The default reference is `<run>/train/run.json`; use `--run-config` or `--output-dir` to select another recorded configuration or a fresh profile destination.
 The profiler warms all configured cycle shapes, backward, and the optimizer before tracing one episode and one optimizer step with CPU and CUDA activity.
 Its first warmup step allocates optimizer state; later warmups and the traced episode run with that state resident.
 Each diagnostic step consumes one episode scaled by the production accumulation factor, so this is operator attribution rather than a training-throughput or learning measurement.
@@ -114,11 +121,10 @@ Training requires an explicit optimizer-update budget.
 For example, after choosing a feasible device batch:
 
 ```bash
-NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_RUN_NAME=spark-rlm-learning-20 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_train \
     --mode train --num-iterations 20 --warmup-steps 2 \
-    --device-batch-size 16 --activation-checkpointing --save-every 10 \
-    --output-dir "$HOME/.cache/nanochat/spark-rlm/learning-20"
+    --device-batch-size 16 --activation-checkpointing --save-every 10
 ```
 
 The short budget and warmup above are experiment choices, not the original production horizon.
@@ -171,7 +177,7 @@ The best-fit loader retains approximate row-group resumption, so resumed trainin
 
 Each invocation writes an `attempts/` subdirectory containing the command, source snapshot including untracked modules, source/data inventories, and update metrics.
 Completed measurements go to `result.json`; failures produce `failure.json` and, for failed updates, `failed-update.json` within the attempt, preserving prior attempt artifacts.
-Training checkpoints are under `checkpoints/` within the run directory.
+Training checkpoints are under `checkpoints/` within the training output directory, which defaults to `<run>/train`.
 Checkpoint saving records writer elapsed time and separate durations for CPU staging, rolling saves, and numbered saves.
 Update timing includes any `checkpoint_wait_seconds` spent at the optimizer barrier, and `execution_wall_seconds` covers all updates plus final checkpoint draining, excluding model loading and other setup.
 The system-memory sampler spans training and checkpointing; async per-update CUDA peaks include overlapping checkpoint activity, and memory values attached to checkpoint results reflect the main thread's observation when it joins the writer.
@@ -442,19 +448,18 @@ Use the dedicated RLM entry points so checkpoint loading preserves the recurrent
 Both verify the tokenizer fingerprint and model vocabulary before loading the exact saved parameters.
 
 ```bash
-NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_RUN_NAME=spark-rlm-learning-20 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_eval \
-    --checkpoint-dir "$HOME/.cache/nanochat/spark-rlm/learning-20/checkpoints" \
     --step 20 --cycles 2 --batch-size 2 --batches 8 \
     --sampler contiguous_documents \
-    --output "$HOME/.cache/nanochat/spark-rlm/learning-20/evaluation.json"
+    --output training_run/spark-rlm-learning-20/evaluation.json
 
-NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_RUN_NAME=spark-rlm-learning-20 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_sample \
-    --checkpoint-dir "$HOME/.cache/nanochat/spark-rlm/learning-20/checkpoints" \
     --step 20 --prompt "The meaning of life is" --max-tokens 128
 ```
 
+Both commands default to `<run>/train/checkpoints`; `--checkpoint-dir` preserves access to an explicitly selected checkpoint directory.
 Evaluation compares identical held-out rows using intact, zeroed, and shuffled incoming memory and reports shifted text loss separately by cycle, excluding the additional `<EOM>` predictions from these text-only metrics.
 The default `--sampler bos_bestfit` uses the existing packed loader.
 Use `--sampler contiguous_documents` for one uninterrupted prefix per sufficiently long validation document, with BOS only at the beginning and one extra token for shifted targets.

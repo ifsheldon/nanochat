@@ -45,6 +45,14 @@ For development (adds pytest, matplotlib, ipykernel, transformers, etc.):
 uv sync --extra gpu --group dev
 ```
 
+### Run artifacts and datasets
+
+Run artifacts default to `training_run/pretrain-1/` inside this project, and downloaded datasets are shared under `datasets/`.
+Set `NANOCHAT_RUN_NAME` to select a run, for example `NANOCHAT_RUN_NAME=pretrain-2 uv run --no-sync python -m scripts.base_train`.
+The shell runners use descriptive run names such as `speedrun`; use the same name for later evaluation or chat, for example `NANOCHAT_RUN_NAME=speedrun python -m scripts.chat_cli`.
+Git tracks both storage directories through empty placeholders and ignores their contents.
+Existing files stay in place; see [project storage](dev/PROJECT_STORAGE.md) for paths, cache defaults, and explicit overrides.
+
 ### Reproduce and talk to GPT-2
 
 The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
@@ -56,7 +64,7 @@ bash runs/speedrun.sh
 You may wish to do so in a screen session as this will take ~1.5 hours to run. Once it's done, you can talk to your model over the CLI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and chat:
 
 ```bash
-python -m scripts.chat_cli
+NANOCHAT_RUN_NAME=speedrun python -m scripts.chat_cli
 ```
 
 Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :). An example conversation with a speedrun model:

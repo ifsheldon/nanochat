@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import time
 
+from nanochat.paths import configure_runtime_paths, get_run_dir
+
 
 class EvaluationSampler(str, Enum):
     BOS_BESTFIT = "bos_bestfit"
@@ -18,7 +20,8 @@ class EvaluationSampler(str, Enum):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint-dir", type=Path, default=get_run_dir() / "train" / "checkpoints",
+                        help="checkpoint directory (default: selected run's train/checkpoints)")
     parser.add_argument("--step", type=int)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--batch-size", type=int, default=2)
@@ -42,6 +45,7 @@ def main():
     os.environ.setdefault("NANOCHAT_DTYPE", "float32" if args.device == "cpu" else "bfloat16")
     os.environ.setdefault("NANOCHAT_CUDA_MEMORY_LIMIT_GB", "80")
     os.environ.setdefault("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB", "16")
+    configure_runtime_paths()
 
     import torch
     from nanochat.common import compute_cleanup, compute_init

@@ -48,6 +48,7 @@ Use a new timestamped log for this command:
 
 ```bash
 NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_DATASETS_DIR="$HOME/.cache/nanochat/spark-d24" \
 NANOCHAT_CUDA_MEMORY_LIMIT_GB=80 NANOCHAT_DTYPE=bfloat16 \
 NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 \
 uv run --no-sync python -m scripts.chat_eval \
@@ -88,8 +89,12 @@ tmux attach -t nanochat-spark
 ```
 
 Detach with Ctrl-b followed by d.
-Each invocation writes a timestamped log under `~/.cache/nanochat/spark/logs`.
-Set `NANOCHAT_BASE_DIR` to use another artifact directory.
+New invocations keep checkpoints, tokenizer files, logs, metrics, and runtime caches under `training_run/spark/` in this project.
+Set `NANOCHAT_RUN_NAME` to choose another name under `training_run/`, or `NANOCHAT_BASE_DIR` to select an explicit artifact directory.
+Raw ClimbMix, task, and CORE evaluation datasets are shared under the project's `datasets/`; `NANOCHAT_DATASETS_DIR` selects an explicit shared data root.
+The runner selects the first eight ClimbMix training shards plus the fixed validation shard, even when other runs have downloaded additional shards.
+Every invocation captures stdout and stderr in a timestamped file under its run's `logs/` directory.
+Existing artifacts under `~/.cache/nanochat` stay in place and are not copied automatically.
 
 ## Stages
 
@@ -132,11 +137,11 @@ To upgrade an existing environment without retraining its tokenizer, run `uv syn
 
 ```bash
 source .venv/bin/activate
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark"
+export NANOCHAT_RUN_NAME=spark
 python -m scripts.chat_cli --device-type=cuda --model-tag=spark-d6-torch214
 ```
 
-The base checkpoint is in `$NANOCHAT_BASE_DIR/base_checkpoints/spark-d6-torch214` and the conversational checkpoint is in `$NANOCHAT_BASE_DIR/chatsft_checkpoints/spark-d6-torch214`.
+The selected run contains `base_checkpoints/spark-d6-torch214` for the base model and `chatsft_checkpoints/spark-d6-torch214` for the conversational model.
 This is a small educational model; the next research scale in the upstream README is depth 12.
 Measure the six-layer run before allocating time to larger experiments.
 

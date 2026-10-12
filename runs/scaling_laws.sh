@@ -14,9 +14,37 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 WANDB_RUN="${WANDB_RUN:-scaling_${LABEL}}"
 EVAL_TOKENS=$((100 * 524288))  # ~100M tokens for final eval (default is ~10M)
 
-export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
-source .venv/bin/activate
+source "$(dirname -- "${BASH_SOURCE[0]}")/_common.sh" scaling-laws || exit $?
+source .venv/bin/activate || exit $?
+
+# Each sweep owns its tokenizer, while the input shards are already shared.
+# Preparation is local: download the selected dataset before starting the sweep.
+python - <<'PY' || exit $?
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+from nanochat.dataset import list_parquet_files
+
+try:
+    shards = list_parquet_files()
+except (FileNotFoundError, ValueError) as exc:
+    raise SystemExit(f"Shared ClimbMix data is unavailable: {exc}. Prepare the shared dataset before running the sweep.") from exc
+if len(shards) < 2 or not all(Path(path).is_file() for path in shards):
+    raise SystemExit("Shared ClimbMix data requires training and validation shards. Prepare the shared dataset before running the sweep.")
+
+tokenizer_dir = Path(os.environ["NANOCHAT_BASE_DIR"]) / "tokenizer"
+tokenizer_files = tuple(tokenizer_dir / name for name in ("tokenizer.pkl", "token_bytes.pt"))
+if tokenizer_dir.is_symlink() or any(path.is_symlink() for path in tokenizer_files):
+    raise SystemExit("The run tokenizer must not contain symlinks.")
+if all(path.is_file() for path in tokenizer_files):
+    print(f"Reusing run tokenizer: {tokenizer_dir}")
+elif tokenizer_dir.exists() and (not tokenizer_dir.is_dir() or any(tokenizer_dir.iterdir())):
+    raise SystemExit("The run tokenizer is incomplete; preserve it and use a fresh run directory.")
+else:
+    subprocess.run([sys.executable, "-m", "scripts.tok_train", "--max-chars=2000000000", "--vocab-size=32768"], check=True)
+PY
 
 RESULTS_DIR="$NANOCHAT_BASE_DIR/scaling_laws_results_${LABEL}"
 mkdir -p "$RESULTS_DIR"

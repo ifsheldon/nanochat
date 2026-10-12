@@ -21,14 +21,15 @@ import csv
 import time
 import json
 import yaml
-import shutil
+from pathlib import Path, PurePosixPath
 import random
+import stat
 import zipfile
 import tempfile
 import argparse
 import torch
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, get_datasets_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
@@ -43,14 +44,33 @@ EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundl
 
 
 def place_eval_bundle(file_path):
-    """Unzip eval_bundle.zip and place it in the base directory."""
-    base_dir = get_base_dir()
-    eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
-    with tempfile.TemporaryDirectory() as tmpdir:
+    """Validate and atomically publish CORE data while holding the download lock."""
+    base_dir = Path(get_datasets_dir())
+    eval_bundle_dir = base_dir / "eval_bundle"
+    if eval_bundle_dir.is_symlink():
+        raise ValueError(f"CORE bundle destination must not be a symlink: {eval_bundle_dir}")
+    if eval_bundle_dir.exists():
+        if not eval_bundle_dir.is_dir():
+            raise ValueError(f"CORE bundle destination must be a directory: {eval_bundle_dir}")
+        return
+    with tempfile.TemporaryDirectory(dir=base_dir) as tmpdir:
         with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            for member in zip_ref.infolist():
+                archive_path = PurePosixPath(member.filename)
+                if (
+                    archive_path.is_absolute()
+                    or ".." in archive_path.parts
+                    or "\\" in member.filename
+                    or not archive_path.parts
+                    or archive_path.parts[0] != "eval_bundle"
+                    or stat.S_ISLNK(member.external_attr >> 16)
+                ):
+                    raise ValueError(f"Unsafe CORE bundle archive entry: {member.filename!r}")
             zip_ref.extractall(tmpdir)
-        extracted_bundle_dir = os.path.join(tmpdir, "eval_bundle")
-        shutil.move(extracted_bundle_dir, eval_bundle_dir)
+        extracted_bundle_dir = Path(tmpdir) / "eval_bundle"
+        if not extracted_bundle_dir.is_dir():
+            raise ValueError("CORE bundle archive must contain an eval_bundle directory")
+        extracted_bundle_dir.rename(eval_bundle_dir)
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
 
@@ -59,7 +79,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     Evaluate a base model on the CORE benchmark.
     Returns dict with results, centered_results, and core_metric.
     """
-    base_dir = get_base_dir()
+    base_dir = get_datasets_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
     # Download the eval bundle if needed
     if not os.path.exists(eval_bundle_dir):

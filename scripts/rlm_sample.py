@@ -5,9 +5,13 @@ import math
 import os
 from pathlib import Path
 
+from nanochat.paths import configure_runtime_paths, get_run_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint-dir", type=Path, default=get_run_dir() / "train" / "checkpoints",
+                        help="checkpoint directory (default: selected run's train/checkpoints)")
     parser.add_argument("--step", type=int)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -26,6 +30,7 @@ def main():
     os.environ.setdefault("NANOCHAT_DTYPE", "float32" if args.device == "cpu" else "bfloat16")
     os.environ.setdefault("NANOCHAT_CUDA_MEMORY_LIMIT_GB", "80")
     os.environ.setdefault("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB", "16")
+    configure_runtime_paths()
 
     from nanochat.common import compute_cleanup, compute_init
     from nanochat.rlm_inference import RLMGenerator, load_rlm_checkpoint

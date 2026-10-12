@@ -4,6 +4,10 @@ Date: October 8, 2026.
 Branch: `spark-rlm`, created from `spark` at `f148fe7`.
 Status: the initial model, training, evaluation, and sampling workflow is implemented; d24 batch 16 passed the two-update probe with activation checkpointing, and a six-update natural-language pilot completed with checkpointing and held-out memory controls.
 See the [RLM workflow and measured results](SPARK_RLM.md) for commands, implementation details, and validation status.
+New runs now default to the repository's `training_run/<NANOCHAT_RUN_NAME>/`, using `pretrain-1` when no name is set, while datasets are shared under `datasets/`.
+RLM training outputs default to `<run>/train`, the tokenizer remains under `<run>/tokenizer`, and profiles use `<run>/profiles/<UTC timestamp>`.
+`NANOCHAT_BASE_DIR` and `NANOCHAT_DATASETS_DIR` independently override those roots; set `NANOCHAT_TRAIN_SHARDS=170` to preserve the Spark recipe's 170 training shards and designated validation shard when sharing a larger cache.
+Existing runs, their recorded paths, and dated evidence remain in place without automatic migration.
 An additional batch-32 probe passed two complete updates with activation checkpointing, peaking at 67.94 GB reserved and taking 196.29 seconds for the second update at the same global text batch.
 Batch 48 was subsequently probed with an approved 100 GB CUDA ceiling and 1,081,344 text targets per update; its second update stopped at the retained 16 GB system-memory guard, so that attempt has no complete steady-update timing.
 A separate batch-48 retry with an approved 12 GB system guard and cached compilation completed both updates at 94.01 GB peak reserved; its 202.24-second second update achieved essentially the same text throughput as batch 32 despite the higher memory use.
@@ -202,7 +206,7 @@ Model and optimizer parameters are shared across cycles.
 
 Probe procedure after implementation:
 
-1. Use a fresh artifact root such as `~/.cache/nanochat/spark-rlm`, fresh d24 weights, the existing tokenizer, and real training batches.
+1. Select a fresh run such as `NANOCHAT_RUN_NAME=spark-rlm-probe-b16`, prepare its tokenizer under `training_run/spark-rlm-probe-b16/tokenizer/`, and use fresh d24 weights with `NANOCHAT_TRAIN_SHARDS=170` and real training batches from the shared `datasets/` directory.
 2. Start with `B=16`, `U=2`, `C=1023`, `K=512`, full SDPA, BF16, and activation checkpointing disabled to establish the footprint.
 3. Keep the 80 GB CUDA allocator limit and 16 GB minimum system-available-memory threshold from the Spark workflow; report decimal GB and account for CPU and external CUDA allocations separately.
 4. Complete at least two optimizer updates, using the full 1,047,552-text-token global batch; compare real-text throughput separately from the 1,048,576 supervised predictions.

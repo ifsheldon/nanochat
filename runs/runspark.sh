@@ -8,13 +8,8 @@ case "$stage" in
     *) echo "Usage: bash runs/runspark.sh [all|prepare|smoke|demo|sft]" >&2; exit 2 ;;
 esac
 
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat/spark}"
-export OMP_NUM_THREADS=1
-export PYTHONUNBUFFERED=1
-mkdir -p "$NANOCHAT_BASE_DIR/logs"
-log_file="$NANOCHAT_BASE_DIR/logs/${stage}-$(date +%Y%m%d-%H%M%S).log"
-exec > >(tee "$log_file") 2>&1
-trap 'echo "Failed at line $LINENO; see $log_file" >&2' ERR
+source "$(dirname -- "${BASH_SOURCE[0]}")/_common.sh" spark 8
+trap 'echo "Failed at line $LINENO; see $NANOCHAT_LOG_FILE" >&2' ERR
 
 if [[ "$stage" == all || "$stage" == prepare ]]; then
     uv sync --extra gpu --group dev --locked
@@ -93,4 +88,4 @@ if [[ "$stage" == all || "$stage" == demo || "$stage" == sft ]]; then
         -p "What is the capital of France?"
 fi
 
-echo "Completed $stage; log: $log_file"
+echo "Completed $stage; log: $NANOCHAT_LOG_FILE"

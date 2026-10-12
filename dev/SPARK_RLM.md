@@ -184,6 +184,26 @@ The system-memory sampler spans training and checkpointing; async per-update CUD
 Writer durations overlap update durations in async mode and must not be added to estimate total runtime.
 Numbered saves add another write on their scheduled updates.
 
+### Export a portable input embedding
+
+The initialization loader accepts both full model checkpoints and compact checkpoints containing only `transformer.wte.weight`.
+Export the original pretrained table and its matching tokenizer before transferring them to another machine:
+
+```bash
+CUDA_VISIBLE_DEVICES='' uv run --no-sync python -m scripts.rlm_export_embedding \
+    --checkpoint-dir /path/to/base_checkpoints/spark-d24-bf16 \
+    --step 5568 \
+    --tokenizer-dir /path/to/tokenizer \
+    --output-dir /path/to/embedding-seed
+```
+
+The output directory must be new and its parent must already exist.
+The bundle contains `model_005568.pt`, `meta_005568.json`, `tokenizer.pkl`, `token_bytes.pt`, and `manifest.json`; the model file contains a cloned input table, and the manifest records payload checksums and original checkpoint provenance.
+Copy the complete directory to the target machine and install its matching tokenizer assets in the selected run's tokenizer directory.
+The existing `--init-embedding-checkpoint-dir`, `--init-embedding-step`, and `--init-embedding-tokenizer` options accept the compact checkpoint through the same loader as a full checkpoint.
+Only the input table is copied into a fresh RLM; the remaining model weights and optimizer start fresh.
+Resume uses the saved RLM checkpoint and omits initialization flags.
+
 ### New run with scheduled input-embedding freezing
 
 Use `--freeze-input-embedding` together with the three `--init-embedding-*` options for a fresh run.

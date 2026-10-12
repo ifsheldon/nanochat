@@ -1,7 +1,7 @@
 """Prepare, capacity-test, and launch the fixed single-H100 RLM recipe.
 
 Use runs/runh100_rlm.sh to install the locked environment first.
-See dev/H100_RLM.md for the asset bundle, resource requirements, and recovery.
+See dev/h100-training/H100_RLM.md for the asset bundle, resource requirements, and recovery.
 """
 
 import argparse

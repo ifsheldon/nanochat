@@ -1,9 +1,9 @@
 # Recurrent latent memory on DGX Spark
 
-This workflow implements the first version of the [RLM plan](SPARK_RLM_PLAN.md).
+This workflow implements the first version of the [RLM plan](../RLM-architecture/SPARK_RLM_PLAN.md).
 It trains models with differentiable memory between bounded text chunks and provides separate evaluation and sampling entry points.
 Initialization defaults to fresh weights; an optional verified transfer initializes only the main input token embedding from an existing checkpoint.
-The same loader accepts a full checkpoint or a checkpoint containing only `transformer.wte.weight`; [H100 RLM handoff](H100_RLM.md) documents the compact checkpoint converter and verified asset bundle.
+The same loader accepts a full checkpoint or a checkpoint containing only `transformer.wte.weight`; [H100 RLM handoff](../h100-training/H100_RLM.md) documents pretraining with the supplied asset bundle.
 The existing d24 production artifacts remain under `~/.cache/nanochat/spark-d24`.
 New runs use the repository's `training_run/<name>/`, selected with `NANOCHAT_RUN_NAME`; the default name is `pretrain-1`.
 The tokenizer lives in `<run>/tokenizer`, training and probe outputs default to `<run>/train`, and profiles default to `<run>/profiles/<UTC timestamp>`.

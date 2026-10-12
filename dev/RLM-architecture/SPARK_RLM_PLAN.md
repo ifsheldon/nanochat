@@ -3,7 +3,7 @@
 Date: October 8, 2026.
 Branch: `spark-rlm`, created from `spark` at `f148fe7`.
 Status: the initial model, training, evaluation, and sampling workflow is implemented; d24 batch 16 passed the two-update probe with activation checkpointing, and a six-update natural-language pilot completed with checkpointing and held-out memory controls.
-See the [RLM workflow and measured results](SPARK_RLM.md) for commands, implementation details, and validation status.
+See the [RLM workflow and measured results](../spark-training/SPARK_RLM.md) for commands, implementation details, and validation status.
 New runs now default to the repository's `training_run/<NANOCHAT_RUN_NAME>/`, using `pretrain-1` when no name is set, while datasets are shared under `datasets/`.
 RLM training outputs default to `<run>/train`, the tokenizer remains under `<run>/tokenizer`, and profiles use `<run>/profiles/<UTC timestamp>`.
 `NANOCHAT_BASE_DIR` and `NANOCHAT_DATASETS_DIR` independently override those roots; set `NANOCHAT_TRAIN_SHARDS=170` to preserve the Spark recipe's 170 training shards and designated validation shard when sharing a larger cache.
@@ -62,7 +62,7 @@ The forward episode length and gradient unroll length must match initially: all 
 | Memory type objective | Defer `<M>` / `<S>` classification; initial auxiliary weight is zero |
 | Input embedding policy | October 10 run freezes only the pretrained main input table for the first 90% of the full update budget, then trains it for the final 10%; value embeddings, LM head, `<EOM>`, summary, and Transformer stay trainable |
 
-These choices build on the [d24 configuration](SPARK_D24.md) and the [RLM proposal](../../recurrent-latent-memory/README.md).
+These choices build on the [d24 configuration](../spark-training/SPARK_D24.md) and the [RLM proposal](../../../recurrent-latent-memory/README.md).
 The RLM proposal is in a neighboring repository; the relative link assumes both repositories share a parent directory.
 The sections below distinguish initial implementation choices from later experiments.
 
@@ -104,7 +104,7 @@ Current training omits it explicitly through `write_memory=False`, reducing two-
 
 ## Model integration contract
 
-The existing [model forward path](../nanochat/gpt.py) accepts token IDs, so continuous memory needs an explicit embedding-level path.
+The existing [model forward path](../../nanochat/gpt.py) accepts token IDs, so continuous memory needs an explicit embedding-level path.
 Use the following initial contract:
 
 - Represent the shared summary input as one model-owned embedding parameter, repeated across all summary slots and cycles; no tokenizer vocabulary change is needed for this internal query.
@@ -129,7 +129,7 @@ Track slot similarity or effective rank during learning, and prioritize whether 
 
 ## Data, document boundaries, and targets
 
-Use the existing [BOS best-fit data loader](../nanochat/dataloader.py) with an episode length of `U * C`.
+Use the existing [BOS best-fit data loader](../../nanochat/dataloader.py) with an episode length of `U * C`.
 For two cycles, request one 2046-token input row and split it into two 1023-token chunks.
 For three cycles, request 3069 tokens and split into three chunks; the Transformer still processes at most 2048 positions per cycle.
 The loader already reads one extra token to construct shifted targets.

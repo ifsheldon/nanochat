@@ -84,7 +84,7 @@ The packed-loader analysis below measures the retained targets occurring after a
 
 ## Packed-loader configuration and scope
 
-The boundary analysis ran the actual [BOS best-fit loader](../nanochat/dataloader.py) on CPU, using the existing tokenizer and cached training corpus under `~/.cache/nanochat/spark-d24`.
+The boundary analysis ran the actual [BOS best-fit loader](../../nanochat/dataloader.py) on CPU, using the existing tokenizer and cached training corpus under `~/.cache/nanochat/spark-d24`.
 It did not train a model or modify the training data.
 
 | Setting | Value |
@@ -219,4 +219,4 @@ The packed-loader measurements cover only text retained by the current loader.
 When a document is cropped to finish a row, its remaining tail is discarded rather than continued into another episode.
 The boundary analysis does not count hypothetical predictions on those discarded tails or infer useful retention from boundary placement alone.
 
-For the model and training workflow, see [Recurrent latent memory on DGX Spark](SPARK_RLM.md).
+For the model and training workflow, see [Recurrent latent memory on DGX Spark](../spark-training/SPARK_RLM.md).

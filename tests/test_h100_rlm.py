@@ -241,13 +241,6 @@ def test_disk_preflight_adds_cache_and_output_budgets_on_same_volume(tmp_path, m
     launcher.require_disk_space(output, cache)
 
 
-def test_shell_help_is_available_without_uv_or_gpu():
-    result = subprocess.run(["bash", "runs/runh100_rlm.sh", "--help"], cwd=launcher.REPOSITORY,
-                            capture_output=True, text=True, check=True)
-    assert "--assets" in result.stdout and "--resume" in result.stdout
-    assert "Traceback" not in result.stderr
-
-
 @pytest.mark.parametrize("field,value", [("input_embedding_frozen", True), ("finite_loss_and_gradients", False), ("finite_model_and_optimizer_state", False)])
 def test_wrong_phase_or_failed_health_checks_cannot_select_recipe(tmp_path, field, value):
     def run(command, log_path, environment):

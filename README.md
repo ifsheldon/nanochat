@@ -122,6 +122,7 @@ The important thing to note is that nanochat is written and configured around on
 For a single-GPU DGX Spark version of the small demo, including a smoke test, see [DGX Spark small experiments](dev/SPARK.md).
 For the complete d24 pipeline with an 80 GB CUDA allocator limit, checkpoint recovery, and full evaluations, see [DGX Spark d24 training](dev/SPARK_D24.md).
 For recurrent latent memory pretraining, memory probes, and memory-aware evaluation and sampling, see [DGX Spark RLM](dev/SPARK_RLM.md).
+For a fresh run on one H100 80 GB, with a compact embedding checkpoint and ordered capacity probes, see [H100 RLM handoff](dev/H100_RLM.md).
 
 SFT packs complete conversations when possible and truncates the shortest oversized conversation only when none fits an empty row.
 Examples without assistant targets inside the context window are excluded and counted toward dataset progress; a dataset cycle with no usable targets on a rank raises an error.

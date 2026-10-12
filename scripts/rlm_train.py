@@ -53,6 +53,7 @@ def parse_args():
     parser.add_argument("--init-embedding-checkpoint-dir", type=Path, help="fresh runs only: checkpoint directory providing transformer.wte.weight")
     parser.add_argument("--init-embedding-step", type=int, help="published source checkpoint step for input embedding initialization")
     parser.add_argument("--init-embedding-tokenizer", type=Path, help="source tokenizer.pkl; must exactly match the training tokenizer")
+    parser.add_argument("--init-embedding-bundle", type=Path, help="fresh runs only: verified embedding-only export directory")
     parser.add_argument("--input-embedding-freeze", type=InputEmbeddingFreeze,
                         choices=list(InputEmbeddingFreeze), default=InputEmbeddingFreeze.NONE,
                         help="none, scheduled (first 90%%), or permanent; EOM and summary inputs stay trainable")
@@ -93,14 +94,18 @@ def parse_args():
         args.init_embedding_checkpoint_dir, args.init_embedding_step, args.init_embedding_tokenizer,
     )
     if any(value is not None for value in initialization_args):
+        if args.init_embedding_bundle is not None:
+            parser.error("choose an embedding bundle or source checkpoint, not both")
         if not all(value is not None for value in initialization_args):
             parser.error("embedding initialization requires checkpoint directory, step, and source tokenizer together")
         if args.init_embedding_step < 0:
             parser.error("--init-embedding-step must be nonnegative")
         if resuming:
             parser.error("embedding initialization is fresh-run only; resume restores its saved initialization provenance and trained weights")
+    if args.init_embedding_bundle is not None and resuming:
+        parser.error("embedding initialization is fresh-run only; resume restores its saved weights")
     if (args.input_embedding_freeze is not InputEmbeddingFreeze.NONE and not resuming
-            and args.init_embedding_checkpoint_dir is None):
+            and args.init_embedding_checkpoint_dir is None and args.init_embedding_bundle is None):
         parser.error("--input-embedding-freeze requires pretrained embedding initialization for a fresh run")
     if args.resume_from_step is not None and args.resume_from_step <= 0:
         parser.error("--resume-from-step must name a completed positive optimizer update")
@@ -216,6 +221,11 @@ def run(args, attempt):
             "random", "pretrained_input_token_embedding",
         ):
             raise ValueError("The recorded run has invalid initialization provenance")
+    elif args.init_embedding_bundle is not None:
+        from nanochat.rlm_initialization import TokenEmbeddingInitialization
+
+        initializer = TokenEmbeddingInitialization.from_bundle(args.init_embedding_bundle, tokenizer_path)
+        initialization = initializer.contract()
     elif args.init_embedding_checkpoint_dir is not None:
         from nanochat.rlm_initialization import TokenEmbeddingInitialization
 

@@ -1,6 +1,7 @@
 """The H100 freeze policies preserve the 90% boundary before any unfreezing."""
 
 import json
+import shutil
 
 import pytest
 import torch
@@ -46,6 +47,28 @@ def updates(attempt):
     return [json.loads(line) for line in (attempt / "updates.jsonl").read_text().splitlines()]
 
 
+def test_compact_bundle_starts_training_after_source_checkpoint_is_removed(training_environment, tmp_path, monkeypatch):
+    from nanochat.rlm_initialization import TokenEmbeddingInitialization
+
+    source_dir, source_tokenizer, source_embedding = training_environment
+    tokenizer_dir = tmp_path / "cache" / "tokenizer"
+    torch.save(torch.ones(32, dtype=torch.int32), tokenizer_dir / "token_bytes.pt")
+    bundle = TokenEmbeddingInitialization.export_from_checkpoint(
+        source_dir, 7, tokenizer_dir, tmp_path / "seed",
+    )
+    shutil.rmtree(source_dir)
+    source_tokenizer.unlink()
+    output = tmp_path / "compact-training"
+    attempt = run_attempt(arguments(
+        monkeypatch, output, "--init-embedding-bundle", bundle,
+        "--input-embedding-freeze", "permanent", "--stop-after-step", "1",
+    ), "first-update")
+    model, _, metadata = LatestCheckpoint(output / "checkpoints").load(torch.device("cpu"))
+    torch.testing.assert_close(model["transformer.wte.weight"], source_embedding, rtol=0, atol=0)
+    initialization = metadata["run_contract"]["initialization"]
+    assert initialization["bundle"]["path"] == str(bundle / "manifest.json")
+    assert initialization["source_checkpoint"]["name"] == "model_000007.pt"
+    assert updates(attempt)[0]["input_embedding_frozen"] is True
 
 
 def test_permanent_freeze_keeps_source_table_without_adam_state_while_other_weights_train(

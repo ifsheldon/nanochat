@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -18,7 +19,7 @@ import subprocess
 import sys
 
 from nanochat.paths import RunName, configure_runtime_paths, get_datasets_dir, get_run_dir
-from nanochat.rlm_policy import InputEmbeddingFreeze
+from nanochat.rlm_policy import AttentionBackend, InputEmbeddingFreeze
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -92,9 +93,10 @@ def parse_args(argv=None):
     return args
 
 
-def training_arguments(recipe, output_dir, *, assets=None, probe=False, resume=False):
+def training_arguments(recipe, output_dir, *, assets=None, mode="train", resume=False):
+    probe = mode != "train"
     arguments = [
-        "--mode", "capacity-probe" if probe else "train", "--device-type", "cuda",
+        "--mode", mode, "--device-type", "cuda",
         "--depth", "24", "--width", "1536", "--head-dim", "128",
         "--text-length", "1023", "--memory-tokens", "512", "--cycles", "4",
         "--device-batch-size", str(recipe.device_batch_size), "--total-batch-size", "1047552",
@@ -253,7 +255,7 @@ def choose_recipe(output_dir, assets, environment, log_dir, runner=None):
         )
         if probe_dir.exists():
             raise FileExistsError(f"A previous probe already exists at {probe_dir}; preserve this run and choose a new --output-dir.")
-        arguments = training_arguments(recipe, probe_dir, assets=assets, probe=True)
+        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="capacity-probe")
         code = runner([sys.executable, "-m", "scripts.rlm_train", *arguments],
                       log_dir / f"probe-{index:02d}-{recipe.name}.log", environment)
         result_path = probe_dir / "result.json"
@@ -278,6 +280,56 @@ def choose_recipe(output_dir, assets, environment, log_dir, runner=None):
             continue
         raise RuntimeError(f"Probe {recipe.name} failed for a reason other than GPU memory capacity: {result}. Inspect {log_dir} before retrying.")
     raise RuntimeError("WARNING: all three authorized H100 capacity probes failed. Training was not started; no smaller batch or alternate precision was selected.")
+
+
+def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=None):
+    """Compare isolated, compilation-free updates; an unusable FA3 is optional."""
+    runner = run_logged if runner is None else runner
+    measurements = {}
+    for backend in AttentionBackend:
+        probe_dir = checked_path(
+            output_dir / "probes" / f"attention-{backend.value}", directory=True, must_exist=False,
+        )
+        if probe_dir.exists():
+            raise FileExistsError(f"An attention probe already exists at {probe_dir}; choose a new --output-dir.")
+        log_path = log_dir / f"attention-{backend.value}.log"
+        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="attention-probe")
+        probe_environment = dict(environment, NANOCHAT_ATTENTION_IMPL=backend.value)
+        code = None
+        try:
+            code = runner([sys.executable, "-m", "scripts.rlm_train", *arguments], log_path, probe_environment)
+            if code != 0:
+                raise RuntimeError(f"Attention probe exited with status {code}; inspect {log_path}.")
+            result = json.loads(checked_path(probe_dir / "result.json").read_text())
+            measurement = result["attention_probe"]
+            updates = result["updates"]
+            duration = measurement["duration_seconds"]
+            if (result.get("status") != "completed" or result.get("mode") != "attention-probe"
+                    or AttentionBackend(result["attention_impl"]) is not backend
+                    or measurement.get("compilation_excluded") is not True
+                    or measurement.get("optimizer_state_preallocated") is not True
+                    or measurement.get("checkpoint_staging_preallocated") is not True
+                    or measurement.get("input_embedding_frozen") is not (recipe.probe_freeze is InputEmbeddingFreeze.PERMANENT)
+                    or type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0
+                    or len(updates) != 1
+                    or updates[0].get("finite_loss_and_gradients") is not True
+                    or updates[0].get("finite_model_and_optimizer_state") is not True):
+                raise ValueError("Attention probe did not report a healthy compilation-free update for the requested backend and recipe")
+            measurements[backend.value] = {"status": "completed", **measurement}
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            if backend is AttentionBackend.SDPA:
+                raise RuntimeError(f"SDPA attention probe failed: {exc}") from exc
+            measurements[backend.value] = {
+                "status": "failed", "exit_code": code, "error": str(exc), "log": str(log_path),
+            }
+            print(f"FlashAttention probe failed; continuing with SDPA: {exc}", flush=True)
+    selected = AttentionBackend.SDPA
+    flash = measurements[AttentionBackend.FA3.value]
+    if (flash["status"] == "completed"
+            and flash["duration_seconds"] < measurements[selected.value]["duration_seconds"]):
+        selected = AttentionBackend.FA3
+    print(f"Selected attention {selected.value}: {measurements[selected.value]['duration_seconds']:.3f} s per compiled update.", flush=True)
+    return {"selected": selected.value, "measurements": measurements}
 
 
 def load_recipe(output_dir):
@@ -322,6 +374,8 @@ def launch(args):
         configure_runtime_paths(output_dir)
         gpu = check_gpu()
         environment = runtime_environment(output_dir, datasets_dir, gpu)
+        if args.resume:
+            environment["NANOCHAT_ATTENTION_IMPL"] = AttentionBackend(saved["environment"]["NANOCHAT_ATTENTION_IMPL"]).value
         require_disk_space(output_dir, datasets_dir)
         write_json(log_dir / "preflight.json", gpu)
         if not args.resume:
@@ -339,12 +393,15 @@ def launch(args):
                     raise RuntimeError(f"Dataset downloader failed with status {code}; inspect {log_dir}.")
                 dataset = verify_dataset(datasets_dir)
             recipe = choose_recipe(output_dir, assets, environment, log_dir)
+            attention = choose_attention(recipe, output_dir, assets, environment, log_dir)
+            environment["NANOCHAT_ATTENTION_IMPL"] = attention["selected"]
             production_arguments = training_arguments(recipe, output_dir / "train", assets=assets)
             saved = {
                 "schema_version": 2, "recipe": asdict(recipe),
                 "assets_directory": str(assets), "datasets_directory": str(datasets_dir),
                 "assets": assets_record, "dataset": dataset, "gpu": gpu,
                 "production_arguments": production_arguments,
+                "attention_probe": attention,
                 "environment": {key: environment[key] for key in (
                     "NANOCHAT_BASE_DIR", "NANOCHAT_DATASETS_DIR", "NANOCHAT_TRAIN_SHARDS",
                     "NANOCHAT_DTYPE", "NANOCHAT_ATTENTION_IMPL",

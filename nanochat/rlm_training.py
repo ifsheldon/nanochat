@@ -490,7 +490,7 @@ def checkpoint_metadata(model, config, step, loader_state, contract, token_count
         "run_contract": contract,
         "memory_contract": {
             "initial": "empty", "reset": "episode", "summary_input": "shared_learned_vector",
-            "memory_output": "post_backout_final_rmsnorm", "attention": "full_causal_sdpa",
+            "memory_output": "post_backout_final_rmsnorm", "attention": "full_causal",
             "positions": "reset_each_cycle", "loss": "eom_first_token_and_text_next_token",
             "eom_input": "shared_learned_vector_every_cycle",
             "terminal_summary": "omitted_no_consumer",

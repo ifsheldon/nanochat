@@ -1,5 +1,6 @@
 """One-update capacity measurement with optimizer and staging memory resident."""
 
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import time
@@ -25,6 +26,40 @@ def is_cuda_out_of_memory(error: BaseException) -> bool:
     return False
 
 
+@contextmanager
+def resident_probe_state(model, optimizer, config, monitor):
+    """Keep ordinary optimizer state and production checkpoint buffers resident."""
+    device = model.get_device()
+    stager = None
+    staged = None
+    try:
+        monitor.require_available(0)
+        frozen = apply_input_embedding_schedule(model, config, 0)
+        optimizer.initialize_state()
+        if device.type == "cuda":
+            stager = DefaultStager(StagingOptions(
+                use_pinned_memory=True, use_shared_memory=False,
+                use_async_staging=True, use_non_blocking_copy=True,
+            ))
+            synchronize(device)
+            staged = stager.stage({
+                "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+            }).result()
+        monitor.require_available(0)
+        yield {
+            "optimizer_state_preallocated": True,
+            "checkpoint_staging_preallocated": staged is not None,
+            "input_embedding_frozen": frozen,
+            "production_weights_reused": False,
+        }, cuda_metrics(device)
+    finally:
+        if stager is not None:
+            # A failed stage may have queued copies; drain them before
+            # releasing pinned destinations or live optimizer tensors.
+            synchronize(device)
+            stager.close()
+
+
 def capacity_probe(model, forward_cycle, optimizer, loader, config, initial_decay,
                    bos_token_id: int, attempt: Path):
     """Preallocate state without changing weights, then execute one full update.
@@ -37,25 +72,9 @@ def capacity_probe(model, forward_cycle, optimizer, loader, config, initial_deca
         raise ValueError("Capacity probes require an explicit none or permanent embedding freeze policy")
     device = model.get_device()
     minimum = os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB")
-    stager = None
-    staged = None
     started = time.monotonic()
     with MemoryMonitor(minimum) as monitor:
-        try:
-            monitor.require_available(0)
-            frozen = apply_input_embedding_schedule(model, config, 0)
-            optimizer.initialize_state()
-            if device.type == "cuda":
-                stager = DefaultStager(StagingOptions(
-                    use_pinned_memory=True, use_shared_memory=False,
-                    use_async_staging=True, use_non_blocking_copy=True,
-                ))
-                synchronize(device)
-                staged = stager.stage({
-                    "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                }).result()
-            monitor.require_available(0)
-            setup_memory = cuda_metrics(device)
+        with resident_probe_state(model, optimizer, config, monitor) as (state, setup_memory):
             multiplier = apply_schedule(optimizer, config, 0, initial_decay)
             metrics, _ = measured_update(
                 model, forward_cycle, optimizer, loader, config, 0, bos_token_id,
@@ -67,12 +86,7 @@ def capacity_probe(model, forward_cycle, optimizer, loader, config, initial_deca
             report = {
                 "status": "completed", "mode": "capacity-probe",
                 "completed_updates": 1, "attempt_updates": 1,
-                "capacity_probe": {
-                    "optimizer_state_preallocated": True,
-                    "checkpoint_staging_preallocated": staged is not None,
-                    "input_embedding_frozen": frozen,
-                    "production_weights_reused": False,
-                },
+                "capacity_probe": state,
                 "peak_cuda_reserved_gb": max(setup_memory["cuda_peak_reserved_gb"], metrics["cuda_peak_reserved_gb"]),
                 "peak_cuda_allocated_gb": max(setup_memory["cuda_peak_allocated_gb"], metrics["cuda_peak_allocated_gb"]),
                 "minimum_system_available_gb": monitor.minimum_observed / 1e9,
@@ -80,10 +94,4 @@ def capacity_probe(model, forward_cycle, optimizer, loader, config, initial_deca
                 "checkpoint_overhead_measured": False,
                 "setup_memory": setup_memory, "updates": [metrics],
             }
-        finally:
-            if stager is not None:
-                # A failed stage may have queued copies; drain them before
-                # releasing pinned destinations or live optimizer tensors.
-                synchronize(device)
-                stager.close()
     return report

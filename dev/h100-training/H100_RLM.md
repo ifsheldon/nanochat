@@ -2,7 +2,7 @@
 
 Use the supplied files on the `h100-rlm` branch to start a fresh pretraining run.
 The initialization embedding and matching tokenizer are provided in `assets/h100-seed/` and downloaded through Git LFS during setup.
-The launcher installs the Python environment, downloads the dataset, checks capacity, and starts training.
+The launcher installs the Python environment, downloads the dataset, checks capacity, benchmarks attention, and starts training with the faster supported backend.
 
 ## Requirements
 
@@ -55,7 +55,7 @@ Use `bash runs/runh100_rlm.sh --help` for the available options.
 
 ## Automatic capacity selection
 
-The launcher tries the following recipes in order, using one complete optimizer update for each capacity probe:
+The launcher tries the following recipes in order with PyTorch SDPA, using one complete optimizer update for each capacity probe:
 
 | Priority | Probe batch × accumulation | Input embedding during probe | Selected training recipe |
 | --- | --- | --- | --- |
@@ -63,7 +63,8 @@ The launcher tries the following recipes in order, using one complete optimizer 
 | 2 | 32 × 8 | Frozen | Batch 32; input embedding frozen for all 5574 updates |
 | 3 | 16 × 16 | Trainable | Batch 16; frozen for updates 1–5016, trainable for 5017–5574 |
 
-After a successful probe, production starts fresh from the supplied initialization with the selected recipe.
+After a successful capacity probe, the launcher benchmarks attention for the selected recipe as described below.
+Production then starts fresh from the supplied initialization; probe updates are discarded.
 Every recipe uses 5574 optimizer updates and 1,047,552 real-text tokens per update.
 The remaining model and training settings are already configured by the launcher.
 
@@ -71,15 +72,36 @@ Only a CUDA out-of-memory result advances to the next recipe.
 Other failures stop the launcher for diagnosis.
 If all three recipes run out of memory, it prints a warning and exits without starting training.
 
+## Automatic attention selection
+
+For the selected recipe, the launcher compares PyTorch SDPA with FlashAttention 3 loaded through Hugging Face `kernels`.
+Each backend runs in its own subprocess with the same model, data, batch size, accumulation, activation checkpointing, and optimizer settings.
+Scheduled-freeze recipes use trainable input embeddings during the comparison, matching the capacity probe's more demanding phase; the permanently frozen recipe keeps them frozen.
+
+Each subprocess warms up for at most five full optimizer updates until an update completes without compilation, then measures exactly one further update without compilation.
+The measurement includes forward, backward, optimizer work, and training health checks, with CUDA synchronization around the timed update.
+Compilation and checkpoint disk writes are excluded; optimizer state and checkpoint staging buffers are already resident.
+The launcher chooses the faster successful backend, using SDPA for a tie, and records the measurements and selection in `selected-recipe.json`.
+The comparison is one steady update for the selected recipe, not a full-run throughput measurement.
+
+If FlashAttention cannot load or fails during compilation or execution, runs out of memory, or its subprocess crashes, the launcher records the failure and proceeds with SDPA.
+A failed SDPA probe stops the launcher for diagnosis.
+SDPA can itself use PyTorch's built-in flash attention kernels, so this comparison selects between PyTorch's attention implementation and the separate Hugging Face kernel.
+
+To probe a backend separately, run `uv run --no-sync python -m scripts.rlm_train --mode attention-probe` with the same model and training arguments and a fresh output directory, setting `NANOCHAT_ATTENTION_IMPL=sdpa` or `NANOCHAT_ATTENTION_IMPL=fa3` explicitly.
+Use `--input-embedding-freeze none` or `--input-embedding-freeze permanent`; scheduled freezing is not supported by this probe.
+Retain the full training horizon in `--num-iterations` because it controls the learning-rate schedule, not the number of compilation warmup updates.
+
 ## Monitor the run
 
 `OUTPUT` below means the selected run directory, normally `training_run/pretrain-1`.
 
 | File or directory | What to check |
 | --- | --- |
-| `OUTPUT/logs/TIMESTAMP/` | Dataset preparation, capacity probe, and training logs |
-| `OUTPUT/selected-recipe.json` | Selected recipe and exact training arguments |
+| `OUTPUT/logs/TIMESTAMP/` | Dataset preparation, capacity probe, attention probe, and training logs |
+| `OUTPUT/selected-recipe.json` | Selected recipe, attention backend and measurements, and exact training arguments |
 | `OUTPUT/probes/` | Capacity probe results and any failures |
+| `OUTPUT/probes/attention-sdpa/`, `OUTPUT/probes/attention-fa3/` | Attention measurements and failures when a result could be written |
 | `OUTPUT/train/attempts/` | Training measurements and attempt records |
 | `OUTPUT/train/result.json` | Latest completed attempt or failure |
 | `OUTPUT/train/checkpoints/` | Published training checkpoints |
@@ -104,8 +126,8 @@ bash runs/runh100_rlm.sh --resume --run-name pretrain-1
 
 If the original launch used `--output-dir`, use that same option and path when resuming.
 The launcher uses the saved dataset directory by default; pass `--datasets-dir` to select a different location.
-Resume restores the selected recipe, model, optimizer, data-loader position, and random state, then continues the original 5574-update budget.
-It skips dataset downloading, capacity probes, and embedding initialization, so `--assets` is not needed.
+Resume restores the selected recipe and attention backend, model, optimizer, data-loader position, and random state, then continues the original 5574-update budget.
+It skips dataset downloading, capacity and attention probes, and embedding initialization, so `--assets` is not needed.
 
 The saved recipe selects the model and training settings.
 Resume does not require identical source files, a matching saved command line, or matching tokenizer and dataset hashes.

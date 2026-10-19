@@ -28,7 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=get_run_dir() / "train",
                         help="new training/probe directory (default: selected run's train directory)")
-    parser.add_argument("--mode", choices=("probe", "capacity-probe", "train"), default="probe")
+    parser.add_argument("--mode", choices=("probe", "capacity-probe", "attention-probe", "train"), default="probe")
     parser.add_argument("--device-type", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--depth", type=int, default=24)
     parser.add_argument("--width", type=int, default=None, help="default: depth * 64, rounded to head dimension")
@@ -78,11 +78,11 @@ def parse_args():
                                   or args.stop_after_step is not None or args.save_every
                                   or args.keep_checkpoints is not None):
         parser.error("probe requires at least two updates, with no resume, early stop, checkpoint saving, or retention")
-    if args.mode == "capacity-probe":
+    if args.mode in ("capacity-probe", "attention-probe"):
         if resuming or args.stop_after_step is not None or args.save_every or args.keep_checkpoints is not None:
-            parser.error("capacity-probe executes one fresh update without resume, early stop, or checkpoint saving")
+            parser.error(f"{args.mode} requires a fresh run without resume, early stop, checkpoint saving, or retention")
         if args.input_embedding_freeze is InputEmbeddingFreeze.SCHEDULED:
-            parser.error("capacity-probe requires input-embedding-freeze none or permanent")
+            parser.error(f"{args.mode} requires input-embedding-freeze none or permanent")
     if args.save_every < 0:
         parser.error("--save-every cannot be negative")
     if args.keep_checkpoints is not None and args.keep_checkpoints <= 0:
@@ -159,6 +159,7 @@ def run(args, attempt):
     from nanochat.rlm_checkpoints import recover_numbered_checkpoint, save_numbered_checkpoint
     from nanochat.rlm_checkpointing import CheckpointWriter
     from nanochat.common import COMPUTE_DTYPE, compute_init, get_base_dir
+    from nanochat.flash_attention import attention_backend
     from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
     from nanochat.rlm import RecurrentGPT, RLMConfig
     from nanochat.rlm_training import (
@@ -269,7 +270,7 @@ def run(args, attempt):
         } if args.mode == "train" else None,
         "source_sha256": source["sha256"], "tokenizer_sha256": tokenizer_sha256,
         "data_inventory_sha256": inventory["sha256"], "compute_dtype": str(COMPUTE_DTYPE),
-        "device_type": device.type, "attention_impl": "sdpa",
+        "device_type": device.type, "attention_impl": attention_backend().value,
         "runtime": {
             "python": sys.version.split()[0], "torch": torch.__version__,
             "cuda": torch.version.cuda, "triton": triton_version,
@@ -371,10 +372,13 @@ def run(args, attempt):
         split="train", device=device.type,
         resume_state_dict=None if metadata is None else metadata["dataloader_state_dict"],
     )
-    if args.mode == "capacity-probe":
-        from nanochat.rlm_capacity import capacity_probe
+    if args.mode in ("capacity-probe", "attention-probe"):
+        if args.mode == "capacity-probe":
+            from nanochat.rlm_capacity import capacity_probe as probe
+        else:
+            from nanochat.rlm_attention_probe import attention_probe as probe
 
-        report = capacity_probe(
+        report = probe(
             model, forward_cycle, optimizer, loader, config, decay,
             tokenizer.get_bos_token_id(), attempt,
         )
@@ -494,7 +498,7 @@ def run(args, attempt):
 def main():
     args = parse_args()
     configure_runtime_paths()
-    os.environ["NANOCHAT_ATTENTION_IMPL"] = "sdpa"
+    os.environ.setdefault("NANOCHAT_ATTENTION_IMPL", "sdpa")
     os.environ.setdefault("NANOCHAT_DTYPE", "bfloat16" if args.device_type == "cuda" else "float32")
     os.environ.setdefault("NANOCHAT_CUDA_MEMORY_LIMIT_GB", "80")
     os.environ.setdefault("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB", "16")

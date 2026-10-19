@@ -1,8 +1,8 @@
 """
 Unified Flash Attention interface with automatic FA3/SDPA switching.
 
-Exports `flash_attn` module that matches the FA3 API exactly, but falls back
-to PyTorch SDPA on incompatible CUDA GPUs, MPS, and CPU.
+Exports `flash_attn` module that matches the FA3 API exactly. Automatic selection
+falls back to PyTorch SDPA; explicit NANOCHAT_ATTENTION_IMPL=fa3 fails if unavailable.
 
 Usage (drop-in replacement for FA3):
     from nanochat.flash_attention import flash_attn
@@ -17,21 +17,26 @@ import os
 import torch
 import torch.nn.functional as F
 
+from nanochat.rlm_policy import AttentionBackend
+
 
 # =============================================================================
 # Detection: Try to load FA3 on CUDA GPUs
 # =============================================================================
 try:
-    _force_sdpa = {"auto": False, "sdpa": True}[os.environ.get("NANOCHAT_ATTENTION_IMPL", "auto")]
-except KeyError as exc:
-    raise ValueError("NANOCHAT_ATTENTION_IMPL must be 'auto' or 'sdpa'") from exc
+    _requested_impl = os.environ.get("NANOCHAT_ATTENTION_IMPL", "auto")
+    _requested_backend = None if _requested_impl == "auto" else AttentionBackend(_requested_impl)
+except ValueError as exc:
+    raise ValueError("NANOCHAT_ATTENTION_IMPL must be 'auto', 'sdpa', or 'fa3'") from exc
 
 
 def _load_flash_attention_3():
-    """Try to load Flash Attention 3."""
-    if _force_sdpa or not torch.cuda.is_available():
+    """Load FA3, failing explicitly when it was required by the caller."""
+    if _requested_backend is AttentionBackend.SDPA:
         return None
     try:
+        if not torch.cuda.is_available():
+            raise RuntimeError("FlashAttention 3 requires a compatible CUDA GPU")
         major, _ = torch.cuda.get_device_capability()
         # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
         # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
@@ -46,9 +51,11 @@ def _load_flash_attention_3():
             if has_kernel(hf_kernel):
                 return get_kernel(hf_kernel).flash_attn_interface
             else:
-                return None
+                raise RuntimeError(f"No compatible FlashAttention 3 kernel is available from {hf_kernel}")
 
-    except Exception:
+    except Exception as exc:
+        if _requested_backend is AttentionBackend.FA3:
+            raise RuntimeError("Requested FlashAttention 3 backend could not be loaded") from exc
         return None
 
 
@@ -71,10 +78,19 @@ def _resolve_use_fa3():
         from nanochat.common import COMPUTE_DTYPE
         if COMPUTE_DTYPE == torch.bfloat16:
             return True
+        if _requested_backend is AttentionBackend.FA3:
+            raise RuntimeError("Requested FlashAttention 3 backend requires bfloat16 compute")
         return False
+    if _requested_backend is AttentionBackend.FA3:
+        raise RuntimeError("Requested FlashAttention 3 backend is unavailable")
     return False
 
 USE_FA3 = _resolve_use_fa3()
+
+
+def attention_backend() -> AttentionBackend:
+    """Return the backend actually dispatched by the attention interface."""
+    return AttentionBackend.FA3 if USE_FA3 else AttentionBackend.SDPA
 
 
 # =============================================================================

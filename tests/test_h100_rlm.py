@@ -27,6 +27,18 @@ def passed_result(frozen=False):
     }
 
 
+def passed_attention_result(backend, duration, frozen=False):
+    return {
+        "status": "completed", "mode": "attention-probe", "attention_impl": backend,
+        "attention_probe": {
+            "duration_seconds": duration, "warmup_updates": 2, "compilation_excluded": True,
+            "optimizer_state_preallocated": True, "checkpoint_staging_preallocated": True,
+            "input_embedding_frozen": frozen,
+        },
+        "updates": [{"finite_loss_and_gradients": True, "finite_model_and_optimizer_state": True}],
+    }
+
+
 def fake_probe_runner(outcomes, commands):
     def run(command, log_path, environment):
         commands.append(command)
@@ -105,7 +117,8 @@ def test_probe_without_resident_memory_contract_is_not_accepted(tmp_path, missin
 
 
 @pytest.mark.parametrize("destination_kind", ["explicit", "named", "default"])
-def test_launch_and_resume_reuse_recipe_without_probes_download_or_initialization(tmp_path, monkeypatch, destination_kind):
+@pytest.mark.parametrize("flash_crashes", [False, True])
+def test_launch_and_resume_reuse_recipe_without_probes_download_or_initialization(tmp_path, monkeypatch, destination_kind, flash_crashes):
     output = tmp_path / "output"
     assets = tmp_path / "assets"
     assets.mkdir()
@@ -157,6 +170,13 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
                 result = {"status": "failed", "failure_kind": "cuda_out_of_memory"}
             (destination / "result.json").write_text(json.dumps(result))
             return int(result["status"] == "failed")
+        if argument(command, "--mode") == "attention-probe":
+            backend = environment["NANOCHAT_ATTENTION_IMPL"]
+            if flash_crashes and backend == "fa3":
+                return -11
+            result = passed_attention_result(backend, 12 if backend == "fa3" else 15, frozen=True)
+            (destination / "result.json").write_text(json.dumps(result))
+            return 0
         (destination / "checkpoints").mkdir(exist_ok=True)
         (destination / "checkpoints" / "latest.pt").write_bytes(b"checkpoint")
         return 0
@@ -169,7 +189,11 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     assert saved["environment"]["NANOCHAT_DATASETS_DIR"] == str(tmp_path / "datasets")
     assert saved["environment"]["NANOCHAT_TRAIN_SHARDS"] == "170"
     assert not (output / "cache").exists()
-    assert [command[2] for command in calls] == ["nanochat.dataset", "scripts.rlm_train", "scripts.rlm_train", "scripts.rlm_train"]
+    assert [command[2] for command in calls] == ["nanochat.dataset", *["scripts.rlm_train"] * 5]
+    selected = "sdpa" if flash_crashes else "fa3"
+    assert saved["attention_probe"]["selected"] == selected
+    assert saved["environment"]["NANOCHAT_ATTENTION_IMPL"] == selected
+    assert environments[-1]["NANOCHAT_ATTENTION_IMPL"] == selected
     assert "--init-embedding-bundle" in calls[-1]
     assert argument(calls[-1], "--input-embedding-freeze") == "permanent"
     calls.clear()
@@ -190,12 +214,96 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     assert argument(calls[0], "--device-batch-size") == "32"
     assert argument(calls[0], "--num-iterations") == "5574"
     assert environments[0]["NANOCHAT_DATASETS_DIR"] == str(tmp_path / "datasets")
+    assert environments[0]["NANOCHAT_ATTENTION_IMPL"] == selected
     alternate = tmp_path / "other-datasets"
     (tmp_path / "datasets").rename(alternate)
     launcher.launch(launcher.parse_args(["--resume", *destination, "--datasets-dir", str(alternate)]))
     assert len(calls) == 2
     assert calls[1] == calls[0]
     assert environments[1]["NANOCHAT_DATASETS_DIR"] == str(alternate)
+
+
+@pytest.mark.parametrize("sdpa_seconds,fa3_seconds,selected", [
+    (20, 15, "fa3"), (15, 20, "sdpa"), (15, 15, "sdpa"),
+])
+def test_attention_selection_compares_the_same_recipe_and_uses_fastest_valid_backend(
+    tmp_path, sdpa_seconds, fa3_seconds, selected,
+):
+    calls = []
+    environment = {"NANOCHAT_ATTENTION_IMPL": "sdpa"}
+
+    def run(command, log_path, child_environment):
+        backend = child_environment["NANOCHAT_ATTENTION_IMPL"]
+        calls.append(backend)
+        assert argument(command, "--mode") == "attention-probe"
+        assert argument(command, "--num-iterations") == "5574"
+        assert argument(command, "--input-embedding-freeze") == "none"
+        assert argument(command, "--device-batch-size") == "32"
+        assert "--save-every" not in command
+        path = Path(argument(command, "--output-dir"))
+        path.mkdir(parents=True)
+        duration = sdpa_seconds if backend == "sdpa" else fa3_seconds
+        (path / "result.json").write_text(json.dumps(passed_attention_result(backend, duration)))
+        return 0
+
+    result = launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", environment, tmp_path, run)
+    assert result["selected"] == selected
+    assert calls == ["sdpa", "fa3"]
+    assert environment["NANOCHAT_ATTENTION_IMPL"] == "sdpa"
+
+
+@pytest.mark.parametrize("failure", [
+    "signal", "nonzero", "missing-result", "malformed-result", "wrong-backend",
+    "compilation", "nonfinite-timing", "failed-health", "launch-error",
+])
+def test_flash_attention_probe_failures_preserve_successful_sdpa(tmp_path, failure):
+    def run(command, log_path, environment):
+        backend = environment["NANOCHAT_ATTENTION_IMPL"]
+        path = Path(argument(command, "--output-dir"))
+        path.mkdir(parents=True)
+        result = passed_attention_result(backend, 10 if backend == "fa3" else 20)
+        if backend == "fa3":
+            if failure == "signal":
+                return launcher.run_logged(
+                    [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"],
+                    log_path, environment,
+                )
+            if failure == "nonzero":
+                return 1
+            if failure == "missing-result":
+                return 0
+            if failure == "malformed-result":
+                (path / "result.json").write_text("{incomplete")
+                return 0
+            if failure == "wrong-backend":
+                result["attention_impl"] = "sdpa"
+            if failure == "compilation":
+                result["attention_probe"]["compilation_excluded"] = False
+            if failure == "nonfinite-timing":
+                result["attention_probe"]["duration_seconds"] = float("nan")
+            if failure == "failed-health":
+                result["updates"][0]["finite_loss_and_gradients"] = False
+            if failure == "launch-error":
+                raise OSError("injected subprocess failure")
+        (path / "result.json").write_text(json.dumps(result))
+        return 0
+
+    result = launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", {}, tmp_path, run)
+    assert result["selected"] == "sdpa"
+    assert result["measurements"]["sdpa"]["duration_seconds"] == 20
+    assert result["measurements"]["fa3"]["status"] == "failed"
+
+
+def test_sdpa_attention_probe_failure_stops_before_optional_flash_probe(tmp_path):
+    calls = []
+
+    def run(command, log_path, environment):
+        calls.append(environment["NANOCHAT_ATTENTION_IMPL"])
+        return 1
+
+    with pytest.raises(RuntimeError, match="SDPA attention probe failed"):
+        launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", {}, tmp_path, run)
+    assert calls == ["sdpa"]
 
 
 def test_dataset_verification_selects_required_shards_from_shared_root_and_hashes_contents(tmp_path):

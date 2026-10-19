@@ -121,7 +121,7 @@ def check_gpu():
     import torch
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable. Check nvidia-smi and the NVIDIA driver's support for this repository's locked CUDA 13.2 PyTorch build; do not substitute a different training environment silently.")
+        raise RuntimeError("CUDA is unavailable. Check nvidia-smi and the NVIDIA driver's support for this repository's locked PyTorch 2.14.1 CUDA 12.6 build; do not substitute a different training environment silently.")
     if torch.cuda.device_count() != 1:
         raise RuntimeError("Expose exactly one GPU with CUDA_VISIBLE_DEVICES before launching.")
     properties = torch.cuda.get_device_properties(0)

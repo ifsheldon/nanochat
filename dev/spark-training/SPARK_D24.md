@@ -8,7 +8,8 @@ Run commands from the repository root on the `spark` branch.
 
 ## Configuration
 
-The locked environment uses PyTorch 2.14.0+cu132 and Triton 3.8.0.
+The `spark` branch's locked environment uses PyTorch 2.14.0+cu132 and Triton 3.8.0.
+The `h100-rlm` branch instead installs PyTorch 2.14.1+cu126 for H100; that build does not support Spark's GB10, so use the Spark branch environment for these commands.
 Training uses BF16 compute, existing parameter/optimizer precision, 24 layers, width 1536, 12 heads, 2048-token context, and full-context SDPA.
 The runner sets `NANOCHAT_ATTENTION_IMPL=sdpa` to bypass remote FA3 kernel discovery throughout the run; the default `auto` retains upstream detection for other workflows.
 Each run owns its tokenizer; preparation trains a 32,768-token tokenizer when the new run has none and validates any complete tokenizer already supplied in that run.

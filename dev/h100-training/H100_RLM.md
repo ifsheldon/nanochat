@@ -7,7 +7,7 @@ The launcher installs the Python environment, downloads the dataset, checks capa
 ## Requirements
 
 - Linux with exactly one unpartitioned H100 GPU visible to the run, including H100 80 GB and H100 NVL 94 GB.
-- A working NVIDIA driver compatible with the locked CUDA 13.2 PyTorch build.
+- A working NVIDIA driver compatible with the locked PyTorch 2.14.1 CUDA 12.6 build.
 - At least 32 GB of available host RAM before launch.
 - Approximately 280 GB of free disk space for a new run, plus space for the supplied bundle and Python environment.
 - Git, Git LFS, `uv`, and Python 3.10 or newer available as `python3`.

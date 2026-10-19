@@ -240,6 +240,36 @@ CPU mapping of the 9.766 GB numbered checkpoint verified that the input table's 
 The check reconstructed parameter identities with a meta-device model and did not allocate a GPU model or interrupt training.
 The run's `startup-verification.json` records these checks, source provenance, and the service's active state at 01:06 SGT.
 
+On October 15, 2026, training stopped before applying update 2491 because sampled available system memory fell to 10.686 GB, below the configured 12 GB guard.
+Rolling and numbered checkpoint 2490 had both been saved.
+On October 16 at 17:46 SGT, the same service was relaunched from that checkpoint with the approved 8 GB system-memory guard and the CLI at revision `269a269`.
+The resumed configuration retains the 5574-update budget, four cycles, batch 32, activation checkpointing, scheduled freezing through update 5016 with unfreezing at 5017, and asynchronous checkpointing with numbered saves every ten updates and ten retained numbered checkpoints.
+The 8 GB guard applies to this run; the general 16 GB default and the historical measurements above remain unchanged.
+The historical command below requires that recorded source revision and its CLI syntax.
+
+```bash
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_DATASETS_DIR="$HOME/.cache/nanochat/spark-d24" \
+NANOCHAT_TRAIN_SHARDS=170 \
+NANOCHAT_DTYPE=bfloat16 NANOCHAT_ATTENTION_IMPL=sdpa OMP_NUM_THREADS=1 \
+NANOCHAT_CUDA_MEMORY_LIMIT_GB=100 \
+NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=8 \
+NANOCHAT_CHECKPOINT_RESERVE_GB=100 \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 \
+uv run --no-sync python -m scripts.rlm_train \
+    --mode train --num-iterations 5574 --cycles 4 \
+    --device-batch-size 32 --activation-checkpointing \
+    --save-every 10 --keep-checkpoints 10 --checkpoint-mode async \
+    --input-embedding-freeze scheduled --resume-latest \
+    --output-dir "$HOME/.cache/nanochat/spark-rlm/pretrain-u4-b32-frozen-20261010"
+```
+
+The relaunch reuses `nanochat-rlm-u4-b32-frozen-20261010.service` and appends to `~/.cache/nanochat/spark-rlm/pretrain-u4-b32-frozen-20261010.log`.
+The exact launch command, environment, revision, and checkpoint are recorded in `~/.cache/nanochat/spark-rlm/pretrain-u4-b32-frozen-20261010-resume-20261016T094646Z.json`.
+The first resumed update, 2491, completed at 17:53 SGT with loss 2.563202, passing finite-state checks, and minimum system available memory of 30.531 GB.
+It took 396.05 seconds including compilation, and its rolling checkpoint was durably published at 17:54 SGT while training continued.
+
 ### Four-cycle pretraining with the step-5568 input embedding
 
 The selected full run uses four cycles, batch 32, activation checkpointing, and terminal-summary omission.

@@ -6,7 +6,7 @@ If you consider additional checks or related features important, explain them to
 # Project overview
 
 nanochat is a Python/PyTorch toolkit for language-model tokenization, pretraining, supervised fine-tuning, reinforcement learning, evaluation, and inference.
-This fork adds DGX Spark workflows and recurrent latent memory (RLM), including pretraining on a single H100 80 GB GPU.
+This fork adds DGX Spark workflows and recurrent latent memory (RLM), including pretraining on a single H100 80 GB or H100 NVL 94 GB GPU.
 RLM reuses a GPT backbone across bounded text chunks and passes learned memory between chunks.
 
 ## Codebase structure

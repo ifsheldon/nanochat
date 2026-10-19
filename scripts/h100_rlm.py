@@ -125,8 +125,8 @@ def check_gpu():
     if torch.cuda.device_count() != 1:
         raise RuntimeError("Expose exactly one GPU with CUDA_VISIBLE_DEVICES before launching.")
     properties = torch.cuda.get_device_properties(0)
-    if "H100" not in properties.name or "MIG" in properties.name or not 75 * GB <= properties.total_memory <= 90 * GB:
-        raise RuntimeError(f"This launcher requires one full H100 80 GB GPU; found {properties.name} with {properties.total_memory / GB:.1f} GB.")
+    if "H100" not in properties.name or "MIG" in properties.name or properties.total_memory < 75 * GB:
+        raise RuntimeError(f"This launcher requires one full H100 GPU with at least 75 GB of VRAM; found {properties.name} with {properties.total_memory / GB:.1f} GB.")
     if not torch.cuda.is_bf16_supported():
         raise RuntimeError("The selected GPU/runtime does not support the required BF16 compute.")
     free, total = torch.cuda.mem_get_info(0)

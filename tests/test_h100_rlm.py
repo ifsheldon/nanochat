@@ -273,12 +273,16 @@ def test_signal_termination_does_not_trigger_fallback_even_with_oom_result(tmp_p
     assert len(calls) == 1
 
 
-def test_gpu_capacity_and_environment_override_spark_allocator_limit(monkeypatch):
+@pytest.mark.parametrize("name,total_gb,free_gb,allocator_limit_gb", [
+    ("NVIDIA H100 80GB HBM3", 85, 83, 81),
+    ("NVIDIA H100 NVL", 94, 92, 90),
+])
+def test_gpu_capacity_and_environment_override_spark_allocator_limit(monkeypatch, name, total_gb, free_gb, allocator_limit_gb):
     cuda = SimpleNamespace(
         is_available=lambda: True, device_count=lambda: 1,
-        get_device_properties=lambda _: SimpleNamespace(name="NVIDIA H100 80GB HBM3", total_memory=85 * launcher.GB),
+        get_device_properties=lambda _: SimpleNamespace(name=name, total_memory=total_gb * launcher.GB),
         is_bf16_supported=lambda: True,
-        mem_get_info=lambda _: (83 * launcher.GB, 85 * launcher.GB),
+        mem_get_info=lambda _: (free_gb * launcher.GB, total_gb * launcher.GB),
     )
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda, __version__="locked-torch", version=SimpleNamespace(cuda="13.2")))
     monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(virtual_memory=lambda: SimpleNamespace(total=64 * launcher.GB, available=40 * launcher.GB)))
@@ -287,7 +291,7 @@ def test_gpu_capacity_and_environment_override_spark_allocator_limit(monkeypatch
     monkeypatch.setenv("NANOCHAT_DTYPE", "float32")
     gpu = launcher.check_gpu()
     environment = launcher.runtime_environment(Path("/run"), Path("/datasets"), gpu)
-    assert float(environment["NANOCHAT_CUDA_MEMORY_LIMIT_GB"]) == 81
+    assert float(environment["NANOCHAT_CUDA_MEMORY_LIMIT_GB"]) == allocator_limit_gb
     assert environment["NANOCHAT_DTYPE"] == "bfloat16"
     cuda.get_device_properties = lambda _: SimpleNamespace(name="NVIDIA H100 80GB MIG", total_memory=85 * launcher.GB)
     with pytest.raises(RuntimeError, match="full H100"):

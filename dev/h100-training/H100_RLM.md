@@ -6,13 +6,14 @@ The launcher installs the Python environment, downloads the dataset, checks capa
 
 ## Requirements
 
-- Linux with one unpartitioned H100 80 GB GPU available for the run.
+- Linux with exactly one unpartitioned H100 GPU visible to the run, including H100 80 GB and H100 NVL 94 GB.
 - A working NVIDIA driver compatible with the locked CUDA 13.2 PyTorch build.
 - At least 32 GB of available host RAM before launch.
 - Approximately 280 GB of free disk space for a new run, plus space for the supplied bundle and Python environment.
 - Git, Git LFS, `uv`, and Python 3.10 or newer available as `python3`.
 - Internet access for dependencies, the supplied files, and the dataset.
 
+The GPU capacity check requires at least 75 GB (75 × 10^9 bytes) of total GPU memory and has no upper memory limit.
 Use a persistent terminal session or your normal job scheduler so disconnecting SSH does not terminate training.
 The launcher checks the GPU, available memory, and disk space before training; it does not install or upgrade the NVIDIA driver.
 

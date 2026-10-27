@@ -4,11 +4,12 @@ For the October 5, 2026 run status and instructions to finish only the paused Hu
 
 This workflow trains a fresh 1,384,122,122-parameter nanochat model on one GB10 GPU through pretraining, base evaluation, SFT, and chat evaluation.
 The quality target is the repository's GPT-2 reference CORE score of 0.256525; completing training does not by itself establish that capability.
-Run commands from the repository root on the `spark` branch.
+Run commands from the repository root on the merged `spark-rlm` branch.
 
 ## Configuration
 
-The locked environment uses PyTorch 2.14.0+cu132 and Triton 3.8.0.
+On Linux ARM64, the locked GPU environment selects PyTorch 2.14.0+cu132 and Triton 3.8.0.
+The same configuration selects PyTorch 2.14.1+cu126 on Linux x86-64 for H100, using CPU-architecture markers in `pyproject.toml`.
 Training uses BF16 compute, existing parameter/optimizer precision, 24 layers, width 1536, 12 heads, 2048-token context, and full-context SDPA.
 The runner sets `NANOCHAT_ATTENTION_IMPL=sdpa` to bypass remote FA3 kernel discovery throughout the run; the default `auto` retains upstream detection for other workflows.
 Each run owns its tokenizer; preparation trains a 32,768-token tokenizer when the new run has none and validates any complete tokenizer already supplied in that run.

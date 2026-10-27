@@ -30,7 +30,16 @@ See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret a
 ### Setup
 
 nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management.
-The GPU extra installs PyTorch 2.14.0 with CUDA 13.2 runtime libraries.
+The GPU extra selects the locked PyTorch build by operating system and CPU architecture:
+
+| Host | PyTorch | CUDA runtime |
+| --- | --- | --- |
+| Linux ARM64 (`aarch64`), including DGX Spark | 2.14.0 | 13.2 |
+| Linux x86-64 (`x86_64`), including the H100 host | 2.14.1 | 12.6 |
+
+Both use the same `pyproject.toml`, `uv.lock`, and installation command.
+The `cpu` extra selects CPU-only wheels with the same architecture-specific versions.
+These selections use environment markers, not GPU or driver detection; other platforms retain the 2.14.1 dependency pin.
 To install:
 
 ```bash
@@ -122,6 +131,7 @@ The important thing to note is that nanochat is written and configured around on
 For a single-GPU DGX Spark version of the small demo, including a smoke test, see [DGX Spark small experiments](dev/spark-training/SPARK.md).
 For the complete d24 pipeline with an 80 GB CUDA allocator limit, checkpoint recovery, and full evaluations, see [DGX Spark d24 training](dev/spark-training/SPARK_D24.md).
 For recurrent latent memory pretraining, memory probes, and memory-aware evaluation and sampling, see [DGX Spark RLM](dev/spark-training/SPARK_RLM.md).
+For a fresh run on one H100 80 GB or H100 NVL 94 GB, with a compact embedding checkpoint, ordered capacity probes, and automatic attention benchmarking, see [H100 RLM handoff](dev/h100-training/H100_RLM.md).
 
 SFT packs complete conversations when possible and truncates the shortest oversized conversation only when none fits an empty row.
 Examples without assistant targets inside the context window are excluded and counted toward dataset progress; a dataset cycle with no usable targets on a rank raises an error.

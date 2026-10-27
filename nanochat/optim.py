@@ -271,6 +271,56 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
+    def _initialize_adamw_state(self, parameter, parameter_slice):
+        state = self.state[parameter]
+        if not state:
+            state['step'] = 0
+            state['exp_avg'] = torch.zeros_like(parameter_slice)
+            state['exp_avg_sq'] = torch.zeros_like(parameter_slice)
+        return state
+
+    def _initialize_muon_state(self, group, chunk_size):
+        parameter = group['params'][0]
+        shape, device, dtype = parameter.shape, parameter.device, parameter.dtype
+        state = self.state[parameter]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+        if "second_momentum_buffer" not in state:
+            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        return state
+
+    @torch.no_grad()
+    def initialize_state(self):
+        """Allocate ordinary optimizer state without gradients or an update.
+
+        Capacity probes call this before forward/backward so their single update
+        includes resident optimizer memory. Frozen AdamW parameters stay lazy.
+        Repeated calls preserve existing moments and step counters.
+        """
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+        for group in self.param_groups:
+            if group['kind'] == 'adamw':
+                for parameter in group['params']:
+                    if not parameter.requires_grad:
+                        continue
+                    parameter_slice = parameter
+                    if world_size > 1 and parameter.numel() >= 1024:
+                        if parameter.shape[0] % world_size:
+                            raise ValueError("AdamW state sharding requires shape[0] divisible by world size")
+                        rank_size = parameter.shape[0] // world_size
+                        parameter_slice = parameter[rank * rank_size:(rank + 1) * rank_size]
+                    self._initialize_adamw_state(parameter, parameter_slice)
+            elif group['kind'] == 'muon':
+                if any(not parameter.requires_grad for parameter in group['params']):
+                    raise ValueError("Muon state initialization requires trainable matrix parameters")
+                chunk_size = (len(group['params']) + world_size - 1) // world_size
+                self._initialize_muon_state(group, chunk_size)
+            else:
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
         param_infos = {}
@@ -330,7 +380,6 @@ class MuonAdamW(torch.optim.Optimizer):
             if pinfo['future'] is not None:
                 pinfo['future'].wait()
             grad_slice = pinfo['grad_slice']
-            state = self.state[p]
 
             # For small params, operate on full param; for large, operate on slice
             if pinfo['is_small']:
@@ -340,10 +389,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 p_slice = p[rank * rank_size:(rank + 1) * rank_size]
 
             # State init
-            if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p_slice)
-                state['exp_avg_sq'] = torch.zeros_like(p_slice)
+            state = self._initialize_adamw_state(p, p_slice)
             state['step'] += 1
 
             # Fill 0-D tensors and run fused kernel
@@ -379,12 +425,7 @@ class MuonAdamW(torch.optim.Optimizer):
         num_owned = min(chunk_size, max(0, len(params) - start_idx))
 
         # Get or create group-level state
-        state = self.state[p]
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        state = self._initialize_muon_state(group, chunk_size)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         stacked_owned = None

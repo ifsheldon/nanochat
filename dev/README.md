@@ -9,6 +9,10 @@ Run commands from the repository root unless a guide says otherwise.
 - [D24 training and evaluation](spark-training/SPARK_D24.md)
 - [RLM training, evaluation, and measured results](spark-training/SPARK_RLM.md)
 
+## H100 training
+
+- [Pretraining with the supplied files](h100-training/H100_RLM.md)
+
 ## RLM architecture
 
 - [Design and implementation plan](RLM-architecture/SPARK_RLM_PLAN.md)

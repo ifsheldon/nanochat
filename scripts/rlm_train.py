@@ -19,6 +19,7 @@ import sys
 import time
 
 from nanochat.paths import configure_runtime_paths, get_run_dir
+from nanochat.rlm_policy import InputEmbeddingFreeze
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=get_run_dir() / "train",
                         help="new training/probe directory (default: selected run's train directory)")
-    parser.add_argument("--mode", choices=("probe", "train"), default="probe")
+    parser.add_argument("--mode", choices=("probe", "capacity-probe", "attention-probe", "train"), default="probe")
     parser.add_argument("--device-type", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--depth", type=int, default=24)
     parser.add_argument("--width", type=int, default=None, help="default: depth * 64, rounded to head dimension")
@@ -52,10 +53,13 @@ def parse_args():
     parser.add_argument("--init-embedding-checkpoint-dir", type=Path, help="fresh runs only: checkpoint directory providing transformer.wte.weight")
     parser.add_argument("--init-embedding-step", type=int, help="published source checkpoint step for input embedding initialization")
     parser.add_argument("--init-embedding-tokenizer", type=Path, help="source tokenizer.pkl; must exactly match the training tokenizer")
-    parser.add_argument("--freeze-input-embedding", action="store_true", help="freeze the pretrained input table for the first 90%% of the full update budget; EOM and summary inputs stay trainable")
+    parser.add_argument("--init-embedding-bundle", type=Path, help="fresh runs only: verified embedding-only export directory")
+    parser.add_argument("--input-embedding-freeze", type=InputEmbeddingFreeze,
+                        choices=list(InputEmbeddingFreeze), default=InputEmbeddingFreeze.NONE,
+                        help="none, scheduled (first 90%%), or permanent; EOM and summary inputs stay trainable")
     parser.add_argument("--save-every", type=int, help="training only; numbered checkpoint interval (default: 10), plus update 2 and the final/paused update; 0 disables periodic numbered saves")
     parser.add_argument("--keep-checkpoints", type=int, help="training only: numbered checkpoints to retain (default: 10), in addition to rolling latest")
-    parser.add_argument("--checkpoint-mode", choices=("sync", "async"), default="async", help="async overlaps checkpoint writing with the next forward/backward; both modes warn and continue on save errors")
+    parser.add_argument("--checkpoint-mode", choices=("sync", "async"), default="async", help="async overlaps checkpoint writing with the next forward/backward; ordinary save errors warn, but a required 90%% checkpoint failure stops training")
     resume = parser.add_mutually_exclusive_group()
     resume.add_argument("--resume-from-step", type=int, default=None)
     resume.add_argument("--resume-latest", action="store_true", help="resume the complete model/optimizer state in checkpoints/latest.pt")
@@ -74,6 +78,11 @@ def parse_args():
                                   or args.stop_after_step is not None or args.save_every
                                   or args.keep_checkpoints is not None):
         parser.error("probe requires at least two updates, with no resume, early stop, checkpoint saving, or retention")
+    if args.mode in ("capacity-probe", "attention-probe"):
+        if resuming or args.stop_after_step is not None or args.save_every or args.keep_checkpoints is not None:
+            parser.error(f"{args.mode} requires a fresh run without resume, early stop, checkpoint saving, or retention")
+        if args.input_embedding_freeze is InputEmbeddingFreeze.SCHEDULED:
+            parser.error(f"{args.mode} requires input-embedding-freeze none or permanent")
     if args.save_every < 0:
         parser.error("--save-every cannot be negative")
     if args.keep_checkpoints is not None and args.keep_checkpoints <= 0:
@@ -82,14 +91,19 @@ def parse_args():
         args.init_embedding_checkpoint_dir, args.init_embedding_step, args.init_embedding_tokenizer,
     )
     if any(value is not None for value in initialization_args):
+        if args.init_embedding_bundle is not None:
+            parser.error("choose an embedding bundle or source checkpoint, not both")
         if not all(value is not None for value in initialization_args):
             parser.error("embedding initialization requires checkpoint directory, step, and source tokenizer together")
         if args.init_embedding_step < 0:
             parser.error("--init-embedding-step must be nonnegative")
         if resuming:
             parser.error("embedding initialization is fresh-run only; resume restores its saved initialization provenance and trained weights")
-    if args.freeze_input_embedding and not resuming and args.init_embedding_checkpoint_dir is None:
-        parser.error("--freeze-input-embedding requires pretrained embedding initialization for a fresh run")
+    if args.init_embedding_bundle is not None and resuming:
+        parser.error("embedding initialization is fresh-run only; resume restores its saved weights")
+    if (args.input_embedding_freeze is not InputEmbeddingFreeze.NONE and not resuming
+            and args.init_embedding_checkpoint_dir is None and args.init_embedding_bundle is None):
+        parser.error("--input-embedding-freeze requires pretrained embedding initialization for a fresh run")
     if args.resume_from_step is not None and args.resume_from_step <= 0:
         parser.error("--resume-from-step must name a completed positive optimizer update")
     if args.stop_after_step is not None and not 0 < args.stop_after_step <= args.num_iterations:
@@ -145,6 +159,7 @@ def run(args, attempt):
     from nanochat.rlm_checkpoints import recover_numbered_checkpoint, save_numbered_checkpoint
     from nanochat.rlm_checkpointing import CheckpointWriter
     from nanochat.common import COMPUTE_DTYPE, compute_init, get_base_dir
+    from nanochat.flash_attention import attention_backend
     from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
     from nanochat.rlm import RecurrentGPT, RLMConfig
     from nanochat.rlm_training import (
@@ -204,6 +219,11 @@ def run(args, attempt):
             "random", "pretrained_input_token_embedding",
         ):
             raise ValueError("The recorded run has invalid initialization provenance")
+    elif args.init_embedding_bundle is not None:
+        from nanochat.rlm_initialization import TokenEmbeddingInitialization
+
+        initializer = TokenEmbeddingInitialization.from_bundle(args.init_embedding_bundle, tokenizer_path)
+        initialization = initializer.contract()
     elif args.init_embedding_checkpoint_dir is not None:
         from nanochat.rlm_initialization import TokenEmbeddingInitialization
 
@@ -214,7 +234,7 @@ def run(args, attempt):
         initialization = initializer.contract()
     else:
         initialization = {"kind": "random"}
-    if config.freeze_input_embedding and initialization["kind"] != "pretrained_input_token_embedding":
+    if config.input_embedding_freeze is not InputEmbeddingFreeze.NONE and initialization["kind"] != "pretrained_input_token_embedding":
         raise ValueError("Freezing the input embedding requires pretrained initialization provenance")
     model_config = RLMConfig(
         sequence_len=args.text_length + 1 + 2 * args.memory_tokens,
@@ -229,6 +249,16 @@ def run(args, attempt):
         triton_version = version("triton")
     except PackageNotFoundError:
         triton_version = None
+    milestone_step = config.milestone_step
+    if resuming:
+        if latest_checkpoint.milestone_path.exists():
+            milestone_step = latest_checkpoint.verify_milestone()["step"]
+        elif metadata.get("milestone_checkpoint", False):
+            # Finish the first requested preservation even if the horizon changed.
+            milestone_step = step
+        elif milestone_step < step:
+            # A changed horizon cannot recreate a boundary already passed.
+            milestone_step = 0
     contract = {
         "model_config": asdict(model_config), "training_config": asdict(config),
         "initialization": initialization,
@@ -236,10 +266,11 @@ def run(args, attempt):
             "latest_every": 1, "early_step": 2,
             "save_every": args.save_every, "keep_last": args.keep_checkpoints,
             "mode": args.checkpoint_mode, "on_error": "warn",
+            "milestone_step": milestone_step or None,
         } if args.mode == "train" else None,
         "source_sha256": source["sha256"], "tokenizer_sha256": tokenizer_sha256,
         "data_inventory_sha256": inventory["sha256"], "compute_dtype": str(COMPUTE_DTYPE),
-        "device_type": device.type, "attention_impl": "sdpa",
+        "device_type": device.type, "attention_impl": attention_backend().value,
         "runtime": {
             "python": sys.version.split()[0], "torch": torch.__version__,
             "cuda": torch.version.cuda, "triton": triton_version,
@@ -269,8 +300,9 @@ def run(args, attempt):
         "prediction_targets_per_update": config.prediction_targets_per_update(args.text_length),
         "input_embedding_freeze": {
             "frozen_updates": config.input_embedding_frozen_updates,
-            "first_trainable_update": config.input_embedding_frozen_updates + 1,
-        } if config.freeze_input_embedding else None,
+            "first_trainable_update": (None if config.input_embedding_freeze is InputEmbeddingFreeze.PERMANENT
+                                       else config.input_embedding_frozen_updates + 1),
+        } if config.input_embedding_freeze is not InputEmbeddingFreeze.NONE else None,
     }))
 
     optimizer_data = None
@@ -310,6 +342,10 @@ def run(args, attempt):
             record_checkpoint_retention(checkpoint_dir, step, args.keep_checkpoints, attempt)
     else:
         write_json(args.output_dir / "run.json", {"contract": contract, "revision": revision, "mode": args.mode})
+    if resuming and milestone_step and step == milestone_step:
+        # A stop after rolling publication can leave the required durable
+        # copy unfinished. Repair it before any trainable-table forward.
+        latest_checkpoint.preserve_milestone(step)
     with torch.device("meta"):
         model = RecurrentGPT(model_config)
     model.to_empty(device=device)
@@ -336,6 +372,21 @@ def run(args, attempt):
         split="train", device=device.type,
         resume_state_dict=None if metadata is None else metadata["dataloader_state_dict"],
     )
+    if args.mode in ("capacity-probe", "attention-probe"):
+        if args.mode == "capacity-probe":
+            from nanochat.rlm_capacity import capacity_probe as probe
+        else:
+            from nanochat.rlm_attention_probe import attention_probe as probe
+
+        report = probe(
+            model, forward_cycle, optimizer, loader, config, decay,
+            tokenizer.get_bos_token_id(), attempt,
+        )
+        write_json(attempt / "result.json", report)
+        write_json(args.output_dir / "result.json", report)
+        (attempt / "updates.jsonl").write_text(json.dumps(report["updates"][0], allow_nan=False) + "\n")
+        logger.info("%s", json.dumps(report))
+        return
     setup_metrics = cuda_metrics(device)
     updates = []
     tokens_per_update = {
@@ -400,7 +451,14 @@ def run(args, attempt):
                     synchronize(device)
                     saved_metadata = checkpoint_metadata(model, config, step, loader_state, contract, token_counts)
                     saved_metadata["numbered_checkpoint"] = numbered
-                    writer.submit(model.state_dict(), optimizer.state_dict(), saved_metadata, numbered=numbered)
+                    milestone = step == milestone_step
+                    saved_metadata["milestone_checkpoint"] = milestone
+                    writer.submit(model.state_dict(), optimizer.state_dict(), saved_metadata,
+                                  numbered=numbered, milestone=milestone)
+                    if milestone:
+                        # Unfreezing happens at the start of the next forward,
+                        # earlier than the usual pre-optimizer writer barrier.
+                        writer.wait(completed_step=step)
                     record_checkpoint_measurements()
                     logger.info("%s", json.dumps({"checkpoint_status": writer.status(step)}))
         finally:
@@ -440,7 +498,7 @@ def run(args, attempt):
 def main():
     args = parse_args()
     configure_runtime_paths()
-    os.environ["NANOCHAT_ATTENTION_IMPL"] = "sdpa"
+    os.environ.setdefault("NANOCHAT_ATTENTION_IMPL", "sdpa")
     os.environ.setdefault("NANOCHAT_DTYPE", "bfloat16" if args.device_type == "cuda" else "float32")
     os.environ.setdefault("NANOCHAT_CUDA_MEMORY_LIMIT_GB", "80")
     os.environ.setdefault("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB", "16")
@@ -464,10 +522,12 @@ def main():
             run(args, attempt)
         except BaseException as exc:
             import torch
+            from nanochat.rlm_capacity import is_cuda_out_of_memory
             from nanochat.rlm_training import cuda_metrics
             device = torch.device(args.device_type)
             status = {
                 "status": "failed", "error_type": type(exc).__name__, "error": str(exc),
+                "failure_kind": "cuda_out_of_memory" if is_cuda_out_of_memory(exc) else "error",
                 "memory": cuda_metrics(device) if device.type == "cpu" or torch.cuda.is_initialized() else {},
             }
             write_json(attempt / "failure.json", status)

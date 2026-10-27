@@ -1,10 +1,12 @@
 """Durable replacement of the latest complete RLM update, under the run lock."""
 
 from dataclasses import dataclass
+import ctypes
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 from uuid import uuid4
 
@@ -17,6 +19,29 @@ from nanochat.training_runtime import positive_gb
 
 class LatestCheckpointError(RuntimeError):
     """A rolling checkpoint could not be safely read or durably published."""
+
+
+def _publish_no_replace(directory_fd, source, destination):
+    """Publish an immutable milestone atomically without overwriting a rival file."""
+    # RLM recovery already requires Linux descriptor-backed mmap. RENAME_NOREPLACE
+    # also avoids a check/rename race without introducing temporary hardlinks.
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = libc.renameat2
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    if rename(directory_fd, os.fsencode(source), directory_fd, os.fsencode(destination), 1):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
+def _file_identity(status):
+    return status.st_dev, status.st_ino, status.st_mtime_ns, status.st_size
+
+
+def _read_bundle(stream, device, *, metadata_only=False):
+    # The descriptor pins the verified inode across an atomic path replacement.
+    source = f"/proc/self/fd/{stream.fileno()}" if metadata_only else stream
+    return _bundle(torch.load(source, map_location=device, weights_only=True, mmap=metadata_only))
 
 
 def _metadata(value):
@@ -96,6 +121,10 @@ class LatestCheckpoint:
     def path(self):
         return self.checkpoint_dir / "latest.pt"
 
+    @property
+    def milestone_path(self):
+        return self.checkpoint_dir / "pretrain-90pct.pt"
+
     def _directory_fd(self):
         try:
             descriptor = _open_directory(self.checkpoint_dir)
@@ -113,13 +142,16 @@ class LatestCheckpoint:
         if nonempty and status.st_size <= 0:
             raise LatestCheckpointError(f"Checkpoint file must be nonempty: {name}")
 
-    def _inspect_latest(self, directory_fd):
+    def _inspect_file(self, directory_fd, name):
         try:
-            status = os.stat("latest.pt", dir_fd=directory_fd, follow_symlinks=False)
+            status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
             return None
-        self._require_owned_file(status, self.path)
+        self._require_owned_file(status, self.checkpoint_dir / name)
         return status
+
+    def _inspect_latest(self, directory_fd):
+        return self._inspect_file(directory_fd, self.path.name)
 
     def exists(self):
         directory_fd = self._directory_fd()
@@ -130,12 +162,12 @@ class LatestCheckpoint:
         finally:
             os.close(directory_fd)
 
-    def _clear_staging(self, directory_fd):
+    def _clear_staging(self, directory_fd, stem="latest"):
         candidates = []
         for name in os.listdir(directory_fd):
-            if not name.startswith(".latest."):
+            if not name.startswith(f".{stem}."):
                 continue
-            if re.fullmatch(r"\.latest\.[0-9a-f]{32}\.tmp", name) is None:
+            if re.fullmatch(rf"\.{re.escape(stem)}\.[0-9a-f]{{32}}\.tmp", name) is None:
                 raise LatestCheckpointError(f"Unexpected rolling checkpoint staging name: {name}")
             status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             self._require_owned_file(status, name, nonempty=False)
@@ -188,19 +220,15 @@ class LatestCheckpoint:
             finally:
                 os.close(directory_fd)
 
-    def _load(self, device, *, metadata_only=False):
+    def _load(self, device, *, metadata_only=False, name="latest.pt"):
         directory_fd = self._directory_fd()
         try:
-            descriptor = os.open("latest.pt", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
             with os.fdopen(descriptor, "rb") as stream:
-                self._require_owned_file(os.fstat(stream.fileno()), self.path)
-                # PyTorch mmap requires a filename. Linux's descriptor path pins
-                # the already verified inode even if latest is atomically replaced.
-                source = f"/proc/self/fd/{stream.fileno()}" if metadata_only else stream
-                value = torch.load(source, map_location=device, weights_only=True, mmap=metadata_only)
-                return _bundle(value)
+                self._require_owned_file(os.fstat(stream.fileno()), self.checkpoint_dir / name)
+                return _read_bundle(stream, device, metadata_only=metadata_only)
         except Exception as exc:
-            raise LatestCheckpointError(f"Cannot load latest checkpoint {self.path}: {exc}") from exc
+            raise LatestCheckpointError(f"Cannot load checkpoint {self.checkpoint_dir / name}: {exc}") from exc
         finally:
             os.close(directory_fd)
 
@@ -210,3 +238,98 @@ class LatestCheckpoint:
     def metadata(self):
         """Read resume metadata without allocating the model/optimizer storage."""
         return self._load(torch.device("cpu"), metadata_only=True)[2]
+
+    def verify_milestone(self, step=None):
+        """Read the retained checkpoint metadata, optionally requiring an update."""
+        if step is not None and (type(step) is not int or step <= 0):
+            raise ValueError("Milestone step must identify a positive completed update")
+        metadata = self._load(torch.device("cpu"), metadata_only=True, name=self.milestone_path.name)[2]
+        if step is not None and metadata["step"] != step:
+            raise LatestCheckpointError(f"Milestone checkpoint must preserve update {step}, found {metadata['step']}")
+        return metadata
+
+    def _matching_milestone(self, directory_fd, source, metadata):
+        """A retry may reuse only the exact already-published source bundle."""
+        if self._inspect_file(directory_fd, self.milestone_path.name) is None:
+            return False
+        descriptor = os.open(self.milestone_path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+        with os.fdopen(descriptor, "rb") as existing:
+            status = os.fstat(existing.fileno())
+            self._require_owned_file(status, self.milestone_path)
+            if _read_bundle(existing, torch.device("cpu"), metadata_only=True)[2] != metadata:
+                raise LatestCheckpointError("Existing milestone checkpoint conflicts with latest metadata")
+            source.seek(0)
+            existing.seek(0)
+            while True:
+                block = source.read(8 * 1024 * 1024)
+                if block != existing.read(8 * 1024 * 1024):
+                    raise LatestCheckpointError("Existing milestone checkpoint conflicts with latest bundle")
+                if not block:
+                    break
+            current = self._inspect_file(directory_fd, self.milestone_path.name)
+            if current is None or _file_identity(current) != _file_identity(status):
+                raise LatestCheckpointError("Milestone checkpoint changed during verification")
+            os.fsync(existing.fileno())
+        return True
+
+    def preserve_milestone(self, step):
+        """Keep an exact durable copy of latest without GPU work or reserialization.
+
+        This file survives both rolling replacement and numbered retention. The
+        caller holds the run lock and must stop before unfreezing if this fails.
+        """
+        if type(step) is not int or step <= 0:
+            raise ValueError("Milestone step must identify a positive completed update")
+        directory_fd = self._directory_fd()
+        temporary = None
+        published = False
+        try:
+            self._clear_staging(directory_fd, "pretrain-90pct")
+            descriptor = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+            with os.fdopen(descriptor, "rb") as source:
+                original = os.fstat(source.fileno())
+                self._require_owned_file(original, self.path)
+                metadata = _read_bundle(source, torch.device("cpu"), metadata_only=True)[2]
+                if metadata["step"] != step:
+                    raise LatestCheckpointError(f"Latest checkpoint must be update {step} to preserve the milestone, found {metadata['step']}")
+                if self._matching_milestone(directory_fd, source, metadata):
+                    current = self._inspect_latest(directory_fd)
+                    if current is None or _file_identity(current) != _file_identity(original):
+                        raise LatestCheckpointError("Latest checkpoint changed while verifying the milestone")
+                    os.fsync(directory_fd)
+                    return self.milestone_path
+                reserve = os.environ.get("NANOCHAT_CHECKPOINT_RESERVE_GB")
+                required = original.st_size + (0 if reserve is None else positive_gb(reserve, "NANOCHAT_CHECKPOINT_RESERVE_GB"))
+                filesystem = os.fstatvfs(directory_fd)
+                if filesystem.f_bavail * filesystem.f_frsize < required:
+                    raise LatestCheckpointError("Insufficient disk space for retained milestone and configured free-space reserve")
+                name = f".pretrain-90pct.{uuid4().hex}.tmp"
+                descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
+                temporary = name
+                with os.fdopen(descriptor, "wb") as target:
+                    source.seek(0)
+                    shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
+                    target.flush()
+                    os.fsync(target.fileno())
+                    if os.fstat(target.fileno()).st_size != original.st_size:
+                        raise LatestCheckpointError("Milestone copy does not match latest checkpoint size")
+                current = self._inspect_latest(directory_fd)
+                if current is None or _file_identity(current) != _file_identity(original):
+                    raise LatestCheckpointError("Latest checkpoint changed while preserving the milestone")
+                if self._matching_milestone(directory_fd, source, metadata):
+                    os.unlink(temporary, dir_fd=directory_fd)
+                else:
+                    _publish_no_replace(directory_fd, temporary, self.milestone_path.name)
+                temporary = None
+                published = True
+                os.fsync(directory_fd)
+                return self.milestone_path
+        except Exception as exc:
+            detail = "was published but directory durability could not be confirmed" if published else "was not published"
+            raise LatestCheckpointError(f"Milestone checkpoint {detail}: {exc}") from exc
+        finally:
+            try:
+                if temporary is not None:
+                    os.unlink(temporary, dir_fd=directory_fd)
+            finally:
+                os.close(directory_fd)

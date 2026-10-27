@@ -3,6 +3,7 @@
 from dataclasses import asdict
 import hashlib
 import json
+import shutil
 
 import pytest
 import torch
@@ -225,3 +226,144 @@ def test_frozen_target_is_rejected_without_overriding_training_policy(source_fil
         initializer(source_files).initialize(model)
     assert torch.equal(model.transformer.wte.weight, before)
     assert not model.lm_head.weight.requires_grad
+
+
+@pytest.fixture
+def bundle_inputs(source_files, tmp_path):
+    tokenizer_dir = tmp_path / "tokenizer"
+    tokenizer_dir.mkdir()
+    (tokenizer_dir / "tokenizer.pkl").write_bytes(source_files[1].read_bytes())
+    torch.save(torch.ones(32, dtype=torch.int32), tokenizer_dir / "token_bytes.pt")
+    return source_files[0], tokenizer_dir, tmp_path / "bundle"
+
+
+def export_bundle(bundle_inputs):
+    checkpoint, tokenizer_dir, destination = bundle_inputs
+    return TokenEmbeddingInitialization.export_from_checkpoint(checkpoint, 7, tokenizer_dir, destination)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_full_and_embedding_only_checkpoints_use_the_same_loader(source_files, bundle_inputs, dtype):
+    # A view with a much larger backing storage must not transfer the unused tail.
+    def as_view(tensor):
+        storage = torch.full((tensor.numel() * 10,), 99.0, dtype=dtype)
+        view = storage[:tensor.numel()].view(tensor.shape)
+        view.copy_(tensor)
+        return view
+
+    rewrite_embedding(source_files, as_view)
+    original = initializer(source_files)
+    output = export_bundle(bundle_inputs)
+    compact_path = output / "model_000007.pt"
+    compact = torch.load(compact_path, map_location="cpu", weights_only=True)
+    assert set(compact) == {"transformer.wte.weight"}
+    table = compact["transformer.wte.weight"]
+    assert table.untyped_storage().nbytes() == table.numel() * table.element_size()
+    assert compact_path.stat().st_size < (source_files[0] / compact_path.name).stat().st_size
+    assert {path.name for path in output.iterdir()} == {
+        "model_000007.pt", "meta_000007.json", "manifest.json", "tokenizer.pkl", "token_bytes.pt",
+    }
+    expected = original.embedding_sha256
+    original_checkpoint_sha256 = original.contract()["checkpoint"]["sha256"]
+    # The exported checkpoint must stay usable after removing the entire source.
+    del original
+    shutil.rmtree(source_files[0])
+    for source in (
+        TokenEmbeddingInitialization.from_checkpoint(output, 7, output / "tokenizer.pkl", source_files[2]),
+        TokenEmbeddingInitialization.from_bundle(output, source_files[2]),
+    ):
+        model = target_model()
+        model.transformer.wte.to(dtype=dtype)
+        before = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+        proof = source.initialize(model)
+        assert proof["copied_sha256"] == expected
+        changed = [name for name, tensor in model.state_dict().items() if not torch.equal(tensor, before[name])]
+        assert changed == ["transformer.wte.weight"]
+    assert source.contract()["source_checkpoint"]["sha256"] == original_checkpoint_sha256
+
+
+@pytest.mark.parametrize("asset", ["model_000007.pt", "meta_000007.json", "tokenizer.pkl", "token_bytes.pt"])
+def test_bundle_rejects_modified_files_before_loading(bundle_inputs, source_files, monkeypatch, asset):
+    output = export_bundle(bundle_inputs)
+    path = output / asset
+    path.write_bytes(path.read_bytes() + b"tampered")
+
+    def no_load(*args, **kwargs):
+        pytest.fail("Bundle checksum failures must be rejected before loading tensors")
+
+    monkeypatch.setattr(torch, "load", no_load)
+    with pytest.raises(ValueError, match="file SHA-256 mismatch"):
+        TokenEmbeddingInitialization.from_bundle(output, source_files[2])
+
+
+@pytest.mark.parametrize("field,replacement,match", [
+    ("embedding_sha256", "0" * 64, "table SHA-256 mismatch"),
+    ("embedding_shape", [65, 32], "shape or dtype"),
+    ("embedding_dtype", "torch.bfloat16", "shape or dtype"),
+    ("vocab_size", 31, "dimensions do not match"),
+    ("version", True, "version"),
+    ("files", {"../model_000007.pt": "0" * 64}, "canonical filenames"),
+])
+def test_bundle_rejects_invalid_manifest(bundle_inputs, source_files, field, replacement, match):
+    output = export_bundle(bundle_inputs)
+    path = output / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest[field] = replacement
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=match):
+        TokenEmbeddingInitialization.from_bundle(output, source_files[2])
+
+
+def test_bundle_rejects_target_tokenizer_mismatch(bundle_inputs, source_files, monkeypatch):
+    output = export_bundle(bundle_inputs)
+    source_files[2].write_bytes(b"another vocabulary")
+
+    def no_load(*args, **kwargs):
+        pytest.fail("Tokenizer mismatch must be rejected before loading tensors")
+
+    monkeypatch.setattr(torch, "load", no_load)
+    with pytest.raises(ValueError, match="tokenizer SHA-256 identities"):
+        TokenEmbeddingInitialization.from_bundle(output, source_files[2])
+
+
+def test_bundle_rechecks_changed_assets_before_transfer(bundle_inputs, source_files):
+    output = export_bundle(bundle_inputs)
+    source = TokenEmbeddingInitialization.from_bundle(output, source_files[2])
+    (output / "token_bytes.pt").write_bytes(b"changed after validation")
+    model = target_model()
+    before = model.transformer.wte.weight.detach().clone()
+    with pytest.raises(ValueError, match="changed after validation"):
+        source.initialize(model)
+    assert torch.equal(model.transformer.wte.weight, before)
+
+
+@pytest.mark.parametrize("filename", ["manifest.json", "model_000007.pt", "tokenizer.pkl", "token_bytes.pt"])
+def test_bundle_rejects_symlinks(bundle_inputs, source_files, filename):
+    output = export_bundle(bundle_inputs)
+    path = output / filename
+    original = path.with_suffix(".original")
+    path.rename(original)
+    path.symlink_to(original)
+    with pytest.raises(ValueError, match="cannot contain symlinks"):
+        TokenEmbeddingInitialization.from_bundle(output, source_files[2])
+
+
+def test_export_refuses_existing_directory_and_cleans_failed_export(bundle_inputs, monkeypatch):
+    destination = bundle_inputs[2]
+    destination.mkdir()
+    keep = destination / "keep"
+    keep.write_text("existing data")
+    with pytest.raises(FileExistsError, match="Refusing to replace"):
+        export_bundle(bundle_inputs)
+    assert keep.read_text() == "existing data"
+    keep.unlink()
+    destination.rmdir()
+
+    def fail_save(*args, **kwargs):
+        assert not (destination / "manifest.json").exists()
+        raise OSError("simulated storage failure")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+    with pytest.raises(OSError, match="simulated storage failure"):
+        export_bundle(bundle_inputs)
+    assert not destination.exists()

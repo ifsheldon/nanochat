@@ -3,6 +3,7 @@
 This workflow implements the first version of the [RLM plan](../RLM-architecture/SPARK_RLM_PLAN.md).
 It trains models with differentiable memory between bounded text chunks and provides separate evaluation and sampling entry points.
 Initialization defaults to fresh weights; an optional verified transfer initializes only the main input token embedding from an existing checkpoint.
+The same loader accepts a full checkpoint or a checkpoint containing only `transformer.wte.weight`; [H100 RLM handoff](../h100-training/H100_RLM.md) documents pretraining with the supplied asset bundle.
 The existing d24 production artifacts remain under `~/.cache/nanochat/spark-d24`.
 New runs use the repository's `training_run/<name>/`, selected with `NANOCHAT_RUN_NAME`; the default name is `pretrain-1`.
 The tokenizer lives in `<run>/tokenizer`, training and probe outputs default to `<run>/train`, and profiles default to `<run>/profiles/<UTC timestamp>`.
@@ -34,7 +35,8 @@ Input normalization, smear, and the initial residual operate across the combined
 RoPE positions restart at zero each cycle.
 The summary and `<EOM>` parameters use AdamW groups with the embedding learning-rate policy.
 By default all model parameters remain trainable, including the main input embedding, additional value embeddings, and untied LM head.
-For a run initialized from a pretrained input table, `--freeze-input-embedding` holds only that table fixed until the final 10% of the full training budget.
+For a run initialized from a pretrained input table, `--input-embedding-freeze scheduled` holds only that table fixed until the final 10% of the full training budget.
+Use `--input-embedding-freeze permanent` to keep the table frozen for the entire budget, or `none` to train it throughout.
 The separate `<EOM>` and summary inputs, additional value embeddings, LM head, and Transformer stay trainable throughout; the tokenizer vocabulary is unchanged.
 The other proposed boundary/type tokens and auxiliary classification loss remain deferred.
 
@@ -65,6 +67,9 @@ uv run --no-sync python -m scripts.rlm_train \
 ```
 
 The probe completes two full optimizer updates without evaluation or checkpoint saving.
+The separate `--mode capacity-probe` executes exactly one complete optimizer update with optimizer state allocated before its first forward and, on CUDA, reusable pinned checkpoint buffers already resident.
+It accepts only explicit `none` or `permanent` input-embedding policies, discards its updated weights, and writes a structured result for the H100 launcher's ordered selection.
+This measures capacity with the required persistent allocations; it does not measure warmed throughput or checkpoint disk-writing time.
 It starts without activation checkpointing and compiles the cycle forward with separate first-cycle and recurrent shapes.
 Optimizer kernels also compile, even with `--no-compile` for the model.
 The first update includes compilation and lazy optimizer-state creation; the second includes resident optimizer state throughout forward/backward.
@@ -162,6 +167,15 @@ A durable retirement record permits an interrupted deletion to finish safely on 
 There is no live episode memory or partial gradient accumulation at this boundary.
 The default free-space reserve for checkpoint saving is 100 GB.
 
+Runs using either pretrained input-table freeze policy also preserve `checkpoints/pretrain-90pct.pt` at `floor(9 * num_iterations / 10)` completed updates, provided that boundary is positive.
+For 5574 updates, this is update 5016, before the scheduled policy enables gradients at update 5017; a permanent-freeze run retains the same progress milestone without unfreezing.
+The writer durably copies the complete published rolling bundle, retaining model, optimizer, RNG, loader progress, and metadata while keeping `latest.pt` available.
+This immutable file survives numbered-checkpoint retention and requires space for one additional full checkpoint.
+Once saved, the first milestone is retained even if a resumed run's update budget moves the 90% boundary.
+Training waits for its durable publication before beginning the next forward; a failure stops training rather than proceeding without the requested milestone.
+Resume repairs a pending milestone copy from `latest.pt` before training continues, including after a budget change.
+If the current boundary is already past and no milestone was saved or pending, resume continues without creating a historical checkpoint.
+
 To pause reproducibly at an update boundary, add `--stop-after-step 10` to the training command.
 Stopping the service uses the most recent fully published rolling checkpoint; it does not invoke a signal-time save.
 To continue the same training setup, repeat the original model/training and checkpoint-policy options, keep the original `--num-iterations`, and add `--resume-latest` while removing the earlier stop flag and any initialization flags.
@@ -185,9 +199,29 @@ The system-memory sampler spans training and checkpointing; async per-update CUD
 Writer durations overlap update durations in async mode and must not be added to estimate total runtime.
 Numbered saves add another write on their scheduled updates.
 
+### Export a portable input embedding
+
+The initialization loader accepts both full model checkpoints and compact checkpoints containing only `transformer.wte.weight`.
+Export the original pretrained table and its matching tokenizer before transferring them to another machine:
+
+```bash
+CUDA_VISIBLE_DEVICES='' uv run --no-sync python -m scripts.rlm_export_embedding \
+    --checkpoint-dir /path/to/base_checkpoints/spark-d24-bf16 \
+    --step 5568 \
+    --tokenizer-dir /path/to/tokenizer \
+    --output-dir /path/to/embedding-seed
+```
+
+The output directory must be new and its parent must already exist.
+The bundle contains `model_005568.pt`, `meta_005568.json`, `tokenizer.pkl`, `token_bytes.pt`, and `manifest.json`; the model file contains a cloned input table, and the manifest records payload checksums and original checkpoint provenance.
+Copy the complete directory to the target machine and install its matching tokenizer assets in the selected run's tokenizer directory.
+The existing `--init-embedding-checkpoint-dir`, `--init-embedding-step`, and `--init-embedding-tokenizer` options accept the compact checkpoint through the same loader as a full checkpoint.
+Only the input table is copied into a fresh RLM; the remaining model weights and optimizer start fresh.
+Resume uses the saved RLM checkpoint and omits initialization flags.
+
 ### New run with scheduled input-embedding freezing
 
-Use `--freeze-input-embedding` together with the three `--init-embedding-*` options for a fresh run.
+Use `--input-embedding-freeze scheduled` together with the three `--init-embedding-*` options for a fresh run.
 Only the pretrained `transformer.wte.weight` table is frozen; copying happens before the freeze is applied, and the new `<EOM>` and summary parameters retain their fresh, trainable initialization.
 The table receives no gradient, weight decay, or Adam state updates while frozen.
 Its optimizer group remains in place, and its Adam moments are created on the first trainable update, using the learning rate at that point in the original schedule.
@@ -197,7 +231,8 @@ The initial configuration logs this boundary, and each update logs `input_embedd
 The compiled forward/backward may compile again when the table becomes trainable.
 
 The freeze policy is part of the saved training configuration.
-To preserve this experiment's freeze schedule, resume with `--freeze-input-embedding` and the original full `--num-iterations`, and omit the three initialization options.
+The current CLI expresses it with `--input-embedding-freeze`; historical Spark invocations used the former scheduled-only `--freeze-input-embedding` flag and retain their original source snapshots.
+To preserve this experiment's freeze schedule, resume with `--input-embedding-freeze scheduled` and the original full `--num-iterations`, and omit the three initialization options.
 Resume restores trained weights and optimizer state; the current freeze policy, update budget, and completed checkpoint step determine the phase.
 Keeping the policy and budget unchanged preserves the original schedule, while changing them changes the schedule without requiring configuration equality.
 Freezing a run without pretrained initialization provenance is rejected.

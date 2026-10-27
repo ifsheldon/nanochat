@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "kind": "pretrained_input_token_embedding",
+  "parameter": "transformer.wte.weight",
+  "step": 5568,
+  "vocab_size": 32768,
+  "embedding_shape": [
+    32768,
+    1536
+  ],
+  "embedding_dtype": "torch.bfloat16",
+  "embedding_sha256": "f90f29486ceab73ba5012edbe008f42f7962236706e941949d7dfe3a47b103c3",
+  "source_checkpoint": {
+    "name": "model_005568.pt",
+    "sha256": "7912132f83397ce2754debd6d16e37e0ac2e4ef07c69242673939deac316c391"
+  },
+  "files": {
+    "model_005568.pt": "98f71bdc42102271b05bebfe78a092f8d9431754d6c7e29146e50c0f123b305e",
+    "meta_005568.json": "e6cd3db5ff67b97e15ef1bbfe8e549408073d640697eceb20e4f8cd98b5f1907",
+    "tokenizer.pkl": "387cfc082b0bee45467774fd6f1310a922ad170886a58ccddcb468f275e06a6c",
+    "token_bytes.pt": "83d26aaa5585cfc9a3dbe68aa519ba5591049dfc391bdcf6efde529ef481bfae"
+  }
+}

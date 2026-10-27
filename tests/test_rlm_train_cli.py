@@ -181,7 +181,7 @@ def test_frozen_pretrained_embedding_resumes_exactly_before_and_after_unfreezing
     caplog.set_level(logging.INFO, logger=rlm_train.logger.name)
     source_dir, source_tokenizer, source_embedding = training_environment
     init_args = source_arguments(source_dir, source_tokenizer)
-    policy_args = ("--freeze-input-embedding", "--num-iterations", "20", "--total-batch-size", "32")
+    policy_args = ("--input-embedding-freeze", "scheduled", "--num-iterations", "20", "--total-batch-size", "32")
     initialized_models = []
     parameter_ids = []
     build_optimizer = training_module.build_optimizer
@@ -246,7 +246,7 @@ def test_frozen_pretrained_embedding_resumes_exactly_before_and_after_unfreezing
         assert not torch.equal(frozen_model[name], initialized_models[-1][name])
         assert frozen_optimizer["state"][parameter_ids[-1][name]]["step"] == 18
     saved_contract = json.loads((resumed_dir / "run.json").read_text())["contract"]
-    assert saved_contract["training_config"]["freeze_input_embedding"] is True
+    assert saved_contract["training_config"]["input_embedding_freeze"] == "scheduled"
     assert saved_contract["training_config"]["num_iterations"] == 20
     assert frozen_metadata["run_contract"] == saved_contract
     assert frozen_metadata["dataloader_state_dict"] == {"consumed": 36}
@@ -287,7 +287,7 @@ def test_resume_rejects_freezing_random_initialization(training_environment, tmp
     previous_metadata = latest.metadata()
     with pytest.raises(ValueError, match="pretrained"):
         run_attempt(arguments(
-            monkeypatch, output_dir, "--resume-latest", "--freeze-input-embedding",
+            monkeypatch, output_dir, "--resume-latest", "--input-embedding-freeze", "scheduled",
         ), "reject-freeze")
     assert latest.metadata() == previous_metadata
 
@@ -300,14 +300,14 @@ def test_resume_uses_changed_embedding_freeze_schedule_and_training_budget(
 
     source_dir, source_tokenizer, _ = training_environment
     output_dir = tmp_path / "changed-schedule"
-    freeze_args = ("--freeze-input-embedding",) if initially_frozen else ()
+    freeze_args = ("--input-embedding-freeze", "scheduled",) if initially_frozen else ()
     run_attempt(arguments(
         monkeypatch, output_dir, *source_arguments(source_dir, source_tokenizer), *freeze_args,
         "--num-iterations", "10", "--stop-after-step", "1",
     ), "original")
     latest = LatestCheckpoint(output_dir / "checkpoints")
     previous_model, _, _ = latest.load(torch.device("cpu"))
-    changed_args = () if initially_frozen else ("--freeze-input-embedding",)
+    changed_args = () if initially_frozen else ("--input-embedding-freeze", "scheduled",)
     run_attempt(arguments(
         monkeypatch, output_dir, *changed_args, "--num-iterations", "12", "--resume-latest",
         "--stop-after-step", "2",
@@ -315,7 +315,8 @@ def test_resume_uses_changed_embedding_freeze_schedule_and_training_budget(
     model, _, metadata = latest.load(torch.device("cpu"))
     assert metadata["step"] == 2
     assert metadata["training_config"]["num_iterations"] == 12
-    assert metadata["training_config"]["freeze_input_embedding"] is (not initially_frozen)
+    expected_freeze = "none" if initially_frozen else "scheduled"
+    assert metadata["training_config"]["input_embedding_freeze"] == expected_freeze
     if initially_frozen:
         assert not torch.equal(model["transformer.wte.weight"], previous_model["transformer.wte.weight"])
     else:
@@ -847,7 +848,7 @@ def test_probe_does_not_publish_checkpoints(training_environment, tmp_path, monk
 
 
 @pytest.mark.parametrize("extra,match", [
-    (("--freeze-input-embedding",), "embedding"),
+    (("--input-embedding-freeze", "scheduled",), "embedding"),
     (("--init-embedding-checkpoint-dir", "source"), "requires checkpoint directory, step, and source tokenizer together"),
     (("--init-embedding-step", "7", "--init-embedding-tokenizer", "tokenizer.pkl"), "requires checkpoint directory, step, and source tokenizer together"),
     (("--init-embedding-checkpoint-dir", "source", "--init-embedding-step", "7", "--init-embedding-tokenizer", "tokenizer.pkl", "--resume-from-step", "3"), "fresh-run only"),

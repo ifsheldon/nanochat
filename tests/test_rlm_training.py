@@ -189,7 +189,7 @@ def test_compiled_update_unfreezes_input_embedding_at_final_tenth(monkeypatch, i
     forward = torch.compile(model.forward_cycle, backend="aot_eager", dynamic=False)
     config = TrainingConfig(
         device_batch_size=2, total_batch_size=16, num_iterations=10,
-        freeze_input_embedding=True,
+        input_embedding_freeze="scheduled",
     )
     input_embedding = model.transformer.wte.weight
     initial_input_embedding = input_embedding.detach().clone()
@@ -238,7 +238,7 @@ def test_invalid_episode_never_updates_parameters(failure):
     optimizer = RecordingSGD(model.parameters())
     config = TrainingConfig(
         device_batch_size=2, total_batch_size=16, compile=False,
-        freeze_input_embedding=failure == "unexpectedly_frozen_parameter",
+        input_embedding_freeze="scheduled" if failure == "unexpectedly_frozen_parameter" else "none",
     )
     error = RuntimeError if failure in ("missing_gradient", "unexpectedly_frozen_parameter") else FloatingPointError
     with pytest.raises(error, match="[Mm]issing gradient|[Nn]on-finite"):

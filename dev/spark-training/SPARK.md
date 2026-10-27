@@ -71,7 +71,8 @@ Verify changes with `OMP_NUM_THREADS=1 uv run --no-sync python -m pytest -q`, `u
 ## Small experiment workflow
 
 Run the existing six-layer demo from `runs/runcpu.sh` on the Spark's single CUDA GPU with `runs/runspark.sh`.
-The runner uses PyTorch 2.14.0 from the official stable CUDA 13.2 wheel index, with Triton 3.8.0 and locked dependencies.
+On Linux ARM64, the GPU extra selects PyTorch 2.14.0 from the official stable CUDA 13.2 wheel index, with Triton 3.8.0 and locked dependencies.
+The same configuration selects PyTorch 2.14.1 with CUDA 12.6 on Linux x86-64 for the H100 workflow; switching branches is not needed to select the Spark build.
 It requires `uv`, a C compiler for PyTorch compilation, and a working NVIDIA driver.
 The CUDA runtime libraries are installed inside the Python environment by uv; the system CUDA toolkit is separate.
 The runner uses Triton's bundled assembler, with no `TRITON_PTXAS_PATH` override.

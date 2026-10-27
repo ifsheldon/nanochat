@@ -14,6 +14,9 @@ import pytest
 from scripts import h100_rlm as launcher
 
 
+TEST_MODEL_PROFILE = launcher.REPOSITORY / "model_profiles" / "rlm-d24.jsonc"
+
+
 def argument(command, name):
     return command[command.index(name) + 1]
 
@@ -63,7 +66,7 @@ def fake_probe_runner(outcomes, commands):
 def test_capacity_selection_respects_order_and_records_correct_production_phase(tmp_path, outcomes, selected):
     commands = []
     recipe = launcher.choose_recipe(tmp_path / "output", tmp_path / "assets", {}, tmp_path,
-                                    fake_probe_runner(outcomes, commands))
+                                    fake_probe_runner(outcomes, commands), model_profile=TEST_MODEL_PROFILE)
     assert recipe == launcher.RECIPES[selected]
     assert len(commands) == len(outcomes)
     for command, expected in zip(commands, launcher.RECIPES):
@@ -71,9 +74,11 @@ def test_capacity_selection_respects_order_and_records_correct_production_phase(
         assert argument(command, "--input-embedding-freeze") == expected.probe_freeze
         assert argument(command, "--device-batch-size") == str(expected.device_batch_size)
         assert argument(command, "--num-iterations") == "5574"
-        assert int(argument(command, "--total-batch-size")) == expected.device_batch_size * expected.accumulation_steps * 4 * 1023
+        assert int(argument(command, "--total-batch-size")) == 1047552
+        assert argument(command, "--model-profile").endswith("model_profiles/rlm-d24.jsonc")
+        assert "--depth" not in command and "--text-length" not in command
         assert "--save-every" not in command
-    production = launcher.training_arguments(recipe, tmp_path / "train", assets=tmp_path / "assets")
+    production = launcher.training_arguments(recipe, tmp_path / "train", assets=tmp_path / "assets", model_profile=TEST_MODEL_PROFILE)
     assert argument(production, "--input-embedding-freeze") == ("permanent" if selected == 1 else "scheduled")
     assert argument(production, "--save-every") == "10"
 
@@ -82,7 +87,7 @@ def test_all_capacity_failures_abort_without_fourth_recipe(tmp_path):
     commands = []
     with pytest.raises(RuntimeError, match="WARNING: all three"):
         launcher.choose_recipe(tmp_path / "output", tmp_path / "assets", {}, tmp_path,
-                               fake_probe_runner(["oom"] * 3, commands))
+                               fake_probe_runner(["oom"] * 3, commands), model_profile=TEST_MODEL_PROFILE)
     assert len(commands) == 3
     assert not (tmp_path / "output" / "selected-recipe.json").exists()
 
@@ -97,7 +102,7 @@ def test_unclassified_failures_do_not_silently_change_recipe(tmp_path, failure):
     commands = []
     with pytest.raises(RuntimeError, match="other than GPU memory capacity"):
         launcher.choose_recipe(tmp_path / "output", tmp_path / "assets", {}, tmp_path,
-                               fake_probe_runner([failure], commands))
+                               fake_probe_runner([failure], commands), model_profile=TEST_MODEL_PROFILE)
     assert len(commands) == 1
 
 
@@ -113,7 +118,7 @@ def test_probe_without_resident_memory_contract_is_not_accepted(tmp_path, missin
         (path / "result.json").write_text(json.dumps(result))
         return 0
     with pytest.raises(RuntimeError, match="other than GPU memory capacity"):
-        launcher.choose_recipe(tmp_path / "output", tmp_path / "assets", {}, tmp_path, run)
+        launcher.choose_recipe(tmp_path / "output", tmp_path / "assets", {}, tmp_path, run, model_profile=TEST_MODEL_PROFILE)
     assert len(calls) == 1
 
 
@@ -124,6 +129,9 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     output = tmp_path / "output"
     assets = tmp_path / "assets"
     assets.mkdir()
+    source_profile = tmp_path / "selected.jsonc"
+    profile_text = "// Preserve this original profile comment.\n" + TEST_MODEL_PROFILE.read_text()
+    source_profile.write_text(profile_text)
     calls = []
     environments = []
     monkeypatch.setattr(launcher, "get_datasets_dir", lambda: tmp_path / "datasets")
@@ -164,6 +172,15 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
         if command[2] == "nanochat.dataset":
             assert command[3:] == ["-n", "170"]
             return 0
+        assert argument(command, "--total-batch-size") == "1047552"
+        selected_profile = Path(argument(command, "--model-profile"))
+        assert selected_profile.read_text() == profile_text
+        if "--resume-latest" in command:
+            assert selected_profile == output / "train" / "checkpoints" / "model-profile.jsonc"
+        else:
+            assert selected_profile == output / "model-profile.jsonc"
+        # A source edit after selection must never alter subsequent stages.
+        source_profile.write_text("{}")
         workers = next((int(value.split("=")[1]) for value in command
                         if value.startswith("--nproc-per-node=")), 1)
         destination = Path(argument(command, "--output-dir"))
@@ -185,9 +202,10 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
             return 0
         (destination / "checkpoints").mkdir(exist_ok=True)
         (destination / "checkpoints" / "latest.pt").write_bytes(b"checkpoint")
+        (destination / "checkpoints" / "model-profile.jsonc").write_text(selected_profile.read_text())
         return 0
     monkeypatch.setattr(launcher, "run_logged", run)
-    launcher.launch(launcher.parse_args(["--num-gpus", str(initial_gpus), "--assets", str(assets), *destination]))
+    launcher.launch(launcher.parse_args(["--num-gpus", str(initial_gpus), "--assets", str(assets), "--model-profile", str(source_profile), *destination]))
     saved = json.loads((output / "selected-recipe.json").read_text())
     assert saved["recipe"] == asdict(launcher.RECIPES[1])
     assert saved["num_gpus"] == initial_gpus
@@ -206,6 +224,8 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     assert argument(calls[-1], "--input-embedding-freeze") == "permanent"
     calls.clear()
     environments.clear()
+    source_profile.unlink()
+    (output / "model-profile.jsonc").unlink()
     inventories["dataset"]["shard"] = "changed"
     inventories["tokenizer"]["tokenizer.pkl"] = "changed"
     saved["production_arguments"][saved["production_arguments"].index("--num-iterations") + 1] = "10"
@@ -213,7 +233,8 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     monkeypatch.setattr(launcher, "prepare_assets", lambda *_: pytest.fail("resume must not initialize assets"))
     monkeypatch.setattr(launcher, "verify_dataset", lambda *_: pytest.fail("resume must not scan dataset identity"))
     monkeypatch.setattr(launcher, "tokenizer_inventory", lambda *_: pytest.fail("resume must not scan tokenizer identity"))
-    launcher.launch(launcher.parse_args(["--num-gpus", str(resume_gpus), "--resume", *destination]))
+    launcher.launch(launcher.parse_args(["--num-gpus", str(resume_gpus), "--resume", *destination,
+                                        "--model-profile", str(output / "train" / "checkpoints" / "model-profile.jsonc")]))
     assert len(calls) == 1
     expected_prefix = [sys.executable, "-m", "scripts.rlm_train"]
     if resume_gpus > 1:
@@ -233,7 +254,10 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     assert environments[0]["NANOCHAT_ATTENTION_IMPL"] == selected
     alternate = tmp_path / "other-datasets"
     (tmp_path / "datasets").rename(alternate)
-    launcher.launch(launcher.parse_args(["--num-gpus", str(resume_gpus), "--resume", *destination, "--datasets-dir", str(alternate)]))
+    equivalent_profile = tmp_path / "equivalent.jsonc"
+    equivalent_profile.write_text(profile_text.replace("Preserve this original profile comment.", "Equivalent profile, different comment."))
+    launcher.launch(launcher.parse_args(["--num-gpus", str(resume_gpus), "--resume", *destination,
+                                        "--datasets-dir", str(alternate), "--model-profile", str(equivalent_profile)]))
     assert len(calls) == 2
     assert calls[1] == calls[0]
     assert environments[1]["NANOCHAT_DATASETS_DIR"] == str(alternate)
@@ -262,7 +286,7 @@ def test_attention_selection_compares_the_same_recipe_and_uses_fastest_valid_bac
         (path / "result.json").write_text(json.dumps(passed_attention_result(backend, duration)))
         return 0
 
-    result = launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", environment, tmp_path, run)
+    result = launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", environment, tmp_path, run, model_profile=TEST_MODEL_PROFILE)
     assert result["selected"] == selected
     assert calls == ["sdpa", "fa3"]
     assert environment["NANOCHAT_ATTENTION_IMPL"] == "sdpa"
@@ -304,7 +328,7 @@ def test_flash_attention_probe_failures_preserve_successful_sdpa(tmp_path, failu
         (path / "result.json").write_text(json.dumps(result))
         return 0
 
-    result = launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", {}, tmp_path, run)
+    result = launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", {}, tmp_path, run, model_profile=TEST_MODEL_PROFILE)
     assert result["selected"] == "sdpa"
     assert result["measurements"]["sdpa"]["duration_seconds"] == 20
     assert result["measurements"]["fa3"]["status"] == "failed"
@@ -318,7 +342,7 @@ def test_sdpa_attention_probe_failure_stops_before_optional_flash_probe(tmp_path
         return 1
 
     with pytest.raises(RuntimeError, match="SDPA attention probe failed"):
-        launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", {}, tmp_path, run)
+        launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", {}, tmp_path, run, model_profile=TEST_MODEL_PROFILE)
     assert calls == ["sdpa"]
 
 
@@ -378,7 +402,7 @@ def test_wrong_phase_or_failed_health_checks_cannot_select_recipe(tmp_path, fiel
         (path / "result.json").write_text(json.dumps(result))
         return 0
     with pytest.raises(RuntimeError, match="other than GPU memory capacity"):
-        launcher.choose_recipe(tmp_path / "output", tmp_path / "assets", {}, tmp_path, run)
+        launcher.choose_recipe(tmp_path / "output", tmp_path / "assets", {}, tmp_path, run, model_profile=TEST_MODEL_PROFILE)
 
 
 def test_parent_directory_components_are_rejected_before_normalization(tmp_path):
@@ -393,7 +417,7 @@ def test_signal_termination_does_not_trigger_fallback_even_with_oom_result(tmp_p
         writer(*args)
         return -9
     with pytest.raises(RuntimeError, match="other than GPU memory capacity"):
-        launcher.choose_recipe(tmp_path / "output", tmp_path / "assets", {}, tmp_path, run)
+        launcher.choose_recipe(tmp_path / "output", tmp_path / "assets", {}, tmp_path, run, model_profile=TEST_MODEL_PROFILE)
     assert len(calls) == 1
 
 
@@ -431,7 +455,7 @@ def test_probe_symlink_is_rejected_before_dispatch_or_external_writes(tmp_path):
     def run(*_):
         pytest.fail("A probe must not launch through a symlinked output ancestor")
     with pytest.raises(ValueError, match="symlinks"):
-        launcher.choose_recipe(output, tmp_path / "assets", {}, tmp_path, run)
+        launcher.choose_recipe(output, tmp_path / "assets", {}, tmp_path, run, model_profile=TEST_MODEL_PROFILE)
     assert list(outside.iterdir()) == []
 
 
@@ -448,7 +472,7 @@ def test_log_symlink_is_rejected_before_external_directory_creation(tmp_path, mo
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(launcher, "check_gpu", lambda: pytest.fail("Symlink validation must precede GPU initialization"))
     with pytest.raises(ValueError, match="symlinks"):
-        launcher.launch(launcher.parse_args(["--num-gpus", "1", "--assets", str(assets), "--output-dir", str(output)]))
+        launcher.launch(launcher.parse_args(["--num-gpus", "1", "--assets", str(assets), "--model-profile", str(TEST_MODEL_PROFILE), "--output-dir", str(output)]))
     assert list(outside.iterdir()) == []
 
 
@@ -463,7 +487,7 @@ def test_wrapper_sets_run_local_download_caches_before_uv_without_shell_interpol
     for name in ("UV_CACHE_DIR", "HF_XET_CACHE"):
         environment.pop(name, None)
     result = subprocess.run(
-        ["bash", "runs/runh100_rlm.sh", "--num-gpus", "1", "--assets", str(tmp_path / "seed"), "--output-dir", str(run)],
+        ["bash", "runs/runh100_rlm.sh", "--num-gpus", "1", "--model-profile", str(TEST_MODEL_PROFILE), "--assets", str(tmp_path / "seed"), "--output-dir", str(run)],
         cwd=launcher.REPOSITORY, env=environment, capture_output=True, text=True, check=True,
     )
     recorded = json.loads(result.stdout)
@@ -476,6 +500,7 @@ def test_wrapper_sets_run_local_download_caches_before_uv_without_shell_interpol
         ["bash", "runs/runh100_rlm.sh", "--num-gpus", "1", "--assets", "missing", "--help"],
         cwd=launcher.REPOSITORY, env=environment, capture_output=True, text=True, check=True,
     )
+    assert "--model-profile" in help_result.stdout
     assert "--run-name" in help_result.stdout and '"uv_cache"' not in help_result.stdout
 
 
@@ -489,7 +514,7 @@ def test_wrapper_preserves_explicit_uv_and_xet_cache_locations(tmp_path):
                        UV_CACHE_DIR=str(tmp_path / "shared-uv"), HF_XET_CACHE=str(tmp_path / "shared-xet"))
     run = tmp_path / "run"
     result = subprocess.run(
-        ["bash", "runs/runh100_rlm.sh", "--num-gpus", "1", "--assets", str(tmp_path / "seed"), "--output-dir", str(run)],
+        ["bash", "runs/runh100_rlm.sh", "--num-gpus", "1", "--model-profile", str(TEST_MODEL_PROFILE), "--assets", str(tmp_path / "seed"), "--output-dir", str(run)],
         cwd=launcher.REPOSITORY, env=environment, capture_output=True, text=True, check=True,
     )
     assert json.loads(result.stdout) == [str(tmp_path / "shared-uv"), str(tmp_path / "shared-xet")]
@@ -500,6 +525,7 @@ def test_wrapper_preserves_explicit_uv_and_xet_cache_locations(tmp_path):
 @pytest.mark.parametrize("count", [None, "0", "3", "8"])
 def test_cli_requires_an_explicit_supported_gpu_count(resume, count):
     arguments = ["--resume"] if resume else ["--assets", "/seed"]
+    arguments.extend(("--model-profile", str(TEST_MODEL_PROFILE)))
     if count is not None:
         arguments.extend(("--num-gpus", count))
     with pytest.raises(SystemExit) as exc:
@@ -590,7 +616,7 @@ def test_multi_gpu_capacity_probes_preserve_fallback_and_require_matching_worker
             result["world_size"] = num_gpus
         (destination / "result.json").write_text(json.dumps(result))
         return 1 if len(calls) == 1 else 0
-    recipe = launcher.choose_recipe(tmp_path, tmp_path / "assets", {}, tmp_path, run, num_gpus=num_gpus)
+    recipe = launcher.choose_recipe(tmp_path, tmp_path / "assets", {}, tmp_path, run, num_gpus=num_gpus, model_profile=TEST_MODEL_PROFILE)
     assert recipe == launcher.RECIPES[1]
     assert len(calls) == 2
 
@@ -598,7 +624,7 @@ def test_multi_gpu_capacity_probes_preserve_fallback_and_require_matching_worker
 @pytest.mark.parametrize("outcome", ["success", "oom"])
 def test_capacity_probe_cannot_select_result_from_another_worker_count(tmp_path, outcome):
     with pytest.raises(RuntimeError, match="other than GPU memory capacity"):
-        launcher.choose_recipe(tmp_path, tmp_path / "assets", {}, tmp_path, fake_probe_runner([outcome] * 3, []), num_gpus=2)
+        launcher.choose_recipe(tmp_path, tmp_path / "assets", {}, tmp_path, fake_probe_runner([outcome] * 3, []), num_gpus=2, model_profile=TEST_MODEL_PROFILE)
 
 
 @pytest.mark.parametrize("num_gpus", [2, 4])
@@ -613,7 +639,7 @@ def test_attention_probe_requires_matching_worker_count(tmp_path, num_gpus):
         (destination / "result.json").write_text(json.dumps(result))
         return 0
     with pytest.raises(RuntimeError, match="SDPA attention probe failed"):
-        launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", {}, tmp_path, run, num_gpus=num_gpus)
+        launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", {}, tmp_path, run, num_gpus=num_gpus, model_profile=TEST_MODEL_PROFILE)
     assert len(calls) == 1
 
 
@@ -624,10 +650,90 @@ def test_wrapper_rejects_missing_gpu_count_before_running_uv(tmp_path):
     uv.write_text("#!/bin/sh\nexit 99\n")
     uv.chmod(0o700)
     result = subprocess.run(
-        ["bash", "runs/runh100_rlm.sh", "--resume", "--output-dir", str(tmp_path / "run")],
+        ["bash", "runs/runh100_rlm.sh", "--resume", "--model-profile", str(TEST_MODEL_PROFILE), "--output-dir", str(tmp_path / "run")],
         cwd=launcher.REPOSITORY, env=dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"]),
         capture_output=True, text=True,
     )
     assert result.returncode == 2
     assert "--num-gpus" in result.stderr
     assert not (tmp_path / "run").exists()
+
+
+@pytest.mark.parametrize("num_gpus,expected", [(1, 24), (2, 12), (4, 6)])
+@pytest.mark.parametrize("recipe_index,factor", [(0, 1), (1, 1), (2, 2)])
+def test_accumulation_uses_profile_text_length_and_worker_count(num_gpus, expected, recipe_index, factor):
+    assert launcher.accumulation_steps(launcher.RECIPES[recipe_index], 341, num_gpus) == expected * factor
+
+
+def test_resume_rejects_conflicting_explicit_profile_before_gpu_work(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    checkpoints = output / "train" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    profile = {"n_layer": 24, "n_embd": 1536, "n_head": 12, "n_kv_head": 12,
+               "text_length": 1023, "memory_tokens": 512, "eom_tokens": 1}
+    (checkpoints / "model-profile.jsonc").write_text(json.dumps(profile))
+    (checkpoints / "latest.pt").write_bytes(b"checkpoint")
+    explicit = tmp_path / "other.jsonc"
+    explicit.write_text(json.dumps(dict(profile, n_kv_head=4)))
+    (tmp_path / "datasets").mkdir()
+    (output / "selected-recipe.json").write_text(json.dumps({
+        "schema_version": 3, "recipe": asdict(launcher.RECIPES[0]), "num_gpus": 1,
+        "accumulation_steps": 8, "datasets_directory": str(tmp_path / "datasets"),
+    }))
+    monkeypatch.setattr(launcher, "check_gpu", lambda *_: pytest.fail("profile mismatch must precede GPU work"))
+    args = launcher.parse_args(["--num-gpus", "1", "--resume", "--output-dir", str(output),
+                                "--model-profile", str(explicit)])
+    with pytest.raises(ValueError, match="profile.*differ|differ.*profile"):
+        launcher.launch(args)
+    assert json.loads((checkpoints / "model-profile.jsonc").read_text()) == profile
+
+
+@pytest.mark.parametrize("text_length", [342, 1047552])
+def test_accumulation_rejects_profile_lengths_that_cannot_form_global_batch(text_length):
+    with pytest.raises(ValueError, match="global batch.*divisible"):
+        launcher.accumulation_steps(launcher.RECIPES[0], text_length, 1)
+
+
+def test_resume_can_supply_missing_checkpoint_profile_explicitly(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    checkpoints = output / "train" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "latest.pt").write_bytes(b"checkpoint")
+    explicit = tmp_path / "selected.jsonc"
+    text = "// Profile supplied when restoring a checkpoint.\n" + json.dumps({
+        "n_layer": 24, "n_embd": 1536, "n_head": 12, "n_kv_head": 4,
+        "text_length": 341, "memory_tokens": 512, "eom_tokens": 1,
+    })
+    explicit.write_text(text)
+    datasets = tmp_path / "datasets"
+    datasets.mkdir()
+    (output / "selected-recipe.json").write_text(json.dumps({
+        "schema_version": 3, "recipe": asdict(launcher.RECIPES[0]), "num_gpus": 1,
+        "accumulation_steps": 24, "datasets_directory": str(datasets),
+        "environment": {"NANOCHAT_ATTENTION_IMPL": "sdpa"},
+    }))
+    monkeypatch.setattr(launcher, "check_gpu", lambda *_: {"allocator_limit_gb": 80, "visible_devices": "0,1"})
+    monkeypatch.setattr(launcher, "require_disk_space", lambda *_: None)
+    commands = []
+    def run(command, log_path, environment):
+        commands.append(command)
+        selected = Path(argument(command, "--model-profile"))
+        assert selected == output / "model-profile.jsonc"
+        assert selected.read_text() == text
+        assert "--resume-latest" in command and "--init-embedding-bundle" not in command
+        return 0
+    monkeypatch.setattr(launcher, "run_logged", run)
+    launcher.launch(launcher.parse_args(["--num-gpus", "2", "--resume", "--output-dir", str(output),
+                                        "--model-profile", str(explicit)]))
+    assert len(commands) == 1
+    invocation = next((output / "logs").glob("*/invocation.json"))
+    assert json.loads(invocation.read_text())["accumulation_steps"] == 12
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_model_profile_is_required_for_fresh_and_resumed_launches(resume):
+    arguments = ["--num-gpus", "1"]
+    arguments += ["--resume"] if resume else ["--assets", "/seed"]
+    with pytest.raises(SystemExit) as error:
+        launcher.parse_args(arguments)
+    assert error.value.code == 2

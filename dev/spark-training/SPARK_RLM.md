@@ -7,17 +7,22 @@ Initialization defaults to fresh weights; an optional verified transfer initiali
 The same loader accepts a full checkpoint or a checkpoint containing only `transformer.wte.weight`; [H100 RLM handoff](../h100-training/H100_RLM.md) documents pretraining with the supplied asset bundle.
 The existing d24 production artifacts remain under `~/.cache/nanochat/spark-d24`.
 New runs use the repository's `training_run/<name>/`, selected with `NANOCHAT_RUN_NAME`; the default name is `pretrain-1`.
-The tokenizer lives in `<run>/tokenizer`, training and probe outputs default to `<run>/train`, and profiles default to `<run>/profiles/<UTC timestamp>`.
+The tokenizer lives in `<run>/tokenizer`, training and probe outputs default to `<run>/train`, and operator-profiling reports default to `<run>/profiles/<UTC timestamp>`.
 `NANOCHAT_BASE_DIR` overrides the run root; `--output-dir` overrides only the particular command's output directory and does not relocate its tokenizer.
 Shared pretraining, task, and evaluation datasets default to the repository's `datasets/`, independently overridden by `NANOCHAT_DATASETS_DIR`.
 Set `NANOCHAT_TRAIN_SHARDS=170` for the Spark RLM recipe to select training shards 0–169 and validation shard 6542 even when the shared directory contains more shards.
-The dated measurements and historical commands below retain their original paths; existing files are not moved or copied automatically.
+The dated measurements and command examples below retain their original paths; existing files are not moved or copied automatically.
+Command examples are adapted to the current required `--model-profile` argument and freeze-policy syntax; the recorded launch files and source snapshots preserve the exact historical invocations.
 To evaluate, profile, or explicitly resume an existing cached run with current code, set both `NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24"` and `NANOCHAT_DATASETS_DIR="$HOME/.cache/nanochat/spark-d24"`, retain `NANOCHAT_TRAIN_SHARDS=170`, and pass the run's original `--checkpoint-dir`, `--run-config`, or `--output-dir` as appropriate.
 The old run root alone no longer selects its dataset, and changing the defaults does not modify an already running process.
 
 ## Model and data contract
 
-The default model has 24 layers, width 1536, 12 heads, full causal SDPA, and BF16 compute with the existing mixed parameter precision.
+Architecture must be selected with `--model-profile PATH` on every trainer invocation, including probes and resume; there is no default profile.
+The bundled [`model_profiles/rlm-d24.jsonc`](../../model_profiles/rlm-d24.jsonc) is a reference example selected explicitly in the commands below.
+The [profile guide](../../model_profiles/README.md) documents its seven fields, including `eom_tokens`, which must be the integer `1`.
+The reference model has 24 layers, width 1536, and 12 query and KV heads; the workflow uses full causal SDPA and BF16 compute with the existing mixed parameter precision.
+The separate RLM architecture CLI flags have been replaced by this profile; cycles and the remaining training/execution options stay on the CLI.
 Each episode starts with empty memory and contains two 1023-token text chunks.
 Every cycle places one learned `<EOM>` input between incoming memory and text, including the first cycle with empty memory.
 Each memory-writing cycle appends 512 copies of one trainable summary vector; their final normalized hidden states become the next cycle's 512-vector memory prefix.
@@ -63,6 +68,7 @@ Run from the repository root using the locked uv environment.
 ```bash
 NANOCHAT_RUN_NAME=spark-rlm-probe-b16 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_train \
+    --model-profile model_profiles/rlm-d24.jsonc \
     --mode probe \
     --device-batch-size 16
 ```
@@ -129,6 +135,7 @@ For example, after choosing a feasible device batch:
 ```bash
 NANOCHAT_RUN_NAME=spark-rlm-learning-20 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_train \
+    --model-profile model_profiles/rlm-d24.jsonc \
     --mode train --num-iterations 20 --warmup-steps 2 \
     --device-batch-size 16 --activation-checkpointing --save-every 10
 ```
@@ -140,6 +147,7 @@ Every run records its complete configuration and source fingerprint.
 Checkpoints are saved only after a completed optimizer update, with model, summary, and `<EOM>` parameters, optimizer state, PyTorch RNG state, last-consumed loader progress, and separate real-text, prediction, and internal-position counters.
 Cumulative token and internal-position totals preserve earlier updates when batch size or cycle count changes on resume.
 Training saves `checkpoints/latest.pt` after every completed update.
+Before the first save, it copies the originally loaded JSONC document to `checkpoints/model-profile.jsonc`, preserving comments and line endings; later saves reuse that copy.
 The default `--checkpoint-mode async` overlaps the save with the next update's forward and backward passes, then waits for the writer before the next optimizer step can change any saved tensors.
 One writer handles at most one checkpoint request at a time, including its numbered save and retention.
 On CUDA, the writer uses PyTorch's `DefaultStager` to copy into reusable pinned CPU buffers on a dedicated stream, then serializes the completed CPU snapshot.
@@ -179,7 +187,20 @@ If the current boundary is already past and no milestone was saved or pending, r
 
 To pause reproducibly at an update boundary, add `--stop-after-step 10` to the training command.
 Stopping the service uses the most recent fully published rolling checkpoint; it does not invoke a signal-time save.
-To continue the same training setup, repeat the original model/training and checkpoint-policy options, keep the original `--num-iterations`, and add `--resume-latest` while removing the earlier stop flag and any initialization flags.
+To continue the same training setup, repeat the original training and checkpoint-policy options, keep the original `--num-iterations`, and add `--resume-latest` while removing the earlier stop flag and any initialization flags.
+Resume requires `--model-profile PATH`; pass `OUTPUT/checkpoints/model-profile.jsonc` explicitly, where `OUTPUT` is the trainer's output directory, to use the saved document even after the original source profile has changed or been removed.
+You may instead pass a source profile with the same seven field values as the saved profile; if no saved profile exists, pass a profile matching the checkpoint's architecture for copying with the next checkpoint.
+For the bounded example above, resume after a completed checkpoint with:
+
+```bash
+NANOCHAT_RUN_NAME=spark-rlm-learning-20 NANOCHAT_TRAIN_SHARDS=170 \
+uv run --no-sync python -m scripts.rlm_train \
+    --model-profile training_run/spark-rlm-learning-20/train/checkpoints/model-profile.jsonc \
+    --mode train --num-iterations 20 --warmup-steps 2 \
+    --device-batch-size 16 --activation-checkpointing --save-every 10 \
+    --resume-latest
+```
+
 The explicit `--resume-from-step 10` option selects a numbered checkpoint and is mutually exclusive with `--resume-latest`.
 Only the newest published update across rolling and numbered checkpoints can be resumed; choosing an older step is rejected to protect newer published history.
 If a stop interrupted a numbered checkpoint save after the rolling checkpoint was published, latest resume repairs that exact numbered set from the rolling checkpoint and completes pending retention before training continues.
@@ -238,7 +259,7 @@ Resume restores trained weights and optimizer state; the current freeze policy, 
 Keeping the policy and budget unchanged preserves the original schedule, while changing them changes the schedule without requiring configuration equality.
 Freezing a run without pretrained initialization provenance is rejected.
 
-The fresh run was launched on October 10, 2026 at 00:57 SGT with committed training source `0bd758d2b56d1d8c9fe07bda80c36eb3be327d8f` and the following configuration:
+The fresh run was launched on October 10, 2026 at 00:57 SGT with committed training source `0bd758d2b56d1d8c9fe07bda80c36eb3be327d8f` and the following configuration, expressed with the current CLI:
 
 ```bash
 NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
@@ -247,13 +268,14 @@ NANOCHAT_CUDA_MEMORY_LIMIT_GB=100 \
 NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=12 \
 NANOCHAT_CHECKPOINT_RESERVE_GB=100 \
 uv run --no-sync python -m scripts.rlm_train \
+    --model-profile model_profiles/rlm-d24.jsonc \
     --mode train --num-iterations 5574 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing \
     --save-every 10 --keep-checkpoints 10 --checkpoint-mode async \
     --init-embedding-checkpoint-dir "$HOME/.cache/nanochat/spark-d24/base_checkpoints/spark-d24-bf16" \
     --init-embedding-step 5568 \
     --init-embedding-tokenizer "$HOME/.cache/nanochat/spark-d24/tokenizer/tokenizer.pkl" \
-    --freeze-input-embedding \
+    --input-embedding-freeze scheduled \
     --output-dir "$HOME/.cache/nanochat/spark-rlm/pretrain-u4-b32-frozen-20261010"
 ```
 
@@ -281,7 +303,7 @@ Rolling and numbered checkpoint 2490 had both been saved.
 On October 16 at 17:46 SGT, the same service was relaunched from that checkpoint with the approved 8 GB system-memory guard and the CLI at revision `269a269`.
 The resumed configuration retains the 5574-update budget, four cycles, batch 32, activation checkpointing, scheduled freezing through update 5016 with unfreezing at 5017, and asynchronous checkpointing with numbered saves every ten updates and ten retained numbered checkpoints.
 The 8 GB guard applies to this run; the general 16 GB default and the historical measurements above remain unchanged.
-The historical command below requires that recorded source revision and its CLI syntax.
+The command below expresses that resume configuration with the current CLI and explicitly selects the matching d24 reference profile because the historical run predates checkpoint profile copies.
 
 ```bash
 NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
@@ -294,6 +316,7 @@ NANOCHAT_CHECKPOINT_RESERVE_GB=100 \
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 \
 uv run --no-sync python -m scripts.rlm_train \
+    --model-profile model_profiles/rlm-d24.jsonc \
     --mode train --num-iterations 5574 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing \
     --save-every 10 --keep-checkpoints 10 --checkpoint-mode async \
@@ -341,6 +364,7 @@ NANOCHAT_CUDA_MEMORY_LIMIT_GB=100 \
 NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=12 \
 NANOCHAT_CHECKPOINT_RESERVE_GB=100 \
 uv run --no-sync python -m scripts.rlm_train \
+    --model-profile model_profiles/rlm-d24.jsonc \
     --mode train --num-iterations 5574 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing \
     --save-every 10 --keep-checkpoints 10 --checkpoint-mode async \
@@ -686,6 +710,7 @@ NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24" \
 NANOCHAT_CUDA_MEMORY_LIMIT_GB=100 \
 NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=12 \
 uv run --no-sync python -m scripts.rlm_train \
+    --model-profile model_profiles/rlm-d24.jsonc \
     --mode probe --num-iterations 2 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing \
     --output-dir "$HOME/.cache/nanochat/spark-rlm/probe-u4-b32"

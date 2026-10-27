@@ -1,0 +1,15 @@
+{
+  // Shared Transformer backbone.
+  "n_layer": 24,
+  "n_embd": 1536,
+  "n_head": 12,
+  "n_kv_head": 12,
+
+  // Per-cycle text and recurrent memory lengths.
+  "text_length": 1023,
+  "memory_tokens": 512,
+
+  // Exactly one end-of-memory token precedes the text; this must always be 1.
+  // Maximum sequence length = text_length + eom_tokens + 2 * memory_tokens.
+  "eom_tokens": 1
+}

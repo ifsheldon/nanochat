@@ -25,6 +25,7 @@ If two are approved, leave four-GPU behavior explicitly untested.
 
 ```bash
 CUDA_VISIBLE_DEVICES='' uv run --no-sync python -m pytest -q \
+    tests/test_model_profile.py tests/test_rlm_profile_training.py \
     tests/test_h100_rlm.py tests/test_optim_checkpoint.py \
     tests/test_optim_distributed_failures.py tests/test_rlm_distributed.py \
     tests/test_rlm_distributed_checkpoint.py tests/test_rlm_distributed_training.py \
@@ -45,6 +46,9 @@ Check losses, gradients, and model/Adam/Muon updates within appropriate numerica
 **Do not use `runs/runh100_rlm.sh` as a bounded test: it starts full pretraining after its probes and has no stop-limit passthrough.**
 Use the preparation, `choose_recipe`, `choose_attention`, `training_arguments`, and `training_command` helpers in [`scripts/h100_rlm.py`](../../scripts/h100_rlm.py), then invoke the trainer directly for bounded training.
 Keep the helper-generated environment, including tokenizer/data paths, GPU mask, dtype, attention backend, and memory reserves.
+Select a [JSONC model profile](../../model_profiles/README.md), preserve its original document in the scratch run, and pass the same `model_profile` path to `choose_recipe`, `choose_attention`, and `training_arguments`.
+Every trainer or launcher invocation requires `--model-profile PATH`, including resume; no profile is selected automatically.
+Use `model_profiles/rlm-d24.jsonc` for the full-size checks and a separate small profile for tiny-model tests; the former architecture CLI flags have been removed.
 
 - Run capacity and attention probes at each count intended for full-size validation, including the smaller counts needed for resume tests.
   Confirm the reported worker count, finite updates, local staging buffers and the coordinator's complete optimizer snapshot, memory headroom, and collective warmup completion.
@@ -52,6 +56,7 @@ Keep the helper-generated environment, including tokenizer/data paths, GPU mask,
 - Run at least three compiled d24 updates with asynchronous checkpoints by adding `--stop-after-step 3` to the trainer's training arguments.
   Keep `--num-iterations 5574`, the selected recipe, and 1,047,552 global text targets unchanged.
   Verify the update-2 numbered checkpoint, a complete rolling checkpoint at the final completed step, drained writers, and successful exit of all ranks.
+  Verify that `train/checkpoints/model-profile.jsonc` preserves the selected JSONC document, including comments.
 
 Capacity and attention modes do not accept early stopping, resume, or checkpoint-save options; their update limits are internal.
 They require embedding freeze `none` or `permanent`, not `scheduled`.
@@ -61,6 +66,7 @@ They require embedding freeze `none` or `permanent`, not `scheduled`.
 - Test `1 → 2 → 1`, or `1 → 2 → 4 → 1` when four GPUs are approved, using a common recipe that fits every tested count.
   Resume the same scratch training directory with `--resume-latest`, omit fresh embedding initialization, and advance `--stop-after-step` beyond the saved step for each bounded attempt.
   Verify loaded model weights, complete Adam/Muon state, completed step, and per-worker loader/RNG metadata before another healthy update.
+  Remove the original scratch profile source and pass `--model-profile OUTPUT/train/checkpoints/model-profile.jsonc` explicitly on resume to exercise the saved checkpoint copy, where `OUTPUT` is the scratch run root.
 - Keep the global batch fixed and confirm accumulation changes with worker count: batch 32 uses `8 / 4 / 2` microbatches for `1 / 2 / 4` GPUs; batch 16 uses `16 / 8 / 4`.
   Changed-count data continuation is approximate at row-group granularity, so production losses need not match bit-for-bit after resume.
 - Cover both frozen and trainable input-embedding optimizer state.
@@ -71,4 +77,4 @@ They require embedding freeze `none` or `permanent`, not `scheduled`.
 
 Report the commit, approved and tested GPU counts, device mask, selected batch/backend/freeze policy, commands, result/checkpoint paths, update timings, memory peaks, and any failures or untested cases.
 A stalled rank, non-finite state, incomplete checkpoint, incorrect resumed optimizer state, or exhausted memory headroom blocks pretraining until resolved.
-Ask the human to confirm the production GPU count and authorize the long run after reviewing the results, then use a fresh run name and the documented launcher command with explicit `--num-gpus`.
+Ask the human to confirm the production GPU count and authorize the long run after reviewing the results, then use a fresh run name and the documented launcher command with explicit `--num-gpus` and `--model-profile`.

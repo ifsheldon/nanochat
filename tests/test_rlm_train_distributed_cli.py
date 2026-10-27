@@ -51,15 +51,16 @@ def _main_worker(rank, world_size, directory, stop_step, resume, inject_oom, clo
     }
     argv = [
         "rlm_train", "--output-dir", str(output), "--mode", mode, "--device-type", "cpu",
-        "--depth", "3", "--width", "32", "--head-dim", "16", "--text-length", "4",
-        "--memory-tokens", "2", "--cycles", "2", "--device-batch-size", "1",
+        "--cycles", "2", "--device-batch-size", "1",
         "--total-batch-size", "32", "--num-iterations", "4", "--warmup-steps", "0",
         "--no-compile",
     ]
     if mode == "train":
         argv.extend(("--stop-after-step", str(stop_step)))
     if resume:
-        argv.append("--resume-latest")
+        argv.extend(("--resume-latest", "--model-profile", str(output / "checkpoints" / "model-profile.jsonc")))
+    else:
+        argv.extend(("--model-profile", str(directory / "profile.jsonc")))
     initialize_group = dist.init_process_group
 
     def bounded_group(backend):
@@ -132,6 +133,10 @@ def _tokenizer(directory):
     tokenizer = directory / "cache" / "tokenizer" / "tokenizer.pkl"
     tokenizer.parent.mkdir(parents=True)
     tokenizer.write_bytes(b"distributed trainer tokenizer fixture")
+    (directory / "profile.jsonc").write_text("// Distributed GQA experiment\n" + json.dumps({
+        "n_layer": 3, "n_embd": 32, "n_head": 2, "n_kv_head": 1,
+        "text_length": 4, "memory_tokens": 2, "eom_tokens": 1,
+    }))
 
 
 def test_main_two_four_one_workers_resume_and_publish_one_shared_attempt_each(tmp_path):
@@ -156,6 +161,11 @@ def test_main_two_four_one_workers_resume_and_publish_one_shared_attempt_each(tm
             assert not (rank_directory / "result.json").exists()
             assert not (rank_directory / "updates.jsonl").exists()
         metadata = LatestCheckpoint(output / "checkpoints").metadata()
+        assert metadata["model_config"]["n_kv_head"] == 1
+        saved_profile = output / "checkpoints" / "model-profile.jsonc"
+        if index == 0:
+            assert saved_profile.read_bytes() == (tmp_path / "profile.jsonc").read_bytes()
+            (tmp_path / "profile.jsonc").unlink()
         assert metadata["step"] == step
         assert metadata["internal_positions"] == step * 56
         assert metadata["run_contract"]["world_size"] == world_size
@@ -176,6 +186,7 @@ def test_main_worker_oom_records_all_diagnostics_and_no_checkpoint(tmp_path):
     assert report["failure_kind"] == "cuda_out_of_memory"
     assert "rank 1" in report["error"]
     assert not (output / "checkpoints" / "latest.pt").exists()
+    assert not (output / "checkpoints" / "model-profile.jsonc").exists()
     for rank in range(2):
         diagnostic = attempts[0] / f"rank-{rank:05d}"
         assert (diagnostic / "failed-update.json").is_file()

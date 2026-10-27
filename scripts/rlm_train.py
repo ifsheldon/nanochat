@@ -30,11 +30,8 @@ def parse_args():
                         help="new training/probe directory (default: selected run's train directory)")
     parser.add_argument("--mode", choices=("probe", "capacity-probe", "attention-probe", "train"), default="probe")
     parser.add_argument("--device-type", choices=("cpu", "cuda"), default="cuda")
-    parser.add_argument("--depth", type=int, default=24)
-    parser.add_argument("--width", type=int, default=None, help="default: depth * 64, rounded to head dimension")
-    parser.add_argument("--head-dim", type=int, default=128)
-    parser.add_argument("--text-length", type=int, default=1023)
-    parser.add_argument("--memory-tokens", type=int, default=512)
+    parser.add_argument("--model-profile", type=Path, required=True,
+                        help="JSONC architecture profile; required for fresh runs and resume")
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--device-batch-size", type=int, default=16)
     parser.add_argument("--total-batch-size", type=int, default=1_047_552, help="real text targets per optimizer update; EOM adds one prediction per cycle")
@@ -108,14 +105,6 @@ def parse_args():
         parser.error("--resume-from-step must name a completed positive optimizer update")
     if args.stop_after_step is not None and not 0 < args.stop_after_step <= args.num_iterations:
         parser.error("--stop-after-step must be within the configured training horizon")
-    if args.depth <= 0 or args.head_dim <= 0 or args.head_dim % 2:
-        parser.error("depth must be positive and head dimension must be positive and even")
-    if args.text_length <= 0 or args.memory_tokens <= 0:
-        parser.error("text length and memory token count must be positive")
-    if args.width is None:
-        args.width = ((args.depth * 64 + args.head_dim - 1) // args.head_dim) * args.head_dim
-    if args.width < 24 or args.width % args.head_dim:
-        parser.error("width must be at least 24 and compatible with the attention head dimension")
     return args
 
 
@@ -161,7 +150,8 @@ def run(args, attempt, runtime=None):
     from nanochat.common import COMPUTE_DTYPE, get_base_dir
     from nanochat.flash_attention import attention_backend
     from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
-    from nanochat.rlm import RecurrentGPT, RLMConfig
+    from nanochat.rlm import RecurrentGPT
+    from nanochat.model_profile import CHECKPOINT_PROFILE_NAME, ModelProfileDocument
     from nanochat.rlm_training import (
         TrainingConfig, apply_schedule, build_optimizer, checkpoint_metadata,
         cuda_metrics, file_digest, measured_update, MemoryMonitor,
@@ -178,6 +168,19 @@ def run(args, attempt, runtime=None):
     device = runtime.device
     diagnostic_dir = attempt if runtime.world_size == 1 else attempt / f"rank-{runtime.rank:05d}"
     runtime.collective(lambda: diagnostic_dir.mkdir(parents=True, exist_ok=True), "diagnostic directory")
+    checkpoint_dir = args.output_dir / "checkpoints"
+    resuming = args.resume_from_step is not None or args.resume_latest
+
+    def load_profile():
+        saved_profile = checkpoint_dir / CHECKPOINT_PROFILE_NAME
+        document = ModelProfileDocument.read(args.model_profile.expanduser())
+        if resuming and saved_profile.exists():
+            if ModelProfileDocument.read(saved_profile).profile != document.profile:
+                raise ValueError("Selected model profile differs from the saved checkpoint profile")
+        return document
+
+    profile_document = runtime.primary(load_profile, "model profile")
+    profile = profile_document.profile
 
     def prepare_inputs():
         if COMPUTE_DTYPE not in (torch.bfloat16, torch.float32):
@@ -187,16 +190,14 @@ def run(args, attempt, runtime=None):
             torch.cuda.manual_seed(args.seed)
         check_training_memory(device, 0, synchronize_workers=False)
         config = TrainingConfig(**{name: getattr(args, name) for name in TrainingConfig.__dataclass_fields__})
-        accumulation = config.accumulation_steps(args.text_length, runtime.world_size)
+        accumulation = config.accumulation_steps(profile.text_length, runtime.world_size)
         tokenizer_path = Path(get_base_dir()) / "tokenizer" / "tokenizer.pkl"
         return config, accumulation, tokenizer_path, file_digest(tokenizer_path), get_tokenizer()
 
     config, accumulation, tokenizer_path, tokenizer_sha256, tokenizer = runtime.collective(
         prepare_inputs, "training inputs",
     )
-    checkpoint_dir = args.output_dir / "checkpoints"
     latest_checkpoint = LatestCheckpoint(checkpoint_dir) if args.mode == "train" else None
-    resuming = args.resume_from_step is not None or args.resume_latest
 
     def admit_checkpoint():
         if args.mode == "train":
@@ -253,12 +254,8 @@ def run(args, attempt, runtime=None):
         return initializer, initialization
 
     initializer, initialization = runtime.collective(prepare_initialization, "embedding initialization source")
-    model_config = RLMConfig(
-        sequence_len=args.text_length + 1 + 2 * args.memory_tokens,
-        vocab_size=tokenizer.get_vocab_size(), n_layer=args.depth,
-        n_head=args.width // args.head_dim, n_kv_head=args.width // args.head_dim,
-        n_embd=args.width, window_pattern="L", text_length=args.text_length,
-        memory_tokens=args.memory_tokens, activation_checkpointing=args.activation_checkpointing,
+    model_config = profile.model_config(
+        vocab_size=tokenizer.get_vocab_size(), activation_checkpointing=args.activation_checkpointing,
     )
 
     def inspect_provenance():
@@ -322,10 +319,10 @@ def run(args, attempt, runtime=None):
     if runtime.is_primary:
         logger.info("%s", json.dumps({
             "configuration": contract, "accumulation_steps": accumulation,
-            "cycle_lengths": [args.text_length + 1 + args.memory_tokens]
-            + [args.text_length + 1 + 2 * args.memory_tokens] * (args.cycles - 2)
-            + [args.text_length + 1 + args.memory_tokens],
-            "prediction_targets_per_update": config.prediction_targets_per_update(args.text_length),
+            "cycle_lengths": [profile.text_length + profile.eom_tokens + profile.memory_tokens]
+            + [profile.sequence_len] * (args.cycles - 2)
+            + [profile.text_length + profile.eom_tokens + profile.memory_tokens],
+            "prediction_targets_per_update": config.prediction_targets_per_update(profile.text_length),
             "input_embedding_freeze": {
                 "frozen_updates": config.input_embedding_frozen_updates,
                 "first_trainable_update": (None if config.input_embedding_freeze is InputEmbeddingFreeze.PERMANENT
@@ -410,7 +407,7 @@ def run(args, attempt, runtime=None):
             restore_rng(worker_state["rng_state"], device)
         forward_cycle = torch.compile(model.forward_cycle, dynamic=False) if args.compile else model.forward_cycle
         loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-            tokenizer, args.device_batch_size, args.cycles * args.text_length,
+            tokenizer, args.device_batch_size, args.cycles * profile.text_length,
             split="train", device=device.type,
             resume_state_dict=None if worker_state is None else worker_state["dataloader_state_dict"],
         )
@@ -454,9 +451,9 @@ def run(args, attempt, runtime=None):
     updates = []
     tokens_per_update = {
         "text_tokens": config.total_batch_size,
-        "supervised_tokens": config.prediction_targets_per_update(args.text_length),
+        "supervised_tokens": config.prediction_targets_per_update(profile.text_length),
         "internal_positions": runtime.world_size * accumulation * config.device_batch_size
-        * config.positions_per_episode(args.text_length, args.memory_tokens),
+        * config.positions_per_episode(profile.text_length, profile.memory_tokens),
     }
     token_counts = {name: 0 if metadata is None else metadata[name] for name in tokens_per_update}
 
@@ -476,6 +473,7 @@ def run(args, attempt, runtime=None):
         )
 
     writer = runtime.collective(make_writer, "checkpoint writer setup")
+    profile_copied = False
     checkpoint_measurements = [] if writer is None else writer.measurements
     endpoint = args.stop_after_step or args.num_iterations
     metrics_path = attempt / "updates.jsonl"
@@ -530,6 +528,12 @@ def run(args, attempt, runtime=None):
 
                 runtime.primary(record_update, "record update metrics")
                 if writer is not None:
+                    if not profile_copied:
+                        runtime.primary(
+                            lambda: profile_document.copy_once(checkpoint_dir / CHECKPOINT_PROFILE_NAME),
+                            "checkpoint model profile",
+                        )
+                        profile_copied = True
                     numbered = step == 2 or step == endpoint or bool(args.save_every and step % args.save_every == 0)
 
                     def prepare_snapshot():

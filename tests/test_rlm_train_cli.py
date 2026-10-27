@@ -86,12 +86,19 @@ def training_environment(tmp_path, monkeypatch):
 
 
 def arguments(monkeypatch, output_dir, *extra):
+    resuming = "--resume-latest" in extra or "--resume-from-step" in extra
+    profile = output_dir / "checkpoints" / "model-profile.jsonc" if resuming else output_dir.parent / "tiny-model-profile.jsonc"
+    if not resuming and not profile.exists():
+        profile.write_text(json.dumps({
+            "n_layer": 2, "n_embd": 32, "n_head": 2, "n_kv_head": 2,
+            "text_length": 4, "memory_tokens": 2, "eom_tokens": 1,
+        }))
     argv = [
         "rlm_train", "--output-dir", str(output_dir), "--mode", "train",
-        "--device-type", "cpu", "--depth", "2", "--width", "32", "--head-dim", "16",
-        "--text-length", "4", "--memory-tokens", "2", "--cycles", "2",
+        "--device-type", "cpu", "--cycles", "2",
         "--device-batch-size", "2", "--total-batch-size", "16", "--num-iterations", "4",
-        "--warmup-steps", "0", "--no-compile", *map(str, extra),
+        "--warmup-steps", "0", "--no-compile",
+        "--model-profile", str(profile), *map(str, extra),
     ]
     monkeypatch.setattr(sys, "argv", argv)
     return rlm_train.parse_args()
@@ -848,10 +855,25 @@ def test_probe_does_not_publish_checkpoints(training_environment, tmp_path, monk
         monkeypatch, output_dir, "--mode", "probe", "--num-iterations", "2",
     ), "complete")
     assert not (output_dir / "checkpoints" / "latest.pt").exists()
+    assert not (output_dir / "checkpoints" / "model-profile.jsonc").exists()
     assert published_steps(output_dir) == []
     result = json.loads((attempt / "result.json").read_text())
     assert result["completed_updates"] == 2
     assert result["checkpoint_overhead_measured"] is False
+
+
+@pytest.mark.parametrize("extra", [
+    ("--mode", "probe"), ("--mode", "capacity-probe"), ("--mode", "attention-probe"),
+    ("--mode", "train", "--num-iterations", "4"),
+    ("--mode", "train", "--num-iterations", "4", "--resume-latest"),
+    ("--mode", "train", "--num-iterations", "4", "--resume-from-step", "2"),
+])
+def test_cli_requires_model_profile_for_fresh_and_resume(monkeypatch, capsys, extra):
+    monkeypatch.setattr(sys, "argv", ["rlm_train", "--total-batch-size", "32", *extra])
+    with pytest.raises(SystemExit) as error:
+        rlm_train.parse_args()
+    assert error.value.code == 2
+    assert "required: --model-profile" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("extra,match", [

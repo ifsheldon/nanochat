@@ -1,4 +1,4 @@
-"""Prepare, capacity-test, and launch the fixed RLM recipe on 1, 2, or 4 H100s.
+"""Prepare, capacity-test, and launch RLM profiles on 1, 2, or 4 H100s.
 
 Use runs/runh100_rlm.sh to install the locked environment first.
 See dev/h100-training/H100_RLM.md for the asset bundle, resource requirements, and recovery.
@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 
+from nanochat.model_profile import CHECKPOINT_PROFILE_NAME, ModelProfileDocument
 from nanochat.paths import RunName, configure_runtime_paths, get_datasets_dir, get_run_dir
 from nanochat.rlm_policy import AttentionBackend, InputEmbeddingFreeze
 
@@ -32,16 +33,23 @@ TOKENIZER_FILES = ("tokenizer.pkl", "token_bytes.pt")
 class Recipe:
     name: str
     device_batch_size: int
-    accumulation_steps: int
     probe_freeze: InputEmbeddingFreeze
     training_freeze: InputEmbeddingFreeze
 
 
 RECIPES = (
-    Recipe("b32-unfrozen", 32, 8, InputEmbeddingFreeze.NONE, InputEmbeddingFreeze.SCHEDULED),
-    Recipe("b32-frozen", 32, 8, InputEmbeddingFreeze.PERMANENT, InputEmbeddingFreeze.PERMANENT),
-    Recipe("b16-unfrozen", 16, 16, InputEmbeddingFreeze.NONE, InputEmbeddingFreeze.SCHEDULED),
+    Recipe("b32-unfrozen", 32, InputEmbeddingFreeze.NONE, InputEmbeddingFreeze.SCHEDULED),
+    Recipe("b32-frozen", 32, InputEmbeddingFreeze.PERMANENT, InputEmbeddingFreeze.PERMANENT),
+    Recipe("b16-unfrozen", 16, InputEmbeddingFreeze.NONE, InputEmbeddingFreeze.SCHEDULED),
 )
+
+
+def accumulation_steps(recipe, text_length, num_gpus):
+    tokens_per_microbatch = recipe.device_batch_size * 4 * text_length * num_gpus
+    steps, remainder = divmod(1047552, tokens_per_microbatch)
+    if remainder or steps < 1:
+        raise ValueError("The H100 global batch of 1047552 text tokens must be divisible by device batch size x 4 cycles x profile text_length x GPU count.")
+    return steps
 
 
 def checked_path(path, *, directory=False, must_exist=True):
@@ -82,6 +90,8 @@ def parse_args(argv=None):
     parser.add_argument("--num-gpus", type=int, choices=(1, 2, 4), required=True,
                         help="use the first N visible H100s; required for fresh training and resume")
     parser.add_argument("--assets", type=Path, help="verified embedding-only seed bundle; required for a fresh run")
+    parser.add_argument("--model-profile", type=Path, required=True,
+                        help="JSONC architecture profile; required for fresh training and resume")
     destination = parser.add_mutually_exclusive_group()
     destination.add_argument("--run-name", type=RunName, help="run name under repository training_run/; default: NANOCHAT_RUN_NAME or pretrain-1")
     destination.add_argument("--output-dir", type=Path, help="explicit run directory instead of training_run/<run-name>")
@@ -95,12 +105,11 @@ def parse_args(argv=None):
     return args
 
 
-def training_arguments(recipe, output_dir, *, assets=None, mode="train", resume=False):
+def training_arguments(recipe, output_dir, *, model_profile, assets=None, mode="train", resume=False):
     probe = mode != "train"
     arguments = [
         "--mode", mode, "--device-type", "cuda",
-        "--depth", "24", "--width", "1536", "--head-dim", "128",
-        "--text-length", "1023", "--memory-tokens", "512", "--cycles", "4",
+        "--model-profile", str(model_profile), "--cycles", "4",
         "--device-batch-size", str(recipe.device_batch_size), "--total-batch-size", "1047552",
         "--num-iterations", "5574", "--warmup-steps", "40", "--warmdown-ratio", "0.65",
         "--final-lr-frac", "0.05", "--embedding-lr", "0.3", "--unembedding-lr", "0.008",
@@ -272,7 +281,7 @@ def training_command(arguments, num_gpus):
             f"--nproc-per-node={num_gpus}", "-m", "scripts.rlm_train", *arguments]
 
 
-def choose_recipe(output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1):
+def choose_recipe(output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1, model_profile):
     runner = run_logged if runner is None else runner
     for index, recipe in enumerate(RECIPES, start=1):
         probe_dir = checked_path(
@@ -280,7 +289,7 @@ def choose_recipe(output_dir, assets, environment, log_dir, runner=None, *, num_
         )
         if probe_dir.exists():
             raise FileExistsError(f"A previous probe already exists at {probe_dir}; preserve this run and choose a new --output-dir.")
-        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="capacity-probe")
+        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="capacity-probe", model_profile=model_profile)
         code = runner(training_command(arguments, num_gpus),
                       log_dir / f"probe-{index:02d}-{recipe.name}.log", environment)
         result_path = probe_dir / "result.json"
@@ -309,7 +318,7 @@ def choose_recipe(output_dir, assets, environment, log_dir, runner=None, *, num_
     raise RuntimeError("WARNING: all three authorized H100 capacity probes failed. Training was not started; no smaller batch or alternate precision was selected.")
 
 
-def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1):
+def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1, model_profile):
     """Compare isolated, compilation-free updates; an unusable FA3 is optional."""
     runner = run_logged if runner is None else runner
     measurements = {}
@@ -320,7 +329,7 @@ def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=No
         if probe_dir.exists():
             raise FileExistsError(f"An attention probe already exists at {probe_dir}; choose a new --output-dir.")
         log_path = log_dir / f"attention-{backend.value}.log"
-        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="attention-probe")
+        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="attention-probe", model_profile=model_profile)
         probe_environment = dict(environment, NANOCHAT_ATTENTION_IMPL=backend.value)
         code = None
         try:
@@ -360,16 +369,16 @@ def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=No
     return {"selected": selected.value, "measurements": measurements}
 
 
-def load_recipe(output_dir):
+def load_recipe(output_dir, text_length):
     path = checked_path(output_dir / "selected-recipe.json")
     saved = json.loads(path.read_text())
-    if not isinstance(saved, dict) or saved.get("schema_version") != 2:
+    if not isinstance(saved, dict) or saved.get("schema_version") != 3:
         raise ValueError("Unsupported selected-recipe.json schema; refusing to resume.")
     if type(saved.get("num_gpus")) is not int or saved["num_gpus"] not in (1, 2, 4):
         raise ValueError("Saved recipe must record a supported GPU count.")
     for recipe in RECIPES:
         if (saved.get("recipe") == asdict(recipe)
-                and saved.get("accumulation_steps") == recipe.accumulation_steps // saved["num_gpus"]):
+                and saved.get("accumulation_steps") == accumulation_steps(recipe, text_length, saved["num_gpus"])):
             return recipe, saved
     raise ValueError("Saved recipe is not one of the three authorized H100 recipes.")
 
@@ -386,8 +395,22 @@ def launch(args):
         recipe_path = output_dir / "selected-recipe.json"
         recipe = None
         saved = None
+        requested = ModelProfileDocument.read(checked_path(args.model_profile))
         if args.resume:
-            recipe, saved = load_recipe(output_dir)
+            checkpoint_profile = checked_path(
+                output_dir / "train" / "checkpoints" / CHECKPOINT_PROFILE_NAME, must_exist=False,
+            )
+            if checkpoint_profile.exists():
+                document = ModelProfileDocument.read(checkpoint_profile)
+                if requested.profile != document.profile:
+                    raise ValueError("Explicit model profile differs from the saved checkpoint profile.")
+                model_profile = checkpoint_profile
+            else:
+                document = requested
+                model_profile = checked_path(output_dir / CHECKPOINT_PROFILE_NAME, must_exist=False)
+                document.copy_once(model_profile)
+                document = ModelProfileDocument.read(model_profile)
+            recipe, saved = load_recipe(output_dir, document.profile.text_length)
             datasets_dir = checked_path(args.datasets_dir or Path(saved["datasets_directory"]), directory=True)
             checked_path(output_dir / "train" / "checkpoints" / "latest.pt")
             assets = None
@@ -396,6 +419,10 @@ def launch(args):
                 raise FileExistsError("This output directory already has a selected recipe or training artifacts; use --resume or a new --output-dir.")
             datasets_dir = checked_path(args.datasets_dir or get_datasets_dir(), directory=True, must_exist=False)
             assets = checked_path(args.assets, directory=True)
+            document = requested
+            model_profile = checked_path(output_dir / CHECKPOINT_PROFILE_NAME, must_exist=False)
+            document.copy_once(model_profile)
+            document = ModelProfileDocument.read(model_profile)
         datasets_dir.mkdir(parents=True, exist_ok=True)
         log_dir = checked_path(
             output_dir / "logs" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ"),
@@ -423,13 +450,13 @@ def launch(args):
                 if code:
                     raise RuntimeError(f"Dataset downloader failed with status {code}; inspect {log_dir}.")
                 dataset = verify_dataset(datasets_dir)
-            recipe = choose_recipe(output_dir, assets, environment, log_dir, num_gpus=args.num_gpus)
-            attention = choose_attention(recipe, output_dir, assets, environment, log_dir, num_gpus=args.num_gpus)
+            recipe = choose_recipe(output_dir, assets, environment, log_dir, num_gpus=args.num_gpus, model_profile=model_profile)
+            attention = choose_attention(recipe, output_dir, assets, environment, log_dir, num_gpus=args.num_gpus, model_profile=model_profile)
             environment["NANOCHAT_ATTENTION_IMPL"] = attention["selected"]
-            production_arguments = training_arguments(recipe, output_dir / "train", assets=assets)
+            production_arguments = training_arguments(recipe, output_dir / "train", assets=assets, model_profile=model_profile)
             saved = {
-                "schema_version": 2, "recipe": asdict(recipe),
-                "num_gpus": args.num_gpus, "accumulation_steps": recipe.accumulation_steps // args.num_gpus,
+                "schema_version": 3, "recipe": asdict(recipe),
+                "num_gpus": args.num_gpus, "accumulation_steps": accumulation_steps(recipe, document.profile.text_length, args.num_gpus),
                 "assets_directory": str(assets), "datasets_directory": str(datasets_dir),
                 "assets": assets_record, "dataset": dataset, "gpu": gpu,
                 "production_arguments": production_arguments,
@@ -444,9 +471,9 @@ def launch(args):
                 "python": sys.version,
             }
             write_json(recipe_path, saved)
-        accumulation = recipe.accumulation_steps // args.num_gpus
+        accumulation = accumulation_steps(recipe, document.profile.text_length, args.num_gpus)
         print(f"Selected {recipe.name}: {args.num_gpus} GPUs x batch {recipe.device_batch_size} x accumulation {accumulation}, embedding policy {recipe.training_freeze}.", flush=True)
-        arguments = training_arguments(recipe, output_dir / "train", assets=assets, resume=args.resume)
+        arguments = training_arguments(recipe, output_dir / "train", assets=assets, resume=args.resume, model_profile=model_profile)
         command = training_command(arguments, args.num_gpus)
         write_json(log_dir / "invocation.json", {"arguments": arguments, "command": command,
                                                "resume": args.resume, "num_gpus": args.num_gpus,
@@ -454,7 +481,7 @@ def launch(args):
         code = run_logged(command,
                           log_dir / "training.log", environment)
         if code:
-            raise RuntimeError(f"Training exited with status {code}; inspect {log_dir / 'training.log'}. To resume a completed checkpoint, rerun with --num-gpus {args.num_gpus} --resume --output-dir {shlex.quote(str(output_dir))}.")
+            raise RuntimeError(f"Training exited with status {code}; inspect {log_dir / 'training.log'}. To resume a completed checkpoint, rerun with --num-gpus {args.num_gpus} --resume --output-dir {shlex.quote(str(output_dir))} --model-profile {shlex.quote(str(output_dir / 'train' / 'checkpoints' / CHECKPOINT_PROFILE_NAME))}.")
 
 
 def main():

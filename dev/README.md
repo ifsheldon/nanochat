@@ -25,6 +25,8 @@ Run commands from the repository root unless a guide says otherwise.
 
 ## Shared references
 
+- [RLM model profiles: required explicit selection, fields, and checkpoint copies](../model_profiles/README.md)
+- [JSONC model profile implementation plan](MODEL_PROFILES_PLAN.md)
 - [Plot NanoChat and RLM training curves](../.agents/skills/plot-nanochat-training/SKILL.md), a project-local skill with optional original NanoChat comparisons.
 - [Project storage](PROJECT_STORAGE.md)
 - [Development log](LOG.md)

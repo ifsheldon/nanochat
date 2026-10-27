@@ -1,0 +1,4 @@
+interface:
+  display_name: "NanoChat Training Curves"
+  short_description: "Plot RLM training with or without a NanoChat baseline"
+  default_prompt: "Use $plot-nanochat-training to plot the current RLM training curves, comparing original NanoChat when its logs are available."

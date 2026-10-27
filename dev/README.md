@@ -16,6 +16,7 @@ Run commands from the repository root unless a guide says otherwise.
 
 ## Shared references
 
+- [Plot NanoChat and RLM training curves](../.agents/skills/plot-nanochat-training/SKILL.md), a project-local skill with optional original NanoChat comparisons.
 - [Project storage](PROJECT_STORAGE.md)
 - [Development log](LOG.md)
 - [Leaderboard](LEADERBOARD.md)

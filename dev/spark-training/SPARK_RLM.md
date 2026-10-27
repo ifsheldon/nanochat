@@ -305,6 +305,26 @@ The exact launch command, environment, revision, and checkpoint are recorded in 
 The first resumed update, 2491, completed at 17:53 SGT with loss 2.563202, passing finite-state checks, and minimum system available memory of 30.531 GB.
 It took 396.05 seconds including compilation, and its rolling checkpoint was durably published at 17:54 SGT while training continued.
 
+On October 21, 2026 at 14:57 SGT, training was stopped at the user's request.
+The service became inactive and its process exited; CPU-only checkpoint metadata verification confirmed that `checkpoints/latest.pt` preserved completed update 4572 of 5574.
+The run remained paused until the user requested resumption on October 27.
+
+On October 27 at 02:53 SGT, the same service resumed from checkpoint 4572 with the existing 8 GB system-memory guard, 100 GB CUDA allocator cap, and unchanged training and checkpoint settings.
+It runs from the verified source snapshot in `attempts/20261016T094647.740852Z/source/` under the run directory, using the existing Python 3.10.21 and PyTorch 2.14.0+cu132 environment.
+This preserves the previous run's source at revision `269a269`, including the scheduled checkpoint at update 5016 and scheduled embedding unfreezing at update 5017, while the repository checkout stays on `spark-rlm`.
+The launch supplies `GIT_DIR` for the repository and `GIT_WORK_TREE` for that source snapshot so the trainer records the checkout revision and the captured source's diff; its source manifest matches the previous attempt exactly.
+The complete command, environment, source identity, and checkpoint are recorded in `~/.cache/nanochat/spark-rlm/pretrain-u4-b32-frozen-20261010-resume-20261026T185345Z.json`.
+The first resumed update, 4573, completed with loss 2.399954 in 209.58 seconds, passed finite-state checks, and observed at least 40.757 GB of available system memory; its rolling checkpoint was durably published at 02:57 SGT while training continued.
+
+On October 27 at 21:08 SGT, training was stopped at the user's request before upgrading PyTorch.
+The service became inactive and all training processes exited; CPU-only checkpoint metadata verification confirmed that `checkpoints/latest.pt` preserved completed update 4906 of 5574.
+The project dependency and lockfile were then updated to PyTorch 2.14.1, and `uv sync --locked --extra gpu --group dev --inexact` upgraded the Spark environment to PyTorch 2.14.1+cu132 and its required CUDA 13.2 libraries while retaining Python 3.10.21 and Triton 3.8.0.
+The upgraded runtime successfully read checkpoint 4906 and passed compiled BF16 CUDA matrix multiplication with backward propagation and all three SDPA GPU tests.
+The CPU test suite passed with 551 tests passing and 22 skipped, and the lockfile check passed.
+The installed `nvidia-cusparselt-cu13==0.8.1` wheel has an internal `manylinux2014_sbsa` tag despite its `aarch64` filename, so `uv sync --check` reports that package for reinstallation even immediately after a successful sync.
+PyTorch requires that exact package version; the documented training commands use `uv run --no-sync` and the runtime checks passed.
+Training remains paused at update 4906.
+
 ### Four-cycle pretraining with the step-5568 input embedding
 
 The selected full run uses four cycles, batch 32, activation checkpointing, and terminal-summary omission.

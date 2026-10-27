@@ -13,6 +13,7 @@ Run commands from the repository root unless a guide says otherwise.
 ## H100 training
 
 - [Pretraining on 1, 2, or 4 H100 GPUs with the supplied files](h100-training/H100_RLM.md)
+- [Server-agent handoff: GPU allocation and checks before pretraining](h100-training/H100_SERVER_HANDOFF.md)
 - [H100 GPU selection implementation plan](h100-training/H100_MULTI_GPU_PLAN.md)
 
 ## RLM architecture

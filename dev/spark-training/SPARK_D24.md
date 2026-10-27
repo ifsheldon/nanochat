@@ -8,7 +8,7 @@ Run commands from the repository root on the merged `spark-rlm` branch.
 
 ## Configuration
 
-On Linux ARM64, the locked GPU environment selects PyTorch 2.14.0+cu132 and Triton 3.8.0.
+On Linux ARM64, the locked GPU environment selects PyTorch 2.14.1+cu132 and Triton 3.8.0.
 The same configuration selects PyTorch 2.14.1+cu126 on Linux x86-64 for H100, using CPU-architecture markers in `pyproject.toml`.
 Training uses BF16 compute, existing parameter/optimizer precision, 24 layers, width 1536, 12 heads, 2048-token context, and full-context SDPA.
 The runner sets `NANOCHAT_ATTENTION_IMPL=sdpa` to bypass remote FA3 kernel discovery throughout the run; the default `auto` retains upstream detection for other workflows.

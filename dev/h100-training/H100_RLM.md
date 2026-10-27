@@ -37,7 +37,7 @@ Run the script directly, outside `torchrun` or another distributed worker enviro
 A GPU partition or a different accelerator is rejected.
 
 The launcher uses `uv.lock` and Python 3.10.21 to install the required environment automatically.
-The GPU extra selects PyTorch 2.14.1+cu126 on this Linux x86-64 host; the same lockfile selects PyTorch 2.14.0+cu132 on Linux ARM64 for DGX Spark.
+The GPU extra selects PyTorch 2.14.1+cu126 on this Linux x86-64 host; the same lockfile selects PyTorch 2.14.1+cu132 on Linux ARM64 for DGX Spark.
 It verifies the supplied files and installs their tokenizer, then downloads 170 training shards and one validation shard, approximately 15.7 GB in total.
 Existing dataset files are reused and verified.
 No separate dataset transfer is needed.

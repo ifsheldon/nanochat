@@ -34,11 +34,11 @@ The GPU extra selects the locked PyTorch build by operating system and CPU archi
 
 | Host | PyTorch | CUDA runtime |
 | --- | --- | --- |
-| Linux ARM64 (`aarch64`), including DGX Spark | 2.14.0 | 13.2 |
+| Linux ARM64 (`aarch64`), including DGX Spark | 2.14.1 | 13.2 |
 | Linux x86-64 (`x86_64`), including the H100 host | 2.14.1 | 12.6 |
 
 Both use the same `pyproject.toml`, `uv.lock`, and installation command.
-The `cpu` extra selects CPU-only wheels with the same architecture-specific versions.
+The `cpu` extra selects CPU-only wheels with the same PyTorch 2.14.1 version on both architectures.
 These selections use environment markers, not GPU or driver detection; other platforms retain the 2.14.1 dependency pin.
 To install:
 

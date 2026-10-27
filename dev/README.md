@@ -19,6 +19,8 @@ Run commands from the repository root unless a guide says otherwise.
 
 - [Model design, data contract, and architectural experiments](RLM-architecture/RLM_DESIGN.md)
 - [Document-length and memory-boundary analysis](RLM-architecture/SPARK_RLM_DOCUMENT_BOUNDARIES.md)
+- [RLM proposal and source repository](https://github.com/ifsheldon/recurrent-latent-memory)
+- [Interactive memory-cycle illustration](https://recurrent-latent-memory.reify.ing)
 
 ## Shared references
 

@@ -21,8 +21,8 @@ The shared GPT backbone uses full causal attention with `window_pattern="L"`.
 | Memory boundary tokens | Learned `<EOM>` every cycle; defer `<bom>`, `<bosum>`, and `<eosum>` |
 | Memory type objective | Defer `<M>` / `<S>` classification; initial auxiliary weight is zero |
 
-These choices build on the [RLM proposal](../../../recurrent-latent-memory/README.md).
-The RLM proposal is in a neighboring repository; the relative link assumes both repositories share a parent directory.
+These choices build on the [Recurrent Latent Memory proposal](https://github.com/ifsheldon/recurrent-latent-memory).
+The [interactive memory-cycle illustration](https://recurrent-latent-memory.reify.ing) shows how working context is consolidated into latent memory for the next cycle.
 The sections below distinguish initial implementation choices from later experiments.
 
 ## One episode and its gradient path

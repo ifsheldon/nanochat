@@ -1,6 +1,6 @@
 # Development documentation
 
-Training guides and experiment records are grouped by hardware; recurrent latent memory design and analysis are kept separately.
+Training guides, implementation plans, and experiment records are grouped by hardware; recurrent latent memory model design and architectural analysis are kept separately.
 Run commands from the repository root unless a guide says otherwise.
 
 ## Spark training
@@ -8,15 +8,16 @@ Run commands from the repository root unless a guide says otherwise.
 - [Small experiments and run status](spark-training/SPARK.md)
 - [D24 training and evaluation](spark-training/SPARK_D24.md)
 - [RLM training, evaluation, and measured results](spark-training/SPARK_RLM.md)
+- [RLM implementation plan and training history](spark-training/SPARK_RLM_PLAN.md)
 
 ## H100 training
 
 - [Pretraining on 1, 2, or 4 H100 GPUs with the supplied files](h100-training/H100_RLM.md)
+- [H100 GPU selection implementation plan](h100-training/H100_MULTI_GPU_PLAN.md)
 
 ## RLM architecture
 
-- [Design and implementation plan](RLM-architecture/SPARK_RLM_PLAN.md)
-- [H100 GPU selection implementation plan](RLM-architecture/H100_MULTI_GPU_PLAN.md)
+- [Model design, data contract, and architectural experiments](RLM-architecture/RLM_DESIGN.md)
 - [Document-length and memory-boundary analysis](RLM-architecture/SPARK_RLM_DOCUMENT_BOUNDARIES.md)
 
 ## Shared references

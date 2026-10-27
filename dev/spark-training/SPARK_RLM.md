@@ -1,6 +1,7 @@
 # Recurrent latent memory on DGX Spark
 
-This workflow implements the first version of the [RLM plan](../RLM-architecture/SPARK_RLM_PLAN.md).
+This workflow implements the [RLM design](../RLM-architecture/RLM_DESIGN.md).
+The [Spark implementation and training record](SPARK_RLM_PLAN.md) preserves the initial recipe, implementation checklist, and experiment history.
 It trains models with differentiable memory between bounded text chunks and provides separate evaluation and sampling entry points.
 Initialization defaults to fresh weights; an optional verified transfer initializes only the main input token embedding from an existing checkpoint.
 The same loader accepts a full checkpoint or a checkpoint containing only `transformer.wte.weight`; [H100 RLM handoff](../h100-training/H100_RLM.md) documents pretraining with the supplied asset bundle.

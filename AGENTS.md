@@ -18,7 +18,7 @@ RLM reuses a GPT backbone across bounded text chunks and passes learned memory b
 | `runs/` | Shell launchers for complete workflows, including `runh100_rlm.sh`, Spark pipelines, CPU demos, and scaling experiments. |
 | `tasks/` | Task datasets and evaluation adapters, including ARC, GSM8K, HumanEval, MMLU, and SmolTalk. |
 | `tests/` | Pytest coverage for models, data loading, training, checkpoints, resource limits, and launchers. |
-| `dev/` | Documentation index and shared references; `spark-training/` and `h100-training/` hold operational guides, while `RLM-architecture/` holds design and analysis. |
+| `dev/` | Documentation index and shared references; `spark-training/` and `h100-training/` hold training guides, implementation plans, and experiment records, while `RLM-architecture/` holds model design and architectural analysis. |
 | `assets/h100-seed/` | Supplied H100 initialization embedding and tokenizer; binaries use Git LFS, with checksums in `manifest.json`. |
 | `training_run/` | Ignored run outputs: checkpoints, tokenizers, logs, reports, and caches; the default run is `pretrain-1`. |
 | `datasets/` | Ignored shared downloads for pretraining, task datasets, and evaluation. |
@@ -39,7 +39,8 @@ RLM reuses a GPT backbone across bounded text chunks and passes learned memory b
 
 - [H100 pretraining](dev/h100-training/H100_RLM.md): run, monitor, and resume using the supplied files.
 - [Spark RLM training](dev/spark-training/SPARK_RLM.md): training, evaluation, and measured results.
-- [RLM design](dev/RLM-architecture/SPARK_RLM_PLAN.md) and [memory-boundary analysis](dev/RLM-architecture/SPARK_RLM_DOCUMENT_BOUNDARIES.md): architecture and supporting research.
+- [RLM design](dev/RLM-architecture/RLM_DESIGN.md) and [memory-boundary analysis](dev/RLM-architecture/SPARK_RLM_DOCUMENT_BOUNDARIES.md): architecture and supporting research.
+- [Development documentation index](dev/README.md): hardware-specific implementation plans and experiment records, alongside the workflow guides.
 - [Spark d24](dev/spark-training/SPARK_D24.md) and [small Spark experiments](dev/spark-training/SPARK.md): base-model workflows.
 - [Project storage](dev/PROJECT_STORAGE.md): artifact locations, dataset sharing, and path overrides.
 - [README](README.md): broader project background and the original training pipelines.

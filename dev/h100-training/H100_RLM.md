@@ -4,6 +4,7 @@ Use the supplied files on the merged `rlm` branch to start a fresh pretraining r
 The initialization embedding and matching tokenizer are provided in `assets/h100-seed/` and downloaded through Git LFS during setup.
 The launcher installs the Python environment, downloads the dataset, checks capacity, benchmarks attention, and starts training with the faster supported backend.
 Select the number of GPUs explicitly with `--num-gpus 1`, `--num-gpus 2`, or `--num-gpus 4` for every launch, including resume.
+The [H100 implementation plan](H100_MULTI_GPU_PLAN.md) records the distributed execution and checkpoint design, completed tasks, and validation results.
 
 ## Requirements
 

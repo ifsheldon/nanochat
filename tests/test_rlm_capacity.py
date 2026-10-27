@@ -182,7 +182,7 @@ def test_capacity_cli_runs_one_update_without_publishing_checkpoints(training_en
     output = tmp_path / f"capacity-{policy}"
     args = arguments(
         monkeypatch, output, "--mode", "capacity-probe", "--num-iterations", "100",
-        "--total-batch-size", "32", "--input-embedding-freeze", policy,
+        "--total-batch-token-size", "32", "--input-embedding-freeze", policy,
         *source_arguments(source_dir, source_tokenizer),
     )
     attempt = run_attempt(args, "probe")

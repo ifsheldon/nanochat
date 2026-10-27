@@ -5,6 +5,8 @@ The initialization embedding and matching tokenizer are provided in `assets/h100
 The launcher installs the Python environment, downloads the dataset, checks capacity, benchmarks attention, and starts training with the faster supported backend.
 Select the number of GPUs explicitly with `--num-gpus 1`, `--num-gpus 2`, or `--num-gpus 4` for every launch, including resume.
 Every launch also requires `--model-profile PATH`; there is no default profile, including on resume.
+Fresh launches require `--total-batch-token-size`, the number of real-text targets across all GPUs per optimizer update; resume restores the saved budget when this option is omitted.
+The [training settings reference](../RLM_TRAINING_SETTINGS.md) explains episodes, accumulation, token counts, and every trainer/launcher option.
 The [H100 implementation plan](H100_MULTI_GPU_PLAN.md) records the distributed execution and checkpoint design, completed tasks, and validation results.
 Before the first multi-GPU pretraining run on a server, follow the [server validation handoff](H100_SERVER_HANDOFF.md).
 
@@ -35,6 +37,7 @@ git lfs pull
 bash runs/runh100_rlm.sh \
     --num-gpus 1 \
     --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --assets assets/h100-seed \
     --run-name pretrain-1
 ```
@@ -46,10 +49,12 @@ Use `CUDA_VISIBLE_DEVICES` to choose their physical device indices or GPU UUIDs;
 ```bash
 CUDA_VISIBLE_DEVICES=2,3 bash runs/runh100_rlm.sh \
     --num-gpus 2 --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --assets assets/h100-seed --run-name pretrain-2gpu
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 bash runs/runh100_rlm.sh \
     --num-gpus 4 --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --assets assets/h100-seed --run-name pretrain-4gpu
 ```
 
@@ -85,7 +90,7 @@ The supplied initialization embedding requires width 1536 and its matching token
 ## Automatic capacity selection
 
 The launcher tries the following recipes in order with PyTorch SDPA, using one complete optimizer update for each capacity probe.
-The accumulation counts below apply to the reference d24 profile's 1023 text tokens:
+The accumulation counts below apply to the reference d24 profile's 1023 text tokens with `--total-batch-token-size 1047552`:
 
 | Priority | Batch per GPU | Accumulation with 1 / 2 / 4 GPUs | Input embedding during probe | Selected training recipe |
 | --- | --- | --- | --- | --- |
@@ -95,9 +100,13 @@ The accumulation counts below apply to the reference d24 profile's 1023 text tok
 
 After a successful capacity probe, the launcher benchmarks attention for the selected recipe as described below.
 Production then starts fresh from the supplied initialization; probe updates are discarded.
-Every recipe uses 5574 optimizer updates and 1,047,552 real-text targets per update across all GPUs, equivalent to 256 complete four-cycle episodes with the reference d24 profile.
+Every recipe uses 5574 optimizer updates and the explicitly selected global text-target budget.
+The 1,047,552 budget above gives 256 complete four-cycle episodes and 1,048,576 supervised predictions per update with the reference d24 profile.
 Increasing GPU count reduces accumulation per worker and keeps this global batch unchanged.
-For a custom profile, accumulation is `1047552 / (device_batch_size * 4 * text_length * num_gpus)` and must be a positive integer.
+Accumulation is `total_batch_token_size / (device_batch_size * 4 * text_length * num_gpus)` and must be a positive integer.
+Fresh launches validate the batch-32 recipe before GPU setup, so the budget must be divisible by `32 * 4 * text_length * num_gpus`; the batch-16 fallback then also divides evenly.
+The text budget excludes the extra EOM predictions and memory/summary positions, and is passed unchanged to capacity probes, attention probes, and training.
+Changing that budget changes total training text across the fixed 5574-update horizon.
 The remaining training settings are configured by the launcher.
 
 Only a CUDA out-of-memory result advances to the next recipe.
@@ -121,7 +130,8 @@ If FlashAttention cannot load or fails during compilation or execution, runs out
 A failed SDPA probe stops the launcher for diagnosis.
 SDPA can itself use PyTorch's built-in flash attention kernels, so this comparison selects between PyTorch's attention implementation and the separate Hugging Face kernel.
 
-To probe a backend separately, run `uv run --no-sync python -m scripts.rlm_train --model-profile OUTPUT/model-profile.jsonc --mode attention-probe` with the same training arguments and a fresh output directory, setting `NANOCHAT_ATTENTION_IMPL=sdpa` or `NANOCHAT_ATTENTION_IMPL=fa3` explicitly.
+To probe a backend separately for the 1,047,552-budget example, run `uv run --no-sync python -m scripts.rlm_train --model-profile OUTPUT/model-profile.jsonc --total-batch-token-size 1047552 --mode attention-probe` with the same remaining training arguments and a fresh output directory, setting `NANOCHAT_ATTENTION_IMPL=sdpa` or `NANOCHAT_ATTENTION_IMPL=fa3` explicitly.
+For another recipe, pass its chosen text budget instead; the direct trainer requires this option even when the H100 launcher would restore it on resume.
 Use `--input-embedding-freeze none` or `--input-embedding-freeze permanent`; scheduled freezing is not supported by this probe.
 Retain the full training horizon in `--num-iterations` because it controls the learning-rate schedule, not the number of compilation warmup updates.
 
@@ -132,9 +142,9 @@ Retain the full training horizon in `--num-iterations` because it controls the l
 | File or directory | What to check |
 | --- | --- |
 | `OUTPUT/logs/TIMESTAMP/` | Dataset preparation, capacity probe, attention probe, and training logs |
-| `OUTPUT/selected-recipe.json` | Schema 3: original GPU count, per-worker accumulation, selected recipe, attention measurements, and training arguments |
+| `OUTPUT/selected-recipe.json` | Schema 4: original GPU count, global text-token budget, per-worker accumulation, selected recipe, attention measurements, and training arguments |
 | `OUTPUT/model-profile.jsonc` | Original profile used for fresh-launch probes and training |
-| `OUTPUT/logs/TIMESTAMP/invocation.json` | Actual GPU count and accumulation for the current launch or resume |
+| `OUTPUT/logs/TIMESTAMP/invocation.json` | Actual GPU count, global text-token budget, and accumulation for the current launch or resume |
 | `OUTPUT/probes/` | Capacity probe results and any failures |
 | `OUTPUT/probes/attention-sdpa/`, `OUTPUT/probes/attention-fa3/` | Attention measurements and failures when a result could be written |
 | `OUTPUT/train/attempts/` | Training measurements and attempt records |
@@ -167,6 +177,7 @@ bash runs/runh100_rlm.sh \
 ```
 
 If the original launch used `--output-dir`, use that same option and path when resuming.
+The command omits `--total-batch-token-size` to restore the saved recipe's budget; supplying the same value explicitly is allowed, and a different value is rejected.
 The launcher uses the saved dataset directory by default; pass `--datasets-dir` to select a different location.
 Resume restores the selected recipe and attention backend, model, complete optimizer state, data-loader position, and random state, then continues the original 5574-update budget.
 The requested GPU count may differ from the saved count: transitions between 1, 2, and 4 GPUs repartition optimizer moments and recompute accumulation while preserving the global batch.

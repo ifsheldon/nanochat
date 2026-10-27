@@ -178,6 +178,7 @@ Note: `float16` training automatically enables a `GradScaler` in `base_train.py`
 See the [development documentation index](dev/README.md) for hardware-specific training guides and RLM design documents.
 RLM training and the H100 launcher require `--model-profile PATH` on every invocation, including resume, to configure architecture through [JSONC model profiles](model_profiles/README.md).
 There is no default profile; `model_profiles/rlm-d24.jsonc` is a bundled reference example, and resume can explicitly select the copy saved with checkpoints.
+The [RLM training settings reference](dev/RLM_TRAINING_SETTINGS.md) explains `--total-batch-token-size`, episodes, accumulation, and the training options; the token budget is required for every direct-trainer invocation and every fresh H100 launch.
 
 I've published a number of guides that might contain helpful information, most recent to least recent:
 

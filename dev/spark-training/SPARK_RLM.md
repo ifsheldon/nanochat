@@ -12,7 +12,7 @@ The tokenizer lives in `<run>/tokenizer`, training and probe outputs default to 
 Shared pretraining, task, and evaluation datasets default to the repository's `datasets/`, independently overridden by `NANOCHAT_DATASETS_DIR`.
 Set `NANOCHAT_TRAIN_SHARDS=170` for the Spark RLM recipe to select training shards 0–169 and validation shard 6542 even when the shared directory contains more shards.
 The dated measurements and command examples below retain their original paths; existing files are not moved or copied automatically.
-Command examples are adapted to the current required `--model-profile` argument and freeze-policy syntax; the recorded launch files and source snapshots preserve the exact historical invocations.
+Command examples are adapted to the current required `--model-profile` and `--total-batch-token-size` arguments and freeze-policy syntax; the recorded launch files and source snapshots preserve the exact historical invocations.
 To evaluate, profile, or explicitly resume an existing cached run with current code, set both `NANOCHAT_BASE_DIR="$HOME/.cache/nanochat/spark-d24"` and `NANOCHAT_DATASETS_DIR="$HOME/.cache/nanochat/spark-d24"`, retain `NANOCHAT_TRAIN_SHARDS=170`, and pass the run's original `--checkpoint-dir`, `--run-config`, or `--output-dir` as appropriate.
 The old run root alone no longer selects its dataset, and changing the defaults does not modify an already running process.
 
@@ -23,6 +23,7 @@ The bundled [`model_profiles/rlm-d24.jsonc`](../../model_profiles/rlm-d24.jsonc)
 The [profile guide](../../model_profiles/README.md) documents its seven fields, including `eom_tokens`, which must be the integer `1`.
 The reference model has 24 layers, width 1536, and 12 query and KV heads; the workflow uses full causal SDPA and BF16 compute with the existing mixed parameter precision.
 The separate RLM architecture CLI flags have been replaced by this profile; cycles and the remaining training/execution options stay on the CLI.
+The [training settings reference](../RLM_TRAINING_SETTINGS.md) defines episodes, accumulation, optimizer schedules, and every CLI/environment option.
 Each episode starts with empty memory and contains two 1023-token text chunks.
 Every cycle places one learned `<EOM>` input between incoming memory and text, including the first cycle with empty memory.
 Each memory-writing cycle appends 512 copies of one trainable summary vector; their final normalized hidden states become the next cycle's 512-vector memory prefix.
@@ -53,10 +54,12 @@ Metrics report how often a handoff continues a document and the fraction of late
 Loader buffers are reused only after the full episode backward completes.
 
 At batch 16, two cycles give 32 text subsequences, 32,736 shifted text targets, and 32 additional `<EOM>` predictions per microbatch.
-The default 1,047,552-text-target optimizer batch accumulates 32 episode microbatches, supervising 1,048,576 predictions and processing 1,572,864 internal positions.
+Explicitly selecting `--total-batch-token-size 1047552` accumulates 32 episode microbatches on one GPU, supervising 1,048,576 predictions and processing 1,572,864 internal positions.
 Batch 32 uses 16 microbatches for the same update budget.
 Internal positions do not count as additional training text or advance the learning-rate schedule.
-Unroll lengths that do not divide the global text batch require an explicit batch-budget choice.
+Every invocation requires `--total-batch-token-size`; there is no default, and its unit is real-text targets across all workers per optimizer update.
+The budget excludes additional EOM predictions and memory/summary positions and must be divisible by `num_gpus * device_batch_size * cycles * text_length`.
+The trainer derives accumulation from that quotient.
 
 ## Memory probe
 
@@ -69,6 +72,7 @@ Run from the repository root using the locked uv environment.
 NANOCHAT_RUN_NAME=spark-rlm-probe-b16 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_train \
     --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --mode probe \
     --device-batch-size 16
 ```
@@ -136,6 +140,7 @@ For example, after choosing a feasible device batch:
 NANOCHAT_RUN_NAME=spark-rlm-learning-20 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_train \
     --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --mode train --num-iterations 20 --warmup-steps 2 \
     --device-batch-size 16 --activation-checkpointing --save-every 10
 ```
@@ -187,7 +192,7 @@ If the current boundary is already past and no milestone was saved or pending, r
 
 To pause reproducibly at an update boundary, add `--stop-after-step 10` to the training command.
 Stopping the service uses the most recent fully published rolling checkpoint; it does not invoke a signal-time save.
-To continue the same training setup, repeat the original training and checkpoint-policy options, keep the original `--num-iterations`, and add `--resume-latest` while removing the earlier stop flag and any initialization flags.
+To continue the same training setup, repeat the original training and checkpoint-policy options, including required `--total-batch-token-size`, keep the original `--num-iterations`, and add `--resume-latest` while removing the earlier stop flag and any initialization flags.
 Resume requires `--model-profile PATH`; pass `OUTPUT/checkpoints/model-profile.jsonc` explicitly, where `OUTPUT` is the trainer's output directory, to use the saved document even after the original source profile has changed or been removed.
 You may instead pass a source profile with the same seven field values as the saved profile; if no saved profile exists, pass a profile matching the checkpoint's architecture for copying with the next checkpoint.
 For the bounded example above, resume after a completed checkpoint with:
@@ -196,6 +201,7 @@ For the bounded example above, resume after a completed checkpoint with:
 NANOCHAT_RUN_NAME=spark-rlm-learning-20 NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_train \
     --model-profile training_run/spark-rlm-learning-20/train/checkpoints/model-profile.jsonc \
+    --total-batch-token-size 1047552 \
     --mode train --num-iterations 20 --warmup-steps 2 \
     --device-batch-size 16 --activation-checkpointing --save-every 10 \
     --resume-latest
@@ -269,6 +275,7 @@ NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=12 \
 NANOCHAT_CHECKPOINT_RESERVE_GB=100 \
 uv run --no-sync python -m scripts.rlm_train \
     --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --mode train --num-iterations 5574 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing \
     --save-every 10 --keep-checkpoints 10 --checkpoint-mode async \
@@ -317,6 +324,7 @@ PYTORCH_ALLOC_CONF=expandable_segments:True \
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 \
 uv run --no-sync python -m scripts.rlm_train \
     --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --mode train --num-iterations 5574 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing \
     --save-every 10 --keep-checkpoints 10 --checkpoint-mode async \
@@ -365,6 +373,7 @@ NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=12 \
 NANOCHAT_CHECKPOINT_RESERVE_GB=100 \
 uv run --no-sync python -m scripts.rlm_train \
     --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --mode train --num-iterations 5574 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing \
     --save-every 10 --keep-checkpoints 10 --checkpoint-mode async \
@@ -711,6 +720,7 @@ NANOCHAT_CUDA_MEMORY_LIMIT_GB=100 \
 NANOCHAT_MIN_SYSTEM_AVAILABLE_GB=12 \
 uv run --no-sync python -m scripts.rlm_train \
     --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --mode probe --num-iterations 2 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing \
     --output-dir "$HOME/.cache/nanochat/spark-rlm/probe-u4-b32"

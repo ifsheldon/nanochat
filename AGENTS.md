@@ -35,11 +35,12 @@ RLM reuses a GPT backbone across bounded text chunks and passes learned memory b
 - `nanochat/rlm_distributed.py` coordinates workers; `optim_checkpoint.py` partitions portable optimizer state; `rlm_distributed_checkpoint.py` gathers worker snapshots for coordinator publication.
 - `nanochat/rlm_training.py` implements recurrent training; the other `rlm_*.py` modules separate data handling, initialization, freezing policy, capacity probes, inference, and checkpoints.
 - `scripts/base_train.py`, `chat_sft.py`, and `chat_rl.py` drive the base-model and chat training stages.
-- `scripts/rlm_train.py`, `rlm_eval.py`, and `rlm_sample.py` expose recurrent training, evaluation, and generation; the trainer requires `--model-profile PATH` for every mode, including resume.
-- `scripts/h100_rlm.py` orchestrates the H100 workflow with required `--num-gpus {1,2,4}` and `--model-profile PATH`, including portable resume across those GPU counts.
+- `scripts/rlm_train.py`, `rlm_eval.py`, and `rlm_sample.py` expose recurrent training, evaluation, and generation; the trainer requires `--model-profile PATH` and `--total-batch-token-size` for every mode, including resume.
+- `scripts/h100_rlm.py` orchestrates the H100 workflow with required `--num-gpus {1,2,4}` and `--model-profile PATH`, including portable resume across those GPU counts; fresh runs require `--total-batch-token-size`, and resume restores the saved budget or accepts an explicit matching value.
 
 ## Workflow guides
 
+- [RLM training settings](dev/RLM_TRAINING_SETTINGS.md): episode and token-budget definitions, all trainer/launcher options, optimizer schedules, and runtime environment.
 - [RLM model profiles](model_profiles/README.md): architecture fields, `--model-profile`, and checkpoint/resume behavior.
 - [H100 pretraining](dev/h100-training/H100_RLM.md): run, monitor, and resume using the supplied files.
 - [Spark RLM training](dev/spark-training/SPARK_RLM.md): training, evaluation, and measured results.

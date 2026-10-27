@@ -52,7 +52,7 @@ def _main_worker(rank, world_size, directory, stop_step, resume, inject_oom, clo
     argv = [
         "rlm_train", "--output-dir", str(output), "--mode", mode, "--device-type", "cpu",
         "--cycles", "2", "--device-batch-size", "1",
-        "--total-batch-size", "32", "--num-iterations", "4", "--warmup-steps", "0",
+        "--total-batch-token-size", "32", "--num-iterations", "4", "--warmup-steps", "0",
         "--no-compile",
     ]
     if mode == "train":

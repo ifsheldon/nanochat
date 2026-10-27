@@ -96,7 +96,7 @@ def arguments(monkeypatch, output_dir, *extra):
     argv = [
         "rlm_train", "--output-dir", str(output_dir), "--mode", "train",
         "--device-type", "cpu", "--cycles", "2",
-        "--device-batch-size", "2", "--total-batch-size", "16", "--num-iterations", "4",
+        "--device-batch-size", "2", "--total-batch-token-size", "16", "--num-iterations", "4",
         "--warmup-steps", "0", "--no-compile",
         "--model-profile", str(profile), *map(str, extra),
     ]
@@ -195,7 +195,7 @@ def test_frozen_pretrained_embedding_resumes_exactly_before_and_after_unfreezing
     caplog.set_level(logging.INFO, logger=rlm_train.logger.name)
     source_dir, source_tokenizer, source_embedding = training_environment
     init_args = source_arguments(source_dir, source_tokenizer)
-    policy_args = ("--input-embedding-freeze", "scheduled", "--num-iterations", "20", "--total-batch-size", "32")
+    policy_args = ("--input-embedding-freeze", "scheduled", "--num-iterations", "20", "--total-batch-token-size", "32")
     initialized_models = []
     parameter_ids = []
     build_optimizer = training_module.build_optimizer
@@ -717,7 +717,7 @@ def test_resume_preserves_cumulative_counts_when_batch_and_cycles_change(trainin
     run_attempt(arguments(monkeypatch, output_dir, "--stop-after-step", "2"), "original")
     latest = LatestCheckpoint(output_dir / "checkpoints")
     assert latest.metadata()["text_tokens"] == 32
-    changed = ("--total-batch-size", "32", "--cycles", "4", "--resume-latest")
+    changed = ("--total-batch-token-size", "32", "--cycles", "4", "--resume-latest")
     for stop, counts in ((3, (64, 80, 120)), (4, (96, 120, 184))):
         attempt = run_attempt(arguments(
             monkeypatch, output_dir, *changed, "--stop-after-step", str(stop),
@@ -869,11 +869,32 @@ def test_probe_does_not_publish_checkpoints(training_environment, tmp_path, monk
     ("--mode", "train", "--num-iterations", "4", "--resume-from-step", "2"),
 ])
 def test_cli_requires_model_profile_for_fresh_and_resume(monkeypatch, capsys, extra):
-    monkeypatch.setattr(sys, "argv", ["rlm_train", "--total-batch-size", "32", *extra])
+    monkeypatch.setattr(sys, "argv", ["rlm_train", "--total-batch-token-size", "32", *extra])
     with pytest.raises(SystemExit) as error:
         rlm_train.parse_args()
     assert error.value.code == 2
     assert "required: --model-profile" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extra", [
+    ("--mode", "probe"), ("--mode", "capacity-probe"), ("--mode", "attention-probe"),
+    ("--mode", "train", "--num-iterations", "4"),
+    ("--mode", "train", "--num-iterations", "4", "--resume-latest"),
+    ("--mode", "train", "--num-iterations", "4", "--resume-from-step", "2"),
+])
+def test_cli_requires_explicit_text_token_budget(monkeypatch, capsys, extra):
+    monkeypatch.setattr(sys, "argv", ["rlm_train", "--model-profile", "profile.jsonc", *extra])
+    with pytest.raises(SystemExit) as error:
+        rlm_train.parse_args()
+    assert error.value.code == 2
+    assert "required: --total-batch-token-size" in capsys.readouterr().err
+
+
+def test_cli_rejects_removed_total_batch_size_flag(monkeypatch, tmp_path, capsys):
+    with pytest.raises(SystemExit) as error:
+        arguments(monkeypatch, tmp_path / "unused", "--total-batch-size", "32")
+    assert error.value.code == 2
+    assert "unrecognized arguments: --total-batch-size" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("extra,match", [

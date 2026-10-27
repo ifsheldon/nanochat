@@ -2,6 +2,8 @@
 
 Use runs/runh100_rlm.sh to install the locked environment first.
 See dev/h100-training/H100_RLM.md for the asset bundle, resource requirements, and recovery.
+The global token budget counts real-text targets per optimizer update across all
+GPUs and accumulation steps, excluding additional EOM predictions and memory/summary positions.
 """
 
 import argparse
@@ -44,11 +46,12 @@ RECIPES = (
 )
 
 
-def accumulation_steps(recipe, text_length, num_gpus):
+def accumulation_steps(recipe, text_length, num_gpus, total_batch_token_size):
+    """Derive A = global text-token budget / (device batch x 4 cycles x C x GPUs)."""
     tokens_per_microbatch = recipe.device_batch_size * 4 * text_length * num_gpus
-    steps, remainder = divmod(1047552, tokens_per_microbatch)
+    steps, remainder = divmod(total_batch_token_size, tokens_per_microbatch)
     if remainder or steps < 1:
-        raise ValueError("The H100 global batch of 1047552 text tokens must be divisible by device batch size x 4 cycles x profile text_length x GPU count.")
+        raise ValueError("The H100 global batch token budget must be positive and divisible by device batch size x 4 cycles x profile text_length x GPU count.")
     return steps
 
 
@@ -92,6 +95,8 @@ def parse_args(argv=None):
     parser.add_argument("--assets", type=Path, help="verified embedding-only seed bundle; required for a fresh run")
     parser.add_argument("--model-profile", type=Path, required=True,
                         help="JSONC architecture profile; required for fresh training and resume")
+    parser.add_argument("--total-batch-token-size", type=int, metavar="TOKENS",
+                        help="global real-text targets per optimizer update across GPUs and accumulation; excludes additional EOM predictions and memory/summary positions; required fresh, restored on resume (an explicit value must match)")
     destination = parser.add_mutually_exclusive_group()
     destination.add_argument("--run-name", type=RunName, help="run name under repository training_run/; default: NANOCHAT_RUN_NAME or pretrain-1")
     destination.add_argument("--output-dir", type=Path, help="explicit run directory instead of training_run/<run-name>")
@@ -102,15 +107,20 @@ def parse_args(argv=None):
         parser.error("fresh training requires --assets pointing to the embedding-only seed bundle")
     if args.resume and args.assets is not None:
         parser.error("--resume restores checkpoint weights; omit --assets")
+    if args.total_batch_token_size is not None and args.total_batch_token_size <= 0:
+        parser.error("--total-batch-token-size must be a positive integer")
+    if not args.resume and args.total_batch_token_size is None:
+        parser.error("fresh training requires --total-batch-token-size")
     return args
 
 
-def training_arguments(recipe, output_dir, *, model_profile, assets=None, mode="train", resume=False):
+def training_arguments(recipe, output_dir, *, model_profile, total_batch_token_size, assets=None, mode="train", resume=False):
+    """Apply one explicit global text-token budget to probes and training."""
     probe = mode != "train"
     arguments = [
         "--mode", mode, "--device-type", "cuda",
         "--model-profile", str(model_profile), "--cycles", "4",
-        "--device-batch-size", str(recipe.device_batch_size), "--total-batch-size", "1047552",
+        "--device-batch-size", str(recipe.device_batch_size), "--total-batch-token-size", str(total_batch_token_size),
         "--num-iterations", "5574", "--warmup-steps", "40", "--warmdown-ratio", "0.65",
         "--final-lr-frac", "0.05", "--embedding-lr", "0.3", "--unembedding-lr", "0.008",
         "--matrix-lr", "0.02", "--scalar-lr", "0.5", "--weight-decay", "0.28",
@@ -281,7 +291,7 @@ def training_command(arguments, num_gpus):
             f"--nproc-per-node={num_gpus}", "-m", "scripts.rlm_train", *arguments]
 
 
-def choose_recipe(output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1, model_profile):
+def choose_recipe(output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1, model_profile, total_batch_token_size):
     runner = run_logged if runner is None else runner
     for index, recipe in enumerate(RECIPES, start=1):
         probe_dir = checked_path(
@@ -289,7 +299,7 @@ def choose_recipe(output_dir, assets, environment, log_dir, runner=None, *, num_
         )
         if probe_dir.exists():
             raise FileExistsError(f"A previous probe already exists at {probe_dir}; preserve this run and choose a new --output-dir.")
-        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="capacity-probe", model_profile=model_profile)
+        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="capacity-probe", model_profile=model_profile, total_batch_token_size=total_batch_token_size)
         code = runner(training_command(arguments, num_gpus),
                       log_dir / f"probe-{index:02d}-{recipe.name}.log", environment)
         result_path = probe_dir / "result.json"
@@ -318,7 +328,7 @@ def choose_recipe(output_dir, assets, environment, log_dir, runner=None, *, num_
     raise RuntimeError("WARNING: all three authorized H100 capacity probes failed. Training was not started; no smaller batch or alternate precision was selected.")
 
 
-def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1, model_profile):
+def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1, model_profile, total_batch_token_size):
     """Compare isolated, compilation-free updates; an unusable FA3 is optional."""
     runner = run_logged if runner is None else runner
     measurements = {}
@@ -329,7 +339,7 @@ def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=No
         if probe_dir.exists():
             raise FileExistsError(f"An attention probe already exists at {probe_dir}; choose a new --output-dir.")
         log_path = log_dir / f"attention-{backend.value}.log"
-        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="attention-probe", model_profile=model_profile)
+        arguments = training_arguments(recipe, probe_dir, assets=assets, mode="attention-probe", model_profile=model_profile, total_batch_token_size=total_batch_token_size)
         probe_environment = dict(environment, NANOCHAT_ATTENTION_IMPL=backend.value)
         code = None
         try:
@@ -372,13 +382,16 @@ def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=No
 def load_recipe(output_dir, text_length):
     path = checked_path(output_dir / "selected-recipe.json")
     saved = json.loads(path.read_text())
-    if not isinstance(saved, dict) or saved.get("schema_version") != 3:
+    if not isinstance(saved, dict) or saved.get("schema_version") != 4:
         raise ValueError("Unsupported selected-recipe.json schema; refusing to resume.")
     if type(saved.get("num_gpus")) is not int or saved["num_gpus"] not in (1, 2, 4):
         raise ValueError("Saved recipe must record a supported GPU count.")
+    total_batch_token_size = saved.get("total_batch_token_size")
+    if type(total_batch_token_size) is not int or total_batch_token_size <= 0:
+        raise ValueError("Saved recipe must record a positive integer total_batch_token_size.")
     for recipe in RECIPES:
         if (saved.get("recipe") == asdict(recipe)
-                and saved.get("accumulation_steps") == accumulation_steps(recipe, text_length, saved["num_gpus"])):
+                and saved.get("accumulation_steps") == accumulation_steps(recipe, text_length, saved["num_gpus"], total_batch_token_size)):
             return recipe, saved
     raise ValueError("Saved recipe is not one of the three authorized H100 recipes.")
 
@@ -411,6 +424,10 @@ def launch(args):
                 document.copy_once(model_profile)
                 document = ModelProfileDocument.read(model_profile)
             recipe, saved = load_recipe(output_dir, document.profile.text_length)
+            total_batch_token_size = saved["total_batch_token_size"]
+            if args.total_batch_token_size is not None and args.total_batch_token_size != total_batch_token_size:
+                raise ValueError("Explicit --total-batch-token-size differs from the saved recipe token budget.")
+            accumulation_steps(recipe, document.profile.text_length, args.num_gpus, total_batch_token_size)
             datasets_dir = checked_path(args.datasets_dir or Path(saved["datasets_directory"]), directory=True)
             checked_path(output_dir / "train" / "checkpoints" / "latest.pt")
             assets = None
@@ -420,6 +437,8 @@ def launch(args):
             datasets_dir = checked_path(args.datasets_dir or get_datasets_dir(), directory=True, must_exist=False)
             assets = checked_path(args.assets, directory=True)
             document = requested
+            total_batch_token_size = args.total_batch_token_size
+            accumulation_steps(RECIPES[0], document.profile.text_length, args.num_gpus, total_batch_token_size)
             model_profile = checked_path(output_dir / CHECKPOINT_PROFILE_NAME, must_exist=False)
             document.copy_once(model_profile)
             document = ModelProfileDocument.read(model_profile)
@@ -450,13 +469,14 @@ def launch(args):
                 if code:
                     raise RuntimeError(f"Dataset downloader failed with status {code}; inspect {log_dir}.")
                 dataset = verify_dataset(datasets_dir)
-            recipe = choose_recipe(output_dir, assets, environment, log_dir, num_gpus=args.num_gpus, model_profile=model_profile)
-            attention = choose_attention(recipe, output_dir, assets, environment, log_dir, num_gpus=args.num_gpus, model_profile=model_profile)
+            recipe = choose_recipe(output_dir, assets, environment, log_dir, num_gpus=args.num_gpus, model_profile=model_profile, total_batch_token_size=total_batch_token_size)
+            attention = choose_attention(recipe, output_dir, assets, environment, log_dir, num_gpus=args.num_gpus, model_profile=model_profile, total_batch_token_size=total_batch_token_size)
             environment["NANOCHAT_ATTENTION_IMPL"] = attention["selected"]
-            production_arguments = training_arguments(recipe, output_dir / "train", assets=assets, model_profile=model_profile)
+            production_arguments = training_arguments(recipe, output_dir / "train", assets=assets, model_profile=model_profile, total_batch_token_size=total_batch_token_size)
             saved = {
-                "schema_version": 3, "recipe": asdict(recipe),
-                "num_gpus": args.num_gpus, "accumulation_steps": accumulation_steps(recipe, document.profile.text_length, args.num_gpus),
+                "schema_version": 4, "recipe": asdict(recipe),
+                "total_batch_token_size": total_batch_token_size,
+                "num_gpus": args.num_gpus, "accumulation_steps": accumulation_steps(recipe, document.profile.text_length, args.num_gpus, total_batch_token_size),
                 "assets_directory": str(assets), "datasets_directory": str(datasets_dir),
                 "assets": assets_record, "dataset": dataset, "gpu": gpu,
                 "production_arguments": production_arguments,
@@ -471,13 +491,14 @@ def launch(args):
                 "python": sys.version,
             }
             write_json(recipe_path, saved)
-        accumulation = accumulation_steps(recipe, document.profile.text_length, args.num_gpus)
+        accumulation = accumulation_steps(recipe, document.profile.text_length, args.num_gpus, total_batch_token_size)
         print(f"Selected {recipe.name}: {args.num_gpus} GPUs x batch {recipe.device_batch_size} x accumulation {accumulation}, embedding policy {recipe.training_freeze}.", flush=True)
-        arguments = training_arguments(recipe, output_dir / "train", assets=assets, resume=args.resume, model_profile=model_profile)
+        arguments = training_arguments(recipe, output_dir / "train", assets=assets, resume=args.resume, model_profile=model_profile, total_batch_token_size=total_batch_token_size)
         command = training_command(arguments, args.num_gpus)
         write_json(log_dir / "invocation.json", {"arguments": arguments, "command": command,
                                                "resume": args.resume, "num_gpus": args.num_gpus,
-                                               "accumulation_steps": accumulation})
+                                               "accumulation_steps": accumulation,
+                                               "total_batch_token_size": total_batch_token_size})
         code = run_logged(command,
                           log_dir / "training.log", environment)
         if code:

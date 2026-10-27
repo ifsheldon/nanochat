@@ -1,5 +1,10 @@
 """Train or measure recurrent latent memory with explicit text-token budgets.
 
+--total-batch-token-size counts real-text target tokens per optimizer update
+across every GPU and accumulation step. It excludes additional EOM predictions
+and memory/summary positions. Accumulation is derived from this budget, GPU
+count, episodes per device batch, cycles per episode, and profile text_length.
+
 NANOCHAT_RUN_NAME selects training_run/<name>; NANOCHAT_BASE_DIR overrides that
 artifact root, including its tokenizer. Shared data uses NANOCHAT_DATASETS_DIR.
 Training output defaults to <run>/train. See dev/spark-training/SPARK_RLM.md for contracts.
@@ -32,9 +37,13 @@ def parse_args():
     parser.add_argument("--device-type", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--model-profile", type=Path, required=True,
                         help="JSONC architecture profile; required for fresh runs and resume")
-    parser.add_argument("--cycles", type=int, default=2)
-    parser.add_argument("--device-batch-size", type=int, default=16)
-    parser.add_argument("--total-batch-size", type=int, default=1_047_552, help="real text targets per optimizer update; EOM adds one prediction per cycle")
+    parser.add_argument("--cycles", type=int, default=2,
+                        help="recurrent text chunks per episode; memory and gradients span these cycles (default: 2)")
+    parser.add_argument("--device-batch-size", type=int, default=16,
+                        help="episodes processed together per GPU per accumulation step (default: 16)")
+    parser.add_argument("--total-batch-token-size", dest="total_batch_size", metavar="TOKENS", type=int, required=True,
+                        help="global real-text target tokens per optimizer update across all GPUs and accumulation steps; "
+                             "excludes extra EOM predictions and memory/summary positions; accumulation is calculated automatically")
     parser.add_argument("--num-iterations", type=int, default=None, help="required for training; probe defaults to two updates")
     parser.add_argument("--warmup-steps", type=int, default=40)
     parser.add_argument("--warmdown-ratio", type=float, default=0.65)

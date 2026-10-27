@@ -140,7 +140,7 @@ module = importlib.import_module(sys.argv[1])
 assert "torch" not in sys.modules
 sys.argv = [sys.argv[1]]
 if sys.argv[0] == "scripts.rlm_train":
-    sys.argv.extend(["--model-profile", "model_profiles/rlm-d24.jsonc", "--total-batch-size", "1047552"])
+    sys.argv.extend(["--model-profile", "model_profiles/rlm-d24.jsonc", "--total-batch-token-size", "1047552"])
 ordinary_import = builtins.__import__
 
 def checked_import(name, *args, **kwargs):

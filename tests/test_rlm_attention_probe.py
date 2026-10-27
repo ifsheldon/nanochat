@@ -132,7 +132,7 @@ def test_cli_times_complete_update_without_checkpoint_writes(
     output = tmp_path / f"attention-{policy}"
     args = arguments(
         monkeypatch, output, "--mode", "attention-probe", "--num-iterations", "100",
-        "--total-batch-size", "32", "--input-embedding-freeze", policy,
+        "--total-batch-token-size", "32", "--input-embedding-freeze", policy,
         "--compile" if compile_model else "--no-compile",
         *source_arguments(source_dir, source_tokenizer),
     )

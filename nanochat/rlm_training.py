@@ -19,6 +19,16 @@ from nanochat.training_runtime import positive_gb, require_finite_loss
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    """Training settings whose batch units are episodes and real-text targets.
+
+    An episode contains ``cycles`` text chunks with differentiable memory
+    between them; memory resets before the next episode. ``device_batch_size``
+    counts episodes processed together per worker per accumulation step.
+    ``total_batch_size``, exposed as ``--total-batch-token-size``, counts
+    real-text targets per optimizer update across all workers and accumulation
+    steps. It excludes additional EOM predictions and memory/summary positions.
+    """
+
     cycles: int = 2
     device_batch_size: int = 16
     total_batch_size: int = 1_047_552
@@ -53,6 +63,14 @@ class TrainingConfig:
                 raise ValueError(f"{name} must be finite and nonnegative")
 
     def accumulation_steps(self, text_length, world_size=1):
+        """Derive complete microbatches per worker for one optimizer update.
+
+        total_batch_size = world_size * device_batch_size * accumulation_steps
+                           * cycles * text_length
+
+        The budget must be an exact multiple of the global microbatch's text
+        targets; episodes are neither split nor rounded to fit the budget.
+        """
         microbatch_tokens = self.device_batch_size * self.cycles * text_length * world_size
         if self.total_batch_size % microbatch_tokens:
             raise ValueError(
@@ -62,10 +80,12 @@ class TrainingConfig:
         return self.total_batch_size // microbatch_tokens
 
     def positions_per_episode(self, text_length, memory_tokens):
+        """Count Transformer inputs across all cycles, including EOM and memory."""
         # The final cycle has no memory consumer, so it omits the summary suffix.
         return self.cycles * (text_length + 1) + 2 * (self.cycles - 1) * memory_tokens
 
     def prediction_targets_per_update(self, text_length):
+        """Count real-text targets plus one extra EOM prediction per cycle."""
         self.accumulation_steps(text_length)
         return self.total_batch_size + self.total_batch_size // text_length
 

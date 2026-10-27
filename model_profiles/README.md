@@ -4,6 +4,8 @@ RLM training, capacity probes, attention probes, and the H100 launcher require `
 There is no default or automatic profile selection; [`rlm-d24.jsonc`](rlm-d24.jsonc) is a bundled reference example.
 Profiles support `//` and `/* ... */` comments and trailing commas through the `json5` parser.
 
+The [training settings reference](../dev/RLM_TRAINING_SETTINGS.md) explains episodes, token budgets, accumulation, and every trainer/launcher option.
+
 Each profile requires exactly these seven fields:
 
 | Field | Meaning | Reference d24 value |
@@ -30,16 +32,19 @@ Pass the reference profile to the trainer or H100 launcher, or copy it and edit 
 ```bash
 uv run --no-sync python -m scripts.rlm_train \
     --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --mode probe --device-batch-size 16
 
 bash runs/runh100_rlm.sh \
     --num-gpus 2 --model-profile model_profiles/rlm-d24.jsonc \
+    --total-batch-token-size 1047552 \
     --assets assets/h100-seed --run-name pretrain-2gpu
 ```
 
 Prepare the tokenizer and dataset as described in the [Spark guide](../dev/spark-training/SPARK_RLM.md) or use the [H100 launcher](../dev/h100-training/H100_RLM.md), which prepares them automatically.
-The direct trainer's `--total-batch-size` defaults to 1,047,552 real-text targets per optimizer update; choose another divisible budget for a custom architecture.
-The H100 launcher keeps its existing four-cycle training recipe and fixed 1,047,552-text-target batch; accumulation is calculated from the selected profile's `text_length` and GPU count.
+The direct trainer requires `--total-batch-token-size` in every mode, including resume; the H100 launcher requires it for a fresh run and restores it from the saved recipe when omitted on resume.
+This budget counts text targets across all GPUs per optimizer update, excluding EOM predictions and memory/summary positions.
+The H100 launcher keeps its four-cycle recipe; accumulation is calculated from the explicit budget, selected profile's `text_length`, device batch, and GPU count.
 The global text batch must be divisible by `device_batch_size * cycles * text_length * num_gpus`.
 Changing the model width requires a matching initialization embedding or fresh initialization through the direct trainer; the supplied H100 embedding has width 1536.
 
@@ -57,7 +62,8 @@ Resume requires `--model-profile PATH` too.
 For the direct trainer, pass `--model-profile OUTPUT/checkpoints/model-profile.jsonc` to select the saved document explicitly; the original source file can then be edited or removed without changing the resumed architecture.
 You may instead pass a source profile with the same seven field values as the saved profile; its comments may differ, and the saved document is retained unchanged.
 If no checkpoint profile is present, pass a profile matching the checkpoint's architecture; it is copied when the next checkpoint is saved.
-Repeat the desired training and checkpoint options when invoking the direct trainer; the H100 launcher restores its saved training recipe.
+Repeat the desired training and checkpoint options, including required `--total-batch-token-size`, when invoking the direct trainer; the H100 launcher restores its saved training recipe and token budget.
+An explicitly supplied H100 resume budget must match that saved budget.
 
 The H100 launcher also saves `OUTPUT/model-profile.jsonc` before its first probe and passes that same file to capacity probing, attention benchmarking, and fresh training.
 Its trainer then saves `OUTPUT/train/checkpoints/model-profile.jsonc`; pass that path explicitly with `--model-profile` when resuming through the H100 launcher, or pass a matching source profile.

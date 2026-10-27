@@ -1,5 +1,6 @@
 """Exercise the H100 handoff's ordered decisions and checkpoint resume on CPU."""
 
+from contextlib import nullcontext
 from dataclasses import asdict
 import json
 import os
@@ -19,7 +20,7 @@ def argument(command, name):
 
 def passed_result(frozen=False):
     return {
-        "status": "completed", "mode": "capacity-probe", "completed_updates": 1,
+        "world_size": 1, "status": "completed", "mode": "capacity-probe", "completed_updates": 1,
         "attempt_updates": 1, "capacity_probe": {
             "optimizer_state_preallocated": True, "checkpoint_staging_preallocated": True,
             "input_embedding_frozen": frozen,
@@ -29,7 +30,7 @@ def passed_result(frozen=False):
 
 def passed_attention_result(backend, duration, frozen=False):
     return {
-        "status": "completed", "mode": "attention-probe", "attention_impl": backend,
+        "world_size": 1, "status": "completed", "mode": "attention-probe", "attention_impl": backend,
         "attention_probe": {
             "duration_seconds": duration, "warmup_updates": 2, "compilation_excluded": True,
             "optimizer_state_preallocated": True, "checkpoint_staging_preallocated": True,
@@ -48,7 +49,7 @@ def fake_probe_runner(outcomes, commands):
         if outcome == "success":
             result, code = passed_result(argument(command, "--input-embedding-freeze") == "permanent"), 0
         elif outcome == "oom":
-            result, code = {"status": "failed", "failure_kind": "cuda_out_of_memory"}, 1
+            result, code = {"status": "failed", "failure_kind": "cuda_out_of_memory", "world_size": 1}, 1
         else:
             result, code = outcome, 1
         (destination / "result.json").write_text(json.dumps(result))
@@ -116,9 +117,10 @@ def test_probe_without_resident_memory_contract_is_not_accepted(tmp_path, missin
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("initial_gpus,resume_gpus", [(1, 1), (1, 2), (2, 4), (4, 1)])
 @pytest.mark.parametrize("destination_kind", ["explicit", "named", "default"])
 @pytest.mark.parametrize("flash_crashes", [False, True])
-def test_launch_and_resume_reuse_recipe_without_probes_download_or_initialization(tmp_path, monkeypatch, destination_kind, flash_crashes):
+def test_launch_and_resume_reuse_recipe_without_probes_download_or_initialization(tmp_path, monkeypatch, destination_kind, flash_crashes, initial_gpus, resume_gpus):
     output = tmp_path / "output"
     assets = tmp_path / "assets"
     assets.mkdir()
@@ -138,9 +140,9 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
         monkeypatch.delenv(name, raising=False)
     configured = []
     monkeypatch.setattr(launcher, "configure_runtime_paths", configured.append)
-    def check_gpu():
+    def check_gpu(num_gpus):
         assert configured[-1] == output
-        return {"allocator_limit_gb": 80}
+        return {"allocator_limit_gb": 80, "visible_devices": ",".join(str(index) for index in range(num_gpus))}
     monkeypatch.setattr(launcher, "check_gpu", check_gpu)
     monkeypatch.setattr(launcher, "require_disk_space", lambda *_: None)
     def prepare_assets(source, run_dir):
@@ -162,12 +164,15 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
         if command[2] == "nanochat.dataset":
             assert command[3:] == ["-n", "170"]
             return 0
+        workers = next((int(value.split("=")[1]) for value in command
+                        if value.startswith("--nproc-per-node=")), 1)
         destination = Path(argument(command, "--output-dir"))
         destination.mkdir(parents=True, exist_ok=True)
         if argument(command, "--mode") == "capacity-probe":
             result = passed_result(argument(command, "--input-embedding-freeze") == "permanent")
             if argument(command, "--input-embedding-freeze") == "none":
                 result = {"status": "failed", "failure_kind": "cuda_out_of_memory"}
+            result["world_size"] = workers
             (destination / "result.json").write_text(json.dumps(result))
             return int(result["status"] == "failed")
         if argument(command, "--mode") == "attention-probe":
@@ -175,21 +180,24 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
             if flash_crashes and backend == "fa3":
                 return -11
             result = passed_attention_result(backend, 12 if backend == "fa3" else 15, frozen=True)
+            result["world_size"] = workers
             (destination / "result.json").write_text(json.dumps(result))
             return 0
         (destination / "checkpoints").mkdir(exist_ok=True)
         (destination / "checkpoints" / "latest.pt").write_bytes(b"checkpoint")
         return 0
     monkeypatch.setattr(launcher, "run_logged", run)
-    launcher.launch(launcher.parse_args(["--assets", str(assets), *destination]))
+    launcher.launch(launcher.parse_args(["--num-gpus", str(initial_gpus), "--assets", str(assets), *destination]))
     saved = json.loads((output / "selected-recipe.json").read_text())
     assert saved["recipe"] == asdict(launcher.RECIPES[1])
+    assert saved["num_gpus"] == initial_gpus
+    assert saved["accumulation_steps"] == 8 // initial_gpus
     assert saved["datasets_directory"] == str(tmp_path / "datasets")
     assert saved["environment"]["NANOCHAT_BASE_DIR"] == str(output)
     assert saved["environment"]["NANOCHAT_DATASETS_DIR"] == str(tmp_path / "datasets")
     assert saved["environment"]["NANOCHAT_TRAIN_SHARDS"] == "170"
     assert not (output / "cache").exists()
-    assert [command[2] for command in calls] == ["nanochat.dataset", *["scripts.rlm_train"] * 5]
+    assert [command[7] if command[2] == "torch.distributed.run" else command[2] for command in calls] == ["nanochat.dataset", *["scripts.rlm_train"] * 5]
     selected = "sdpa" if flash_crashes else "fa3"
     assert saved["attention_probe"]["selected"] == selected
     assert saved["environment"]["NANOCHAT_ATTENTION_IMPL"] == selected
@@ -205,9 +213,17 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     monkeypatch.setattr(launcher, "prepare_assets", lambda *_: pytest.fail("resume must not initialize assets"))
     monkeypatch.setattr(launcher, "verify_dataset", lambda *_: pytest.fail("resume must not scan dataset identity"))
     monkeypatch.setattr(launcher, "tokenizer_inventory", lambda *_: pytest.fail("resume must not scan tokenizer identity"))
-    launcher.launch(launcher.parse_args(["--resume", *destination]))
+    launcher.launch(launcher.parse_args(["--num-gpus", str(resume_gpus), "--resume", *destination]))
     assert len(calls) == 1
-    assert calls[0][2] == "scripts.rlm_train"
+    expected_prefix = [sys.executable, "-m", "scripts.rlm_train"]
+    if resume_gpus > 1:
+        expected_prefix = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
+                           f"--nproc-per-node={resume_gpus}", "-m", "scripts.rlm_train"]
+    assert calls[0][:len(expected_prefix)] == expected_prefix
+    assert environments[0]["CUDA_VISIBLE_DEVICES"] == ",".join(str(index) for index in range(resume_gpus))
+    invocations = [json.loads(path.read_text()) for path in sorted((output / "logs").glob("*/invocation.json"))]
+    assert invocations[-1]["num_gpus"] == resume_gpus
+    assert invocations[-1]["accumulation_steps"] == 8 // resume_gpus
     assert "--resume-latest" in calls[0]
     assert "--init-embedding-bundle" not in calls[0]
     assert argument(calls[0], "--input-embedding-freeze") == "permanent"
@@ -217,7 +233,7 @@ def test_launch_and_resume_reuse_recipe_without_probes_download_or_initializatio
     assert environments[0]["NANOCHAT_ATTENTION_IMPL"] == selected
     alternate = tmp_path / "other-datasets"
     (tmp_path / "datasets").rename(alternate)
-    launcher.launch(launcher.parse_args(["--resume", *destination, "--datasets-dir", str(alternate)]))
+    launcher.launch(launcher.parse_args(["--num-gpus", str(resume_gpus), "--resume", *destination, "--datasets-dir", str(alternate)]))
     assert len(calls) == 2
     assert calls[1] == calls[0]
     assert environments[1]["NANOCHAT_DATASETS_DIR"] == str(alternate)
@@ -389,7 +405,7 @@ def test_gpu_capacity_and_environment_override_spark_allocator_limit(monkeypatch
     cuda = SimpleNamespace(
         is_available=lambda: True, device_count=lambda: 1,
         get_device_properties=lambda _: SimpleNamespace(name=name, total_memory=total_gb * launcher.GB),
-        is_bf16_supported=lambda: True,
+        is_bf16_supported=lambda: True, device=lambda _: nullcontext(),
         mem_get_info=lambda _: (free_gb * launcher.GB, total_gb * launcher.GB),
     )
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda, __version__="locked-torch", version=SimpleNamespace(cuda="13.2")))
@@ -397,13 +413,13 @@ def test_gpu_capacity_and_environment_override_spark_allocator_limit(monkeypatch
     monkeypatch.setattr(launcher.subprocess, "check_output", lambda *_args, **_kwargs: "driver-version\n")
     monkeypatch.setenv("NANOCHAT_CUDA_MEMORY_LIMIT_GB", "100")
     monkeypatch.setenv("NANOCHAT_DTYPE", "float32")
-    gpu = launcher.check_gpu()
+    gpu = launcher.check_gpu(1)
     environment = launcher.runtime_environment(Path("/run"), Path("/datasets"), gpu)
     assert float(environment["NANOCHAT_CUDA_MEMORY_LIMIT_GB"]) == allocator_limit_gb
     assert environment["NANOCHAT_DTYPE"] == "bfloat16"
     cuda.get_device_properties = lambda _: SimpleNamespace(name="NVIDIA H100 80GB MIG", total_memory=85 * launcher.GB)
     with pytest.raises(RuntimeError, match="full H100"):
-        launcher.check_gpu()
+        launcher.check_gpu(1)
 
 
 def test_probe_symlink_is_rejected_before_dispatch_or_external_writes(tmp_path):
@@ -432,7 +448,7 @@ def test_log_symlink_is_rejected_before_external_directory_creation(tmp_path, mo
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(launcher, "check_gpu", lambda: pytest.fail("Symlink validation must precede GPU initialization"))
     with pytest.raises(ValueError, match="symlinks"):
-        launcher.launch(launcher.parse_args(["--assets", str(assets), "--output-dir", str(output)]))
+        launcher.launch(launcher.parse_args(["--num-gpus", "1", "--assets", str(assets), "--output-dir", str(output)]))
     assert list(outside.iterdir()) == []
 
 
@@ -447,7 +463,7 @@ def test_wrapper_sets_run_local_download_caches_before_uv_without_shell_interpol
     for name in ("UV_CACHE_DIR", "HF_XET_CACHE"):
         environment.pop(name, None)
     result = subprocess.run(
-        ["bash", "runs/runh100_rlm.sh", "--assets", str(tmp_path / "seed"), "--output-dir", str(run)],
+        ["bash", "runs/runh100_rlm.sh", "--num-gpus", "1", "--assets", str(tmp_path / "seed"), "--output-dir", str(run)],
         cwd=launcher.REPOSITORY, env=environment, capture_output=True, text=True, check=True,
     )
     recorded = json.loads(result.stdout)
@@ -457,7 +473,7 @@ def test_wrapper_sets_run_local_download_caches_before_uv_without_shell_interpol
     assert not run.exists()
     assert not (launcher.REPOSITORY / "UNEXPECTED_COMMAND_EXECUTION").exists()
     help_result = subprocess.run(
-        ["bash", "runs/runh100_rlm.sh", "--assets", "missing", "--help"],
+        ["bash", "runs/runh100_rlm.sh", "--num-gpus", "1", "--assets", "missing", "--help"],
         cwd=launcher.REPOSITORY, env=environment, capture_output=True, text=True, check=True,
     )
     assert "--run-name" in help_result.stdout and '"uv_cache"' not in help_result.stdout
@@ -473,8 +489,145 @@ def test_wrapper_preserves_explicit_uv_and_xet_cache_locations(tmp_path):
                        UV_CACHE_DIR=str(tmp_path / "shared-uv"), HF_XET_CACHE=str(tmp_path / "shared-xet"))
     run = tmp_path / "run"
     result = subprocess.run(
-        ["bash", "runs/runh100_rlm.sh", "--assets", str(tmp_path / "seed"), "--output-dir", str(run)],
+        ["bash", "runs/runh100_rlm.sh", "--num-gpus", "1", "--assets", str(tmp_path / "seed"), "--output-dir", str(run)],
         cwd=launcher.REPOSITORY, env=environment, capture_output=True, text=True, check=True,
     )
     assert json.loads(result.stdout) == [str(tmp_path / "shared-uv"), str(tmp_path / "shared-xet")]
     assert not run.exists()
+
+
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("count", [None, "0", "3", "8"])
+def test_cli_requires_an_explicit_supported_gpu_count(resume, count):
+    arguments = ["--resume"] if resume else ["--assets", "/seed"]
+    if count is not None:
+        arguments.extend(("--num-gpus", count))
+    with pytest.raises(SystemExit) as exc:
+        launcher.parse_args(arguments)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("num_gpus", [1, 2, 4])
+@pytest.mark.parametrize("visible", [None, "5,2,7,3", "GPU-a,GPU-b,GPU-c,GPU-d"])
+def test_gpu_selection_respects_visibility_and_uses_smallest_selected_free_memory(monkeypatch, num_gpus, visible):
+    if visible is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    selected = []
+    current = []
+    class Device:
+        def __init__(self, index):
+            self.index = index
+        def __enter__(self):
+            current.append(self.index)
+        def __exit__(self, *_):
+            current.pop()
+    def properties(index):
+        selected.append(index)
+        return SimpleNamespace(name="NVIDIA H100", total_memory=85 * launcher.GB)
+    cuda = SimpleNamespace(
+        is_available=lambda: True, device_count=lambda: 4, get_device_properties=properties,
+        device=Device, is_bf16_supported=lambda: bool(current),
+        mem_get_info=lambda index: ((83 - index) * launcher.GB, 85 * launcher.GB),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda, __version__="locked", version=SimpleNamespace(cuda="12.6")))
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(virtual_memory=lambda: SimpleNamespace(total=128 * launcher.GB, available=100 * launcher.GB)))
+    monkeypatch.setattr(launcher.subprocess, "check_output", lambda *_args, **_kwargs: "driver\n")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+    monkeypatch.setenv("MASTER_ADDR", "stale")
+    gpu = launcher.check_gpu(num_gpus)
+    environment = launcher.runtime_environment(Path("/run"), Path("/datasets"), gpu)
+    tokens = visible.split(",") if visible is not None else ["0", "1", "2", "3"]
+    assert environment["CUDA_VISIBLE_DEVICES"] == ",".join(tokens[:num_gpus])
+    assert selected == list(range(num_gpus))
+    assert float(environment["NANOCHAT_CUDA_MEMORY_LIMIT_GB"]) == 82 - num_gpus
+    assert environment.get("WORLD_SIZE", "1") == "1"
+    assert "LOCAL_WORLD_SIZE" not in environment
+    assert "MASTER_ADDR" not in environment
+
+
+@pytest.mark.parametrize("invalid", ["unavailable", "not-h100", "mig", "small", "bf16"])
+def test_every_selected_gpu_is_validated_before_launch(monkeypatch, invalid):
+    def properties(index):
+        name = "NVIDIA H100"
+        total = 85 * launcher.GB
+        if index == 1:
+            name = {"not-h100": "NVIDIA A100", "mig": "NVIDIA H100 MIG"}.get(invalid, name)
+            if invalid == "small":
+                total = 40 * launcher.GB
+        return SimpleNamespace(name=name, total_memory=total)
+    current = []
+    class Device:
+        def __init__(self, index):
+            self.index = index
+        def __enter__(self):
+            current.append(self.index)
+        def __exit__(self, *_):
+            current.pop()
+    cuda = SimpleNamespace(
+        is_available=lambda: True, device_count=lambda: 1 if invalid == "unavailable" else 4,
+        get_device_properties=properties, device=Device,
+        is_bf16_supported=lambda: not (invalid == "bf16" and current[-1] == 1),
+        mem_get_info=lambda _: (83 * launcher.GB, 85 * launcher.GB),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    with pytest.raises(RuntimeError, match="visible|full H100|BF16"):
+        launcher.check_gpu(2)
+
+
+@pytest.mark.parametrize("num_gpus", [2, 4])
+def test_multi_gpu_capacity_probes_preserve_fallback_and_require_matching_worker_reports(tmp_path, num_gpus):
+    calls = []
+    def run(command, log_path, environment):
+        calls.append(command)
+        assert command[:8] == [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1", f"--nproc-per-node={num_gpus}", "-m", "scripts.rlm_train"]
+        destination = Path(argument(command, "--output-dir"))
+        destination.mkdir(parents=True)
+        result = {"status": "failed", "failure_kind": "cuda_out_of_memory", "world_size": num_gpus}
+        if len(calls) == 2:
+            result = passed_result(True)
+            result["world_size"] = num_gpus
+        (destination / "result.json").write_text(json.dumps(result))
+        return 1 if len(calls) == 1 else 0
+    recipe = launcher.choose_recipe(tmp_path, tmp_path / "assets", {}, tmp_path, run, num_gpus=num_gpus)
+    assert recipe == launcher.RECIPES[1]
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("outcome", ["success", "oom"])
+def test_capacity_probe_cannot_select_result_from_another_worker_count(tmp_path, outcome):
+    with pytest.raises(RuntimeError, match="other than GPU memory capacity"):
+        launcher.choose_recipe(tmp_path, tmp_path / "assets", {}, tmp_path, fake_probe_runner([outcome] * 3, []), num_gpus=2)
+
+
+@pytest.mark.parametrize("num_gpus", [2, 4])
+def test_attention_probe_requires_matching_worker_count(tmp_path, num_gpus):
+    calls = []
+    def run(command, log_path, environment):
+        calls.append(command)
+        assert command[:8] == [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1", f"--nproc-per-node={num_gpus}", "-m", "scripts.rlm_train"]
+        destination = Path(argument(command, "--output-dir"))
+        destination.mkdir(parents=True)
+        result = passed_attention_result(environment["NANOCHAT_ATTENTION_IMPL"], 10)
+        (destination / "result.json").write_text(json.dumps(result))
+        return 0
+    with pytest.raises(RuntimeError, match="SDPA attention probe failed"):
+        launcher.choose_attention(launcher.RECIPES[0], tmp_path, tmp_path / "assets", {}, tmp_path, run, num_gpus=num_gpus)
+    assert len(calls) == 1
+
+
+def test_wrapper_rejects_missing_gpu_count_before_running_uv(tmp_path):
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    uv = binary_dir / "uv"
+    uv.write_text("#!/bin/sh\nexit 99\n")
+    uv.chmod(0o700)
+    result = subprocess.run(
+        ["bash", "runs/runh100_rlm.sh", "--resume", "--output-dir", str(tmp_path / "run")],
+        cwd=launcher.REPOSITORY, env=dict(os.environ, PATH=str(binary_dir) + os.pathsep + os.environ["PATH"]),
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "--num-gpus" in result.stderr
+    assert not (tmp_path / "run").exists()

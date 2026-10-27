@@ -45,37 +45,44 @@ def stochastic_loader(tokenizer, batch_size, sequence_length, *, split, device, 
 
 @pytest.fixture
 def training_environment(tmp_path, monkeypatch):
-    for module in (common_module, gpt_module, rlm_module):
-        monkeypatch.setattr(module, "COMPUTE_DTYPE", torch.float32)
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("NANOCHAT_BASE_DIR", str(tmp_path / "cache"))
-    monkeypatch.delenv("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB", raising=False)
-    monkeypatch.delenv("NANOCHAT_CHECKPOINT_RESERVE_GB", raising=False)
-    tokenizer_path = tmp_path / "cache" / "tokenizer" / "tokenizer.pkl"
-    tokenizer_path.parent.mkdir(parents=True)
-    tokenizer_path.write_bytes(b"tiny tokenizer fixture")
-    monkeypatch.setattr(tokenizer_module, "get_tokenizer", TinyTokenizer)
-    monkeypatch.setattr(dataloader_module, "tokenizing_distributed_data_loader_with_state_bos_bestfit", stochastic_loader)
-    # Hold external inventories fixed while exercising the actual trainer,
-    # model, optimizer, checkpoint publication, pruning, and resume contracts.
-    monkeypatch.setattr(rlm_train, "dataset_inventory", lambda: {"sha256": "fixture-data", "files": []})
-    monkeypatch.setattr(training_module, "source_manifest", lambda root: {"sha256": "fixture-source", "files": {}})
+    # Optimizer kernels specialize globally across tests with unrelated model
+    # shapes. Keep this trainer fixture's FP32 shapes in an independent cache.
+    torch.compiler.reset()
+    try:
+        for module in (common_module, gpt_module, rlm_module):
+            monkeypatch.setattr(module, "COMPUTE_DTYPE", torch.float32)
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        monkeypatch.setenv("NANOCHAT_BASE_DIR", str(tmp_path / "cache"))
+        monkeypatch.delenv("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB", raising=False)
+        monkeypatch.delenv("NANOCHAT_CHECKPOINT_RESERVE_GB", raising=False)
+        tokenizer_path = tmp_path / "cache" / "tokenizer" / "tokenizer.pkl"
+        tokenizer_path.parent.mkdir(parents=True)
+        tokenizer_path.write_bytes(b"tiny tokenizer fixture")
+        monkeypatch.setattr(tokenizer_module, "get_tokenizer", TinyTokenizer)
+        monkeypatch.setattr(dataloader_module, "tokenizing_distributed_data_loader_with_state_bos_bestfit", stochastic_loader)
+        # Hold external inventories fixed while exercising the actual trainer,
+        # model, optimizer, checkpoint publication, pruning, and resume contracts.
+        monkeypatch.setattr(rlm_train, "dataset_inventory", lambda: {"sha256": "fixture-data", "files": []})
+        monkeypatch.setattr(training_module, "source_manifest", lambda root: {"sha256": "fixture-source", "files": {}})
 
-    torch.manual_seed(813)
-    source = GPT(GPTConfig(
-        sequence_len=8, vocab_size=32, n_layer=1, n_head=2,
-        n_kv_head=2, n_embd=32, window_pattern="L",
-    ))
-    source.init_weights()
-    source_dir = tmp_path / "source"
-    source_dir.mkdir()
-    torch.save(source.state_dict(), source_dir / "model_000007.pt")
-    (source_dir / "meta_000007.json").write_text(json.dumps({
-        "step": 7, "model_config": asdict(source.config),
-    }))
-    source_tokenizer = tmp_path / "source-tokenizer.pkl"
-    source_tokenizer.write_bytes(tokenizer_path.read_bytes())
-    return source_dir, source_tokenizer, source.transformer.wte.weight.detach().clone()
+        torch.manual_seed(813)
+        source = GPT(GPTConfig(
+            sequence_len=8, vocab_size=32, n_layer=1, n_head=2,
+            n_kv_head=2, n_embd=32, window_pattern="L",
+        ))
+        source.init_weights()
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        torch.save(source.state_dict(), source_dir / "model_000007.pt")
+        (source_dir / "meta_000007.json").write_text(json.dumps({
+            "step": 7, "model_config": asdict(source.config),
+        }))
+        source_tokenizer = tmp_path / "source-tokenizer.pkl"
+        source_tokenizer.write_bytes(tokenizer_path.read_bytes())
+        yield source_dir, source_tokenizer, source.transformer.wte.weight.detach().clone()
+
+    finally:
+        torch.compiler.reset()
 
 
 def arguments(monkeypatch, output_dir, *extra):
@@ -861,3 +868,77 @@ def test_cli_rejects_invalid_initialization_and_resume_options(monkeypatch, tmp_
         arguments(monkeypatch, tmp_path / "unused", *extra)
     assert error.value.code == 2
     assert match in capsys.readouterr().err
+
+
+def test_main_initializes_workers_before_coordinator_creates_artifacts(tmp_path, monkeypatch):
+    from nanochat.rlm_distributed import DistributedRuntime
+
+    output = tmp_path / "coordinator"
+    arguments(monkeypatch, output)
+    calls = []
+    runtime = DistributedRuntime(torch.device("cpu"), rank=0, world_size=2)
+
+    def initialize(device_type):
+        assert device_type == "cpu"
+        assert not output.exists()
+        calls.append("initialize")
+        return runtime
+
+    def primary(function, phase):
+        calls.append(phase)
+        return function()
+
+    def train(args, attempt, *, runtime):
+        assert calls[:2] == ["initialize", "run directory and lock"]
+        assert runtime.world_size == 2
+        assert (output / ".run.lock").is_file()
+        assert sorted(path.name for path in attempt.iterdir()) == ["rank-00000", "rank-00001"]
+        calls.append("train")
+
+    monkeypatch.setattr(DistributedRuntime, "initialize", initialize)
+    monkeypatch.setattr(runtime, "primary", primary)
+    monkeypatch.setattr(runtime, "close", lambda: calls.append("close"))
+    monkeypatch.setattr(rlm_train, "run", train)
+    rlm_train.main()
+    assert calls[-2:] == ["train", "close"]
+    assert len(list((output / "attempts").iterdir())) == 1
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_main_worker_failure_writes_owned_diagnostics_and_coordinator_status(tmp_path, monkeypatch, rank):
+    from nanochat.rlm_distributed import DistributedRuntime
+    from filelock import FileLock
+
+    output = tmp_path / "failed-worker"
+    arguments(monkeypatch, output)
+    attempt = output / "attempts" / "shared-attempt"
+    for worker in range(2):
+        (attempt / f"rank-{worker:05d}").mkdir(parents=True)
+    (output / "result.json").write_text('{"status": "coordinator-owned"}')
+    runtime = DistributedRuntime(torch.device("cpu"), rank=rank, world_size=2)
+    closed = []
+    monkeypatch.setattr(DistributedRuntime, "initialize", lambda device_type: runtime)
+    # The shared attempt is selected by rank zero, so neither test invocation
+    # needs to touch its lock or recreate its directories.
+    monkeypatch.setattr(runtime, "primary", lambda function, phase: str(attempt))
+    monkeypatch.setattr(runtime, "close", lambda: closed.append(True))
+    monkeypatch.setattr(FileLock, "acquire", lambda *args, **kwargs: pytest.fail("worker acquired shared lock"))
+
+    def fail(args, directory, *, runtime):
+        raise torch.cuda.OutOfMemoryError("injected worker OOM")
+
+    monkeypatch.setattr(rlm_train, "run", fail)
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="injected worker OOM"):
+        rlm_train.main()
+    assert closed == [True]
+    diagnostic = json.loads((attempt / f"rank-{rank:05d}" / "failure.json").read_text())
+    assert diagnostic["world_size"] == 2
+    assert diagnostic["failure_kind"] == "cuda_out_of_memory"
+    assert not (attempt / f"rank-{1 - rank:05d}" / "failure.json").exists()
+    shared = json.loads((output / "result.json").read_text())
+    if rank == 0:
+        assert shared == diagnostic
+        assert json.loads((attempt / "result.json").read_text()) == diagnostic
+    else:
+        assert shared == {"status": "coordinator-owned"}
+        assert not (attempt / "result.json").exists()

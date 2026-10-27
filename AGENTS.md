@@ -6,7 +6,7 @@ If you consider additional checks or related features important, explain them to
 # Project overview
 
 nanochat is a Python/PyTorch toolkit for language-model tokenization, pretraining, supervised fine-tuning, reinforcement learning, evaluation, and inference.
-This fork adds DGX Spark workflows and recurrent latent memory (RLM), including pretraining on a single H100 80 GB or H100 NVL 94 GB GPU.
+This fork adds DGX Spark workflows and recurrent latent memory (RLM), including pretraining on 1, 2, or 4 H100 80 GB or H100 NVL 94 GB GPUs on one host.
 RLM reuses a GPT backbone across bounded text chunks and passes learned memory between chunks.
 
 ## Codebase structure
@@ -30,9 +30,10 @@ RLM reuses a GPT backbone across bounded text chunks and passes learned memory b
 - `nanochat/gpt.py` defines the base transformer; `nanochat/rlm.py` defines the recurrent model.
 - `nanochat/tokenizer.py`, `dataset.py`, and `dataloader.py` handle tokenization and pretraining data; `sft_dataloader.py` handles conversation packing.
 - `nanochat/optim.py` implements optimizers; `training_runtime.py` provides shared training resource checks; `paths.py` resolves run, dataset, and cache locations.
+- `nanochat/rlm_distributed.py` coordinates workers; `optim_checkpoint.py` partitions portable optimizer state; `rlm_distributed_checkpoint.py` gathers worker snapshots for coordinator publication.
 - `nanochat/rlm_training.py` implements recurrent training; the other `rlm_*.py` modules separate data handling, initialization, freezing policy, capacity probes, inference, and checkpoints.
 - `scripts/base_train.py`, `chat_sft.py`, and `chat_rl.py` drive the base-model and chat training stages.
-- `scripts/rlm_train.py`, `rlm_eval.py`, and `rlm_sample.py` expose recurrent training, evaluation, and generation; `scripts/h100_rlm.py` orchestrates the single-H100 workflow.
+- `scripts/rlm_train.py`, `rlm_eval.py`, and `rlm_sample.py` expose recurrent training, evaluation, and generation; `scripts/h100_rlm.py` orchestrates the H100 workflow with required `--num-gpus {1,2,4}` and portable resume across those counts.
 
 ## Workflow guides
 

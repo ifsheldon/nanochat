@@ -1,4 +1,4 @@
-"""Prepare, capacity-test, and launch the fixed single-H100 RLM recipe.
+"""Prepare, capacity-test, and launch the fixed RLM recipe on 1, 2, or 4 H100s.
 
 Use runs/runh100_rlm.sh to install the locked environment first.
 See dev/h100-training/H100_RLM.md for the asset bundle, resource requirements, and recovery.
@@ -79,6 +79,8 @@ def write_json(path, value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--num-gpus", type=int, choices=(1, 2, 4), required=True,
+                        help="use the first N visible H100s; required for fresh training and resume")
     parser.add_argument("--assets", type=Path, help="verified embedding-only seed bundle; required for a fresh run")
     destination = parser.add_mutually_exclusive_group()
     destination.add_argument("--run-name", type=RunName, help="run name under repository training_run/; default: NANOCHAT_RUN_NAME or pretrain-1")
@@ -118,21 +120,29 @@ def training_arguments(recipe, output_dir, *, assets=None, mode="train", resume=
     return arguments
 
 
-def check_gpu():
+def check_gpu(num_gpus):
     import psutil
     import torch
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable. Check nvidia-smi and the NVIDIA driver's support for this repository's locked PyTorch 2.14.1 CUDA 12.6 build; do not substitute a different training environment silently.")
-    if torch.cuda.device_count() != 1:
-        raise RuntimeError("Expose exactly one GPU with CUDA_VISIBLE_DEVICES before launching.")
-    properties = torch.cuda.get_device_properties(0)
-    if "H100" not in properties.name or "MIG" in properties.name or properties.total_memory < 75 * GB:
-        raise RuntimeError(f"This launcher requires one full H100 GPU with at least 75 GB of VRAM; found {properties.name} with {properties.total_memory / GB:.1f} GB.")
-    if not torch.cuda.is_bf16_supported():
-        raise RuntimeError("The selected GPU/runtime does not support the required BF16 compute.")
-    free, total = torch.cuda.mem_get_info(0)
-    ceiling = min(total, free) - 2 * GB
+    available = torch.cuda.device_count()
+    if available < num_gpus:
+        raise RuntimeError(f"Requested {num_gpus} H100 GPUs, but only {available} CUDA devices are visible.")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    device_ids = visible.split(",") if visible is not None else [str(index) for index in range(available)]
+    devices = []
+    for index in range(num_gpus):
+        properties = torch.cuda.get_device_properties(index)
+        if "H100" not in properties.name or "MIG" in properties.name or properties.total_memory < 75 * GB:
+            raise RuntimeError(f"Selected device {index} must be a full H100 GPU with at least 75 GB of VRAM; found {properties.name} with {properties.total_memory / GB:.1f} GB.")
+        with torch.cuda.device(index):
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError(f"Selected GPU {index}/runtime does not support the required BF16 compute.")
+        free, total = torch.cuda.mem_get_info(index)
+        devices.append({"device": device_ids[index], "name": properties.name,
+                        "total_bytes": total, "free_bytes": free})
+    ceiling = min(min(device["total_bytes"], device["free_bytes"]) for device in devices) - 2 * GB
     if ceiling <= 0:
         raise RuntimeError("The selected GPU has no usable memory after the 2 GB external-allocation reserve.")
     memory = psutil.virtual_memory()
@@ -145,7 +155,8 @@ def check_gpu():
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError("Cannot query the NVIDIA driver with nvidia-smi.") from exc
     return {
-        "name": properties.name, "total_bytes": total, "free_bytes": free,
+        "num_gpus": num_gpus, "devices": devices,
+        "visible_devices": ",".join(device_ids[:num_gpus]),
         "allocator_limit_gb": ceiling / GB, "driver_versions": driver,
         "torch": torch.__version__, "torch_cuda": torch.version.cuda,
         "host_total_bytes": memory.total, "host_available_bytes": memory.available,
@@ -154,13 +165,20 @@ def check_gpu():
 
 def runtime_environment(output_dir, datasets_dir, gpu):
     environment = dict(os.environ)
+    for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_RANK", "ROLE_RANK",
+                 "ROLE_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
+        environment.pop(name, None)
+    for name in tuple(environment):
+        if name.startswith("TORCHELASTIC_"):
+            environment.pop(name)
     environment.update({
         "NANOCHAT_BASE_DIR": str(output_dir), "NANOCHAT_DATASETS_DIR": str(datasets_dir),
         "NANOCHAT_TRAIN_SHARDS": "170", "NANOCHAT_DTYPE": "bfloat16",
         "NANOCHAT_ATTENTION_IMPL": "sdpa", "OMP_NUM_THREADS": "1", "PYTHONUNBUFFERED": "1",
         "NANOCHAT_CUDA_MEMORY_LIMIT_GB": str(gpu["allocator_limit_gb"]),
         "NANOCHAT_MIN_SYSTEM_AVAILABLE_GB": "12", "NANOCHAT_CHECKPOINT_RESERVE_GB": "100",
-        "PYTORCH_ALLOC_CONF": "expandable_segments:True", "WORLD_SIZE": "1",
+        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        "CUDA_VISIBLE_DEVICES": gpu["visible_devices"],
     })
     return environment
 
@@ -247,7 +265,14 @@ def prepare_assets(assets, output_dir):
     return {"manifest_sha256": digest(assets / "manifest.json"), "tokenizer": tokenizer_inventory(output_dir)}
 
 
-def choose_recipe(output_dir, assets, environment, log_dir, runner=None):
+def training_command(arguments, num_gpus):
+    if num_gpus == 1:
+        return [sys.executable, "-m", "scripts.rlm_train", *arguments]
+    return [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
+            f"--nproc-per-node={num_gpus}", "-m", "scripts.rlm_train", *arguments]
+
+
+def choose_recipe(output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1):
     runner = run_logged if runner is None else runner
     for index, recipe in enumerate(RECIPES, start=1):
         probe_dir = checked_path(
@@ -256,7 +281,7 @@ def choose_recipe(output_dir, assets, environment, log_dir, runner=None):
         if probe_dir.exists():
             raise FileExistsError(f"A previous probe already exists at {probe_dir}; preserve this run and choose a new --output-dir.")
         arguments = training_arguments(recipe, probe_dir, assets=assets, mode="capacity-probe")
-        code = runner([sys.executable, "-m", "scripts.rlm_train", *arguments],
+        code = runner(training_command(arguments, num_gpus),
                       log_dir / f"probe-{index:02d}-{recipe.name}.log", environment)
         result_path = probe_dir / "result.json"
         if not result_path.exists():
@@ -266,6 +291,7 @@ def choose_recipe(output_dir, assets, environment, log_dir, runner=None):
         capacity = result.get("capacity_probe", {})
         expected_frozen = recipe.probe_freeze is InputEmbeddingFreeze.PERMANENT
         if (code == 0 and result.get("status") == "completed"
+                and result.get("world_size") == num_gpus
                 and result.get("mode") == "capacity-probe"
                 and result.get("completed_updates") == 1 and result.get("attempt_updates") == 1
                 and capacity.get("optimizer_state_preallocated") is True
@@ -275,14 +301,15 @@ def choose_recipe(output_dir, assets, environment, log_dir, runner=None):
                 and updates[0].get("finite_loss_and_gradients") is True
                 and updates[0].get("finite_model_and_optimizer_state") is True):
             return recipe
-        if code > 0 and result.get("status") == "failed" and result.get("failure_kind") == "cuda_out_of_memory":
+        if (code > 0 and result.get("world_size") == num_gpus
+                and result.get("status") == "failed" and result.get("failure_kind") == "cuda_out_of_memory"):
             print(f"Capacity probe {recipe.name} exceeded memory; trying the next authorized recipe.", flush=True)
             continue
         raise RuntimeError(f"Probe {recipe.name} failed for a reason other than GPU memory capacity: {result}. Inspect {log_dir} before retrying.")
     raise RuntimeError("WARNING: all three authorized H100 capacity probes failed. Training was not started; no smaller batch or alternate precision was selected.")
 
 
-def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=None):
+def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=None, *, num_gpus=1):
     """Compare isolated, compilation-free updates; an unusable FA3 is optional."""
     runner = run_logged if runner is None else runner
     measurements = {}
@@ -297,7 +324,7 @@ def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=No
         probe_environment = dict(environment, NANOCHAT_ATTENTION_IMPL=backend.value)
         code = None
         try:
-            code = runner([sys.executable, "-m", "scripts.rlm_train", *arguments], log_path, probe_environment)
+            code = runner(training_command(arguments, num_gpus), log_path, probe_environment)
             if code != 0:
                 raise RuntimeError(f"Attention probe exited with status {code}; inspect {log_path}.")
             result = json.loads(checked_path(probe_dir / "result.json").read_text())
@@ -305,6 +332,7 @@ def choose_attention(recipe, output_dir, assets, environment, log_dir, runner=No
             updates = result["updates"]
             duration = measurement["duration_seconds"]
             if (result.get("status") != "completed" or result.get("mode") != "attention-probe"
+                    or result.get("world_size") != num_gpus
                     or AttentionBackend(result["attention_impl"]) is not backend
                     or measurement.get("compilation_excluded") is not True
                     or measurement.get("optimizer_state_preallocated") is not True
@@ -337,8 +365,11 @@ def load_recipe(output_dir):
     saved = json.loads(path.read_text())
     if not isinstance(saved, dict) or saved.get("schema_version") != 2:
         raise ValueError("Unsupported selected-recipe.json schema; refusing to resume.")
+    if type(saved.get("num_gpus")) is not int or saved["num_gpus"] not in (1, 2, 4):
+        raise ValueError("Saved recipe must record a supported GPU count.")
     for recipe in RECIPES:
-        if saved.get("recipe") == asdict(recipe):
+        if (saved.get("recipe") == asdict(recipe)
+                and saved.get("accumulation_steps") == recipe.accumulation_steps // saved["num_gpus"]):
             return recipe, saved
     raise ValueError("Saved recipe is not one of the three authorized H100 recipes.")
 
@@ -347,7 +378,7 @@ def launch(args):
     from filelock import FileLock
 
     if any(name in os.environ for name in ("RANK", "LOCAL_RANK")) or os.environ.get("WORLD_SIZE", "1") != "1":
-        raise ValueError("Run the launcher directly on one GPU, outside torchrun or a distributed worker environment.")
+        raise ValueError("Run the launcher directly, outside torchrun or a distributed worker environment.")
     output_dir = checked_path(args.output_dir or get_run_dir(args.run_name), directory=True, must_exist=False)
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_path = checked_path(output_dir / ".launcher.lock", must_exist=False)
@@ -372,7 +403,7 @@ def launch(args):
         )
         log_dir.mkdir(parents=True)
         configure_runtime_paths(output_dir)
-        gpu = check_gpu()
+        gpu = check_gpu(args.num_gpus)
         environment = runtime_environment(output_dir, datasets_dir, gpu)
         if args.resume:
             environment["NANOCHAT_ATTENTION_IMPL"] = AttentionBackend(saved["environment"]["NANOCHAT_ATTENTION_IMPL"]).value
@@ -392,12 +423,13 @@ def launch(args):
                 if code:
                     raise RuntimeError(f"Dataset downloader failed with status {code}; inspect {log_dir}.")
                 dataset = verify_dataset(datasets_dir)
-            recipe = choose_recipe(output_dir, assets, environment, log_dir)
-            attention = choose_attention(recipe, output_dir, assets, environment, log_dir)
+            recipe = choose_recipe(output_dir, assets, environment, log_dir, num_gpus=args.num_gpus)
+            attention = choose_attention(recipe, output_dir, assets, environment, log_dir, num_gpus=args.num_gpus)
             environment["NANOCHAT_ATTENTION_IMPL"] = attention["selected"]
             production_arguments = training_arguments(recipe, output_dir / "train", assets=assets)
             saved = {
                 "schema_version": 2, "recipe": asdict(recipe),
+                "num_gpus": args.num_gpus, "accumulation_steps": recipe.accumulation_steps // args.num_gpus,
                 "assets_directory": str(assets), "datasets_directory": str(datasets_dir),
                 "assets": assets_record, "dataset": dataset, "gpu": gpu,
                 "production_arguments": production_arguments,
@@ -407,17 +439,22 @@ def launch(args):
                     "NANOCHAT_DTYPE", "NANOCHAT_ATTENTION_IMPL",
                     "NANOCHAT_CUDA_MEMORY_LIMIT_GB", "NANOCHAT_MIN_SYSTEM_AVAILABLE_GB",
                     "NANOCHAT_CHECKPOINT_RESERVE_GB", "OMP_NUM_THREADS", "PYTORCH_ALLOC_CONF",
+                    "CUDA_VISIBLE_DEVICES",
                 )},
                 "python": sys.version,
             }
             write_json(recipe_path, saved)
-            print(f"Selected {recipe.name}: batch {recipe.device_batch_size} x {recipe.accumulation_steps}, embedding policy {recipe.training_freeze}.", flush=True)
+        accumulation = recipe.accumulation_steps // args.num_gpus
+        print(f"Selected {recipe.name}: {args.num_gpus} GPUs x batch {recipe.device_batch_size} x accumulation {accumulation}, embedding policy {recipe.training_freeze}.", flush=True)
         arguments = training_arguments(recipe, output_dir / "train", assets=assets, resume=args.resume)
-        write_json(log_dir / "invocation.json", {"arguments": arguments, "resume": args.resume})
-        code = run_logged([sys.executable, "-m", "scripts.rlm_train", *arguments],
+        command = training_command(arguments, args.num_gpus)
+        write_json(log_dir / "invocation.json", {"arguments": arguments, "command": command,
+                                               "resume": args.resume, "num_gpus": args.num_gpus,
+                                               "accumulation_steps": accumulation})
+        code = run_logged(command,
                           log_dir / "training.log", environment)
         if code:
-            raise RuntimeError(f"Training exited with status {code}; inspect {log_dir / 'training.log'}. To resume a completed checkpoint, rerun with --resume --output-dir {shlex.quote(str(output_dir))}.")
+            raise RuntimeError(f"Training exited with status {code}; inspect {log_dir / 'training.log'}. To resume a completed checkpoint, rerun with --num-gpus {args.num_gpus} --resume --output-dir {shlex.quote(str(output_dir))}.")
 
 
 def main():

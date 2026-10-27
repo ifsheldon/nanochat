@@ -235,6 +235,10 @@ class LatestCheckpoint:
     def load(self, device):
         return self._load(device)
 
+    def load_cpu_mapped(self):
+        """Map the verified complete bundle before copying a worker's partition."""
+        return self._load(torch.device("cpu"), metadata_only=True)
+
     def metadata(self):
         """Read resume metadata without allocating the model/optimizer storage."""
         return self._load(torch.device("cpu"), metadata_only=True)[2]

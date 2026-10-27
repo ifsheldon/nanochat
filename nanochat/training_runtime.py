@@ -40,14 +40,15 @@ def memory_status(device):
     }
 
 
-def check_training_memory(device, step):
+def check_training_memory(device, step, *, synchronize_workers=True):
+    """Check headroom locally when the caller already coordinates phase errors."""
     value = os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB")
     if value is None:
         return
     minimum = positive_gb(value, "NANOCHAT_MIN_SYSTEM_AVAILABLE_GB")
     status = memory_status(device)
     low = torch.tensor(status["system_available_gb"] * 1e9 < minimum, device=device, dtype=torch.int32)
-    if dist.is_initialized():
+    if synchronize_workers and dist.is_initialized():
         dist.all_reduce(low, op=dist.ReduceOp.MAX)
     if low.item():
         raise RuntimeError(f"Insufficient system memory at step {step}: {status}; required available GB: {minimum / 1e9}")
@@ -55,9 +56,10 @@ def check_training_memory(device, step):
         print(f"Memory at step {step}: {status}", flush=True)
 
 
-def require_finite_loss(loss, step):
+def require_finite_loss(loss, step, *, synchronize_workers=True):
+    """Reject nonfinite loss, optionally leaving worker coordination to the caller."""
     finite = torch.isfinite(loss.detach()).to(dtype=torch.int32)
-    if dist.is_initialized():
+    if synchronize_workers and dist.is_initialized():
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
     if not finite.item():
         raise FloatingPointError(f"Non-finite training loss at optimizer step {step}; update aborted")

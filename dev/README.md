@@ -11,11 +11,12 @@ Run commands from the repository root unless a guide says otherwise.
 
 ## H100 training
 
-- [Pretraining with the supplied files](h100-training/H100_RLM.md)
+- [Pretraining on 1, 2, or 4 H100 GPUs with the supplied files](h100-training/H100_RLM.md)
 
 ## RLM architecture
 
 - [Design and implementation plan](RLM-architecture/SPARK_RLM_PLAN.md)
+- [H100 GPU selection implementation plan](RLM-architecture/H100_MULTI_GPU_PLAN.md)
 - [Document-length and memory-boundary analysis](RLM-architecture/SPARK_RLM_DOCUMENT_BOUNDARIES.md)
 
 ## Shared references

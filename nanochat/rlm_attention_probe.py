@@ -8,6 +8,7 @@ import torch
 
 from nanochat.flash_attention import attention_backend
 from nanochat.rlm_capacity import resident_probe_state
+from nanochat.rlm_distributed import DistributedRuntime
 from nanochat.rlm_policy import InputEmbeddingFreeze
 from nanochat.rlm_training import MemoryMonitor, apply_schedule, measured_update
 
@@ -27,7 +28,7 @@ def compiler_snapshot():
 
 
 def attention_probe(model, forward_cycle, optimizer, loader, config, initial_decay,
-                    bos_token_id: int, attempt: Path):
+                    bos_token_id: int, attempt: Path, runtime=None):
     """Discard warmup weights and report exactly one compilation-free update.
 
     Both candidates must use the same production recipe and an explicit embedding
@@ -37,11 +38,12 @@ def attention_probe(model, forward_cycle, optimizer, loader, config, initial_dec
     if config.input_embedding_freeze is InputEmbeddingFreeze.SCHEDULED:
         raise ValueError("Attention probes require an explicit none or permanent embedding freeze policy")
     minimum = os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB")
+    runtime = runtime or DistributedRuntime.single(model.get_device())
     started = time.monotonic()
     warmups = []
     stable_warmup = False
-    with MemoryMonitor(minimum) as monitor:
-        with resident_probe_state(model, optimizer, config, monitor) as (state, setup_memory):
+    with MemoryMonitor(minimum, runtime=runtime) as monitor:
+        with resident_probe_state(model, optimizer, config, monitor, runtime) as (state, setup_memory):
             for step in range(MAX_WARMUP_UPDATES + 1):
                 # A short standalone horizon must not unfreeze a permanently
                 # frozen table or run a schedule past its configured endpoint.
@@ -50,7 +52,9 @@ def attention_probe(model, forward_cycle, optimizer, loader, config, initial_dec
                 before = compiler_snapshot()
                 metrics, _ = measured_update(
                     model, forward_cycle, optimizer, loader, config, schedule_step,
-                    bos_token_id, minimum, failure_path=attempt / "failed-update.json",
+                    bos_token_id, minimum,
+                    failure_path=attempt / ("failed-update.json" if runtime.is_primary else f"failed-update-rank{runtime.rank}.json"),
+                    runtime=runtime,
                 )
                 after = compiler_snapshot()
                 metrics.update({
@@ -59,8 +63,8 @@ def attention_probe(model, forward_cycle, optimizer, loader, config, initial_dec
                     "compilation_before": before,
                     "compilation_after": after,
                 })
-                monitor.require_available(step + 1)
-                compiled = before != after
+                runtime.collective(lambda: monitor.require_available(step + 1), "check attention probe headroom")
+                compiled = runtime.any(before != after)
                 if stable_warmup and not compiled:
                     break
                 warmups.append(metrics)
@@ -71,7 +75,7 @@ def attention_probe(model, forward_cycle, optimizer, loader, config, initial_dec
                     f"after at most {MAX_WARMUP_UPDATES} warmup updates"
                 )
             measurements = [setup_memory, *warmups, metrics]
-            return {
+            return runtime.aggregate_metrics({
                 "status": "completed", "mode": "attention-probe",
                 "attention_impl": attention_backend().value,
                 "completed_updates": len(warmups) + 1,
@@ -90,4 +94,4 @@ def attention_probe(model, forward_cycle, optimizer, loader, config, initial_dec
                 "setup_memory": setup_memory,
                 "warmup_updates": warmups,
                 "updates": [metrics],
-            }
+            })

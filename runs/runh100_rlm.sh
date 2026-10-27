@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Single-H100 preparation, ordered capacity probes, and training. See dev/h100-training/H100_RLM.md.
+# H100 preparation, ordered capacity probes, and training on --num-gpus {1,2,4}.
+# See dev/h100-training/H100_RLM.md.
 set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$repo_root"

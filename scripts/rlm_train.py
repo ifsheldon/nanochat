@@ -153,12 +153,12 @@ def record_checkpoint_retention(checkpoint_dir, step, keep_last, attempt):
     logger.info("%s", json.dumps({"checkpoint_retention": retention}))
 
 
-def run(args, attempt):
+def run(args, attempt, runtime=None):
     import torch
-    from nanochat.checkpoint_manager import checkpoint_is_complete, load_checkpoint
+    from nanochat.checkpoint_manager import checkpoint_is_complete
     from nanochat.rlm_checkpoints import recover_numbered_checkpoint, save_numbered_checkpoint
     from nanochat.rlm_checkpointing import CheckpointWriter
-    from nanochat.common import COMPUTE_DTYPE, compute_init, get_base_dir
+    from nanochat.common import COMPUTE_DTYPE, get_base_dir
     from nanochat.flash_attention import attention_backend
     from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
     from nanochat.rlm import RecurrentGPT, RLMConfig
@@ -171,71 +171,88 @@ def run(args, attempt):
     from nanochat.tokenizer import get_tokenizer
     from nanochat.training_runtime import check_training_memory
     from nanochat.rlm_latest import LatestCheckpoint
+    from nanochat.rlm_distributed import DistributedRuntime, resume_worker_state
+    from nanochat.optim_checkpoint import OptimizerStateLayout
 
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        raise ValueError("The initial RLM workflow supports one device per run")
-    if COMPUTE_DTYPE not in (torch.bfloat16, torch.float32):
-        raise ValueError("RLM training supports BF16 or FP32 compute; FP16 needs a separate scaling policy")
-    _, _, _, _, device = compute_init(args.device_type)
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed(args.seed)
-    check_training_memory(device, 0)
-    config = TrainingConfig(**{name: getattr(args, name) for name in TrainingConfig.__dataclass_fields__})
-    accumulation = config.accumulation_steps(args.text_length)
-    tokenizer_path = Path(get_base_dir()) / "tokenizer" / "tokenizer.pkl"
-    tokenizer_sha256 = file_digest(tokenizer_path)
-    tokenizer = get_tokenizer()
+    runtime = DistributedRuntime.initialize(args.device_type) if runtime is None else runtime
+    device = runtime.device
+    diagnostic_dir = attempt if runtime.world_size == 1 else attempt / f"rank-{runtime.rank:05d}"
+    runtime.collective(lambda: diagnostic_dir.mkdir(parents=True, exist_ok=True), "diagnostic directory")
+
+    def prepare_inputs():
+        if COMPUTE_DTYPE not in (torch.bfloat16, torch.float32):
+            raise ValueError("RLM training supports BF16 or FP32 compute; FP16 needs a separate scaling policy")
+        torch.manual_seed(args.seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed(args.seed)
+        check_training_memory(device, 0, synchronize_workers=False)
+        config = TrainingConfig(**{name: getattr(args, name) for name in TrainingConfig.__dataclass_fields__})
+        accumulation = config.accumulation_steps(args.text_length, runtime.world_size)
+        tokenizer_path = Path(get_base_dir()) / "tokenizer" / "tokenizer.pkl"
+        return config, accumulation, tokenizer_path, file_digest(tokenizer_path), get_tokenizer()
+
+    config, accumulation, tokenizer_path, tokenizer_sha256, tokenizer = runtime.collective(
+        prepare_inputs, "training inputs",
+    )
     checkpoint_dir = args.output_dir / "checkpoints"
-    latest_checkpoint = None
-    if args.mode == "train":
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        latest_checkpoint = LatestCheckpoint(checkpoint_dir)
+    latest_checkpoint = LatestCheckpoint(checkpoint_dir) if args.mode == "train" else None
     resuming = args.resume_from_step is not None or args.resume_latest
-    metadata = None
-    step = 0
-    if resuming:
-        if args.resume_latest:
-            metadata = latest_checkpoint.metadata()
-            step = metadata["step"]
+
+    def admit_checkpoint():
+        if args.mode == "train":
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        metadata = None
+        step = 0
+        if resuming:
+            if args.resume_latest:
+                metadata = latest_checkpoint.metadata()
+                step = metadata["step"]
+            else:
+                step = args.resume_from_step
+            try:
+                recover_numbered_checkpoint(checkpoint_dir)
+            except Exception as exc:
+                logger.warning("%s", json.dumps({"checkpoint_warning": {
+                    "step": step, "phase": "resume_publication", "type": type(exc).__name__,
+                    "message": str(exc), "training_continues": True,
+                }}))
+            require_latest_resume_checkpoint(checkpoint_dir, step)
+            if metadata is None:
+                metadata = json.loads((checkpoint_dir / f"meta_{step:06d}.json").read_text())
+            if metadata.get("model_type") != "rlm" or metadata.get("step") != step:
+                raise ValueError("Resume requires an RLM checkpoint at the requested completed update")
+        return metadata, step
+
+    metadata, step = runtime.primary(admit_checkpoint, "checkpoint admission")
+
+    def prepare_initialization():
+        initializer = None
+        if resuming:
+            initialization = metadata["run_contract"]["initialization"]
+            if not isinstance(initialization, dict) or initialization.get("kind") not in (
+                "random", "pretrained_input_token_embedding",
+            ):
+                raise ValueError("The recorded run has invalid initialization provenance")
+        elif args.init_embedding_bundle is not None:
+            from nanochat.rlm_initialization import TokenEmbeddingInitialization
+
+            initializer = TokenEmbeddingInitialization.from_bundle(args.init_embedding_bundle, tokenizer_path)
+            initialization = initializer.contract()
+        elif args.init_embedding_checkpoint_dir is not None:
+            from nanochat.rlm_initialization import TokenEmbeddingInitialization
+
+            initializer = TokenEmbeddingInitialization.from_checkpoint(
+                args.init_embedding_checkpoint_dir, args.init_embedding_step,
+                args.init_embedding_tokenizer, tokenizer_path,
+            )
+            initialization = initializer.contract()
         else:
-            step = args.resume_from_step
-        try:
-            recover_numbered_checkpoint(checkpoint_dir)
-        except Exception as exc:
-            logger.warning("%s", json.dumps({"checkpoint_warning": {
-                "step": step, "phase": "resume_publication", "type": type(exc).__name__,
-                "message": str(exc), "training_continues": True,
-            }}))
-        require_latest_resume_checkpoint(checkpoint_dir, step)
-        if metadata is None:
-            metadata = json.loads((checkpoint_dir / f"meta_{step:06d}.json").read_text())
-        if metadata.get("model_type") != "rlm" or metadata.get("step") != step:
-            raise ValueError("Resume requires an RLM checkpoint at the requested completed update")
-    initializer = None
-    if resuming:
-        initialization = metadata["run_contract"]["initialization"]
-        if not isinstance(initialization, dict) or initialization.get("kind") not in (
-            "random", "pretrained_input_token_embedding",
-        ):
-            raise ValueError("The recorded run has invalid initialization provenance")
-    elif args.init_embedding_bundle is not None:
-        from nanochat.rlm_initialization import TokenEmbeddingInitialization
+            initialization = {"kind": "random"}
+        if config.input_embedding_freeze is not InputEmbeddingFreeze.NONE and initialization["kind"] != "pretrained_input_token_embedding":
+            raise ValueError("Freezing the input embedding requires pretrained initialization provenance")
+        return initializer, initialization
 
-        initializer = TokenEmbeddingInitialization.from_bundle(args.init_embedding_bundle, tokenizer_path)
-        initialization = initializer.contract()
-    elif args.init_embedding_checkpoint_dir is not None:
-        from nanochat.rlm_initialization import TokenEmbeddingInitialization
-
-        initializer = TokenEmbeddingInitialization.from_checkpoint(
-            args.init_embedding_checkpoint_dir, args.init_embedding_step,
-            args.init_embedding_tokenizer, tokenizer_path,
-        )
-        initialization = initializer.contract()
-    else:
-        initialization = {"kind": "random"}
-    if config.input_embedding_freeze is not InputEmbeddingFreeze.NONE and initialization["kind"] != "pretrained_input_token_embedding":
-        raise ValueError("Freezing the input embedding requires pretrained initialization provenance")
+    initializer, initialization = runtime.collective(prepare_initialization, "embedding initialization source")
     model_config = RLMConfig(
         sequence_len=args.text_length + 1 + 2 * args.memory_tokens,
         vocab_size=tokenizer.get_vocab_size(), n_layer=args.depth,
@@ -243,25 +260,30 @@ def run(args, attempt):
         n_embd=args.width, window_pattern="L", text_length=args.text_length,
         memory_tokens=args.memory_tokens, activation_checkpointing=args.activation_checkpointing,
     )
-    source = source_manifest(Path(__file__).resolve().parents[1])
-    inventory = dataset_inventory()
-    try:
-        triton_version = version("triton")
-    except PackageNotFoundError:
-        triton_version = None
-    milestone_step = config.milestone_step
-    if resuming:
-        if latest_checkpoint.milestone_path.exists():
-            milestone_step = latest_checkpoint.verify_milestone()["step"]
-        elif metadata.get("milestone_checkpoint", False):
-            # Finish the first requested preservation even if the horizon changed.
-            milestone_step = step
-        elif milestone_step < step:
-            # A changed horizon cannot recreate a boundary already passed.
-            milestone_step = 0
+
+    def inspect_provenance():
+        source = source_manifest(Path(__file__).resolve().parents[1])
+        inventory = dataset_inventory()
+        try:
+            triton_version = version("triton")
+        except PackageNotFoundError:
+            triton_version = None
+        milestone_step = config.milestone_step
+        if resuming:
+            if latest_checkpoint.milestone_path.exists():
+                milestone_step = latest_checkpoint.verify_milestone()["step"]
+            elif metadata.get("milestone_checkpoint", False):
+                # Finish the first requested preservation even if the horizon changed.
+                milestone_step = step
+            elif milestone_step < step:
+                # A changed horizon cannot recreate a boundary already passed.
+                milestone_step = 0
+        return source, inventory, triton_version, milestone_step
+
+    source, inventory, triton_version, milestone_step = runtime.primary(inspect_provenance, "run provenance")
     contract = {
         "model_config": asdict(model_config), "training_config": asdict(config),
-        "initialization": initialization,
+        "initialization": initialization, "world_size": runtime.world_size,
         "checkpoint_policy": {
             "latest_every": 1, "early_step": 2,
             "save_every": args.save_every, "keep_last": args.keep_checkpoints,
@@ -276,34 +298,40 @@ def run(args, attempt):
             "cuda": torch.version.cuda, "triton": triton_version,
         },
     }
-    write_json(attempt / "source.json", source)
-    write_json(attempt / "data-inventory.json", inventory)
-    repo = Path(__file__).resolve().parents[1]
-    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
-    diff = subprocess.run(["git", "diff", "HEAD", "--", "nanochat", "scripts/rlm_train.py"], cwd=repo, text=True, capture_output=True, check=True).stdout
-    (attempt / "tracked-source.diff").write_text(diff)
-    # Capture actual source bytes, including new untracked modules.
-    for name in source["files"]:
-        target = attempt / "source" / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes((repo / name).read_bytes())
-    write_json(attempt / "invocation.json", {
-        "argv": sys.argv, "revision": revision, "contract": contract,
-        "mode": args.mode, "torch_version": torch.__version__,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    })
-    logger.info("%s", json.dumps({
-        "configuration": contract, "accumulation_steps": accumulation,
-        "cycle_lengths": [args.text_length + 1 + args.memory_tokens]
-        + [args.text_length + 1 + 2 * args.memory_tokens] * (args.cycles - 2)
-        + [args.text_length + 1 + args.memory_tokens],
-        "prediction_targets_per_update": config.prediction_targets_per_update(args.text_length),
-        "input_embedding_freeze": {
-            "frozen_updates": config.input_embedding_frozen_updates,
-            "first_trainable_update": (None if config.input_embedding_freeze is InputEmbeddingFreeze.PERMANENT
-                                       else config.input_embedding_frozen_updates + 1),
-        } if config.input_embedding_freeze is not InputEmbeddingFreeze.NONE else None,
-    }))
+
+    def record_provenance():
+        write_json(attempt / "source.json", source)
+        write_json(attempt / "data-inventory.json", inventory)
+        repo = Path(__file__).resolve().parents[1]
+        revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+        diff = subprocess.run(["git", "diff", "HEAD", "--", "nanochat", "scripts/rlm_train.py"], cwd=repo, text=True, capture_output=True, check=True).stdout
+        (attempt / "tracked-source.diff").write_text(diff)
+        # Capture actual source bytes, including new untracked modules.
+        for name in source["files"]:
+            target = attempt / "source" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((repo / name).read_bytes())
+        write_json(attempt / "invocation.json", {
+            "argv": sys.argv, "revision": revision, "contract": contract,
+            "mode": args.mode, "torch_version": torch.__version__,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return revision
+
+    revision = runtime.primary(record_provenance, "record run provenance")
+    if runtime.is_primary:
+        logger.info("%s", json.dumps({
+            "configuration": contract, "accumulation_steps": accumulation,
+            "cycle_lengths": [args.text_length + 1 + args.memory_tokens]
+            + [args.text_length + 1 + 2 * args.memory_tokens] * (args.cycles - 2)
+            + [args.text_length + 1 + args.memory_tokens],
+            "prediction_targets_per_update": config.prediction_targets_per_update(args.text_length),
+            "input_embedding_freeze": {
+                "frozen_updates": config.input_embedding_frozen_updates,
+                "first_trainable_update": (None if config.input_embedding_freeze is InputEmbeddingFreeze.PERMANENT
+                                           else config.input_embedding_frozen_updates + 1),
+            } if config.input_embedding_freeze is not InputEmbeddingFreeze.NONE else None,
+        }))
 
     optimizer_data = None
     model_data = None
@@ -311,67 +339,95 @@ def run(args, attempt):
         endpoint = args.stop_after_step or args.num_iterations
         if step >= endpoint:
             raise ValueError("Resume must continue beyond the checkpoint's completed update")
-        if args.resume_latest:
-            model_data, optimizer_data, loaded_metadata = latest_checkpoint.load(device)
-        else:
-            model_data, optimizer_data, loaded_metadata = load_checkpoint(
-                checkpoint_dir, step, device, load_optimizer=True,
-            )
-        if loaded_metadata != metadata:
-            raise ValueError("Resume checkpoint metadata changed after admission")
-        # A stop during the less frequent numbered save must not strand a
-        # complete update already published in latest. Repair that exact set.
-        if args.resume_latest and metadata.get("numbered_checkpoint", False) and not checkpoint_is_complete(
-            checkpoint_dir, step, load_optimizer=True,
-        ):
-            with MemoryMonitor(os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB")) as monitor:
-                monitor.require_available(step)
-                try:
-                    save_numbered_checkpoint(checkpoint_dir, step, model_data, optimizer_data, metadata)
-                except Exception as exc:
-                    logger.warning("%s", json.dumps({"checkpoint_warning": {
-                        "step": step, "phase": "resume_numbered", "type": type(exc).__name__,
-                        "message": str(exc), "training_continues": True,
-                    }}))
-                else:
-                    write_json(attempt / "checkpoint-repair.json", {"step": step, "source": "latest.pt"})
-                synchronize(device)
-                monitor.require_available(step)
-        if args.resume_latest and metadata.get("numbered_checkpoint", False):
-            # A stop may also occur after publication but before retirement.
-            record_checkpoint_retention(checkpoint_dir, step, args.keep_checkpoints, attempt)
+
+        def load_resume():
+            if args.resume_latest:
+                loaded = latest_checkpoint.load_cpu_mapped()
+            else:
+                loaded = (
+                    torch.load(checkpoint_dir / f"model_{step:06d}.pt", map_location="cpu", mmap=True),
+                    torch.load(checkpoint_dir / f"optim_{step:06d}_rank0.pt", map_location="cpu", mmap=True),
+                    json.loads((checkpoint_dir / f"meta_{step:06d}.json").read_text()),
+                )
+            if loaded[2] != metadata:
+                raise ValueError("Resume checkpoint metadata changed after admission")
+            return loaded[0], loaded[1]
+
+        model_data, optimizer_data = runtime.collective(load_resume, "map resume checkpoint")
+
+        def repair_resume():
+            # A stop during the less frequent numbered save must not strand a
+            # complete update already published in latest. Repair that exact set.
+            if args.resume_latest and metadata.get("numbered_checkpoint", False) and not checkpoint_is_complete(
+                checkpoint_dir, step, load_optimizer=True,
+            ):
+                with MemoryMonitor(os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB")) as monitor:
+                    monitor.require_available(step)
+                    try:
+                        save_numbered_checkpoint(checkpoint_dir, step, model_data, optimizer_data, metadata)
+                    except Exception as exc:
+                        logger.warning("%s", json.dumps({"checkpoint_warning": {
+                            "step": step, "phase": "resume_numbered", "type": type(exc).__name__,
+                            "message": str(exc), "training_continues": True,
+                        }}))
+                    else:
+                        write_json(attempt / "checkpoint-repair.json", {"step": step, "source": "latest.pt"})
+                    synchronize(device)
+                    monitor.require_available(step)
+            if args.resume_latest and metadata.get("numbered_checkpoint", False):
+                # A stop may also occur after publication but before retirement.
+                record_checkpoint_retention(checkpoint_dir, step, args.keep_checkpoints, attempt)
+
+        runtime.primary(repair_resume, "repair resume publications")
     else:
-        write_json(args.output_dir / "run.json", {"contract": contract, "revision": revision, "mode": args.mode})
+        runtime.primary(lambda: write_json(args.output_dir / "run.json", {
+            "contract": contract, "revision": revision, "mode": args.mode,
+        }), "record original run")
     if resuming and milestone_step and step == milestone_step:
         # A stop after rolling publication can leave the required durable
         # copy unfinished. Repair it before any trainable-table forward.
-        latest_checkpoint.preserve_milestone(step)
-    with torch.device("meta"):
-        model = RecurrentGPT(model_config)
-    model.to_empty(device=device)
-    model.init_weights()
-    if model_data is not None:
-        model.load_state_dict(model_data, strict=True, assign=True)
-        del model_data
-    elif initializer is not None:
-        initialization_proof = initializer.initialize(model)
-        write_json(attempt / "embedding-initialization.json", initialization_proof)
-        logger.info("%s", json.dumps({"embedding_initialization": initialization_proof}))
-        del initializer
-    model.train()
-    optimizer, decay = build_optimizer(model, config)
-    parameter_counts = model.num_scaling_params()
-    logger.info("%s", json.dumps({"parameter_counts": parameter_counts}))
-    if optimizer_data is not None:
-        optimizer.load_state_dict(optimizer_data)
-        del optimizer_data
-        restore_rng(metadata["rng_state"], device)
-    forward_cycle = torch.compile(model.forward_cycle, dynamic=False) if args.compile else model.forward_cycle
-    loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-        tokenizer, args.device_batch_size, args.cycles * args.text_length,
-        split="train", device=device.type,
-        resume_state_dict=None if metadata is None else metadata["dataloader_state_dict"],
+        runtime.primary(lambda: latest_checkpoint.preserve_milestone(step), "repair milestone")
+
+    def prepare_model():
+        with torch.device("meta"):
+            model = RecurrentGPT(model_config)
+        model.to_empty(device=device)
+        model.init_weights()
+        initialization_proof = None
+        if model_data is not None:
+            model.load_state_dict(model_data, strict=True)
+        elif initializer is not None:
+            initialization_proof = initializer.initialize(model)
+        model.train()
+        optimizer, decay = build_optimizer(model, config)
+        if optimizer_data is not None:
+            local_optimizer = OptimizerStateLayout.from_optimizer(optimizer).shard(
+                optimizer_data, runtime.rank, runtime.world_size,
+            )
+            optimizer.load_state_dict(local_optimizer)
+        worker_state = None if metadata is None else resume_worker_state(metadata, runtime.rank, runtime.world_size)
+        if worker_state is not None:
+            restore_rng(worker_state["rng_state"], device)
+        forward_cycle = torch.compile(model.forward_cycle, dynamic=False) if args.compile else model.forward_cycle
+        loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+            tokenizer, args.device_batch_size, args.cycles * args.text_length,
+            split="train", device=device.type,
+            resume_state_dict=None if worker_state is None else worker_state["dataloader_state_dict"],
+        )
+        return model, optimizer, decay, initialization_proof, forward_cycle, loader
+
+    model, optimizer, decay, initialization_proof, forward_cycle, loader = runtime.collective(
+        prepare_model, "model and optimizer setup",
     )
+    del model_data, optimizer_data, initializer
+    if initialization_proof is not None:
+        runtime.primary(lambda: write_json(attempt / "embedding-initialization.json", initialization_proof),
+                        "record embedding initialization")
+        if runtime.is_primary:
+            logger.info("%s", json.dumps({"embedding_initialization": initialization_proof}))
+    parameter_counts = model.num_scaling_params()
+    if runtime.is_primary:
+        logger.info("%s", json.dumps({"parameter_counts": parameter_counts}))
     if args.mode in ("capacity-probe", "attention-probe"):
         if args.mode == "capacity-probe":
             from nanochat.rlm_capacity import capacity_probe as probe
@@ -380,31 +436,51 @@ def run(args, attempt):
 
         report = probe(
             model, forward_cycle, optimizer, loader, config, decay,
-            tokenizer.get_bos_token_id(), attempt,
+            tokenizer.get_bos_token_id(), diagnostic_dir, runtime=runtime,
         )
-        write_json(attempt / "result.json", report)
-        write_json(args.output_dir / "result.json", report)
-        (attempt / "updates.jsonl").write_text(json.dumps(report["updates"][0], allow_nan=False) + "\n")
-        logger.info("%s", json.dumps(report))
+        report["world_size"] = runtime.world_size
+
+        def record_probe():
+            write_json(attempt / "result.json", report)
+            write_json(args.output_dir / "result.json", report)
+            (attempt / "updates.jsonl").write_text(json.dumps(report["updates"][0], allow_nan=False) + "\n")
+            logger.info("%s", json.dumps(report))
+
+        runtime.primary(record_probe, "record probe result")
         return
-    setup_metrics = cuda_metrics(device)
+    setup_metrics = runtime.aggregate_metrics(
+        runtime.collective(lambda: cuda_metrics(device), "setup memory metrics"),
+    )
     updates = []
     tokens_per_update = {
         "text_tokens": config.total_batch_size,
         "supervised_tokens": config.prediction_targets_per_update(args.text_length),
-        "internal_positions": accumulation * config.device_batch_size
+        "internal_positions": runtime.world_size * accumulation * config.device_batch_size
         * config.positions_per_episode(args.text_length, args.memory_tokens),
     }
     token_counts = {name: 0 if metadata is None else metadata[name] for name in tokens_per_update}
-    writer = None if args.mode == "probe" else CheckpointWriter(
-        checkpoint_dir, mode=args.checkpoint_mode, keep_last=args.keep_checkpoints,
-        latest_step=latest_checkpoint.metadata()["step"] if latest_checkpoint.exists() else None,
-    )
+
+    def make_writer():
+        if args.mode == "probe":
+            return None
+        latest_step = latest_checkpoint.metadata()["step"] if latest_checkpoint.exists() else None
+        if runtime.world_size == 1:
+            return CheckpointWriter(checkpoint_dir, mode=args.checkpoint_mode,
+                                    keep_last=args.keep_checkpoints, latest_step=latest_step)
+        from nanochat.rlm_distributed_checkpoint import DistributedCheckpointWriter
+
+        return DistributedCheckpointWriter(
+            checkpoint_dir, mode=args.checkpoint_mode, keep_last=args.keep_checkpoints,
+            optimizer=optimizer, checkpoint_group=runtime.checkpoint_group,
+            control_group=runtime.control_group, latest_step=latest_step,
+        )
+
+    writer = runtime.collective(make_writer, "checkpoint writer setup")
     checkpoint_measurements = [] if writer is None else writer.measurements
     endpoint = args.stop_after_step or args.num_iterations
     metrics_path = attempt / "updates.jsonl"
     execution_started = time.monotonic()
-    with MemoryMonitor(os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB")) as monitor:
+    with MemoryMonitor(os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB"), runtime=runtime) as monitor:
         def record_checkpoint_measurements():
             for measurement in checkpoint_measurements:
                 if "minimum_system_available_gb" not in measurement:
@@ -412,7 +488,7 @@ def run(args, attempt):
                         "minimum_system_available_gb": monitor.minimum_observed / 1e9,
                         **cuda_metrics(device),
                     })
-            if writer is not None:
+            if writer is not None and runtime.is_primary:
                 try:
                     write_json(attempt / "checkpoint-measurements.json", checkpoint_measurements)
                 except OSError as exc:
@@ -427,13 +503,16 @@ def run(args, attempt):
 
         try:
             while step < endpoint:
-                check_training_memory(device, step)
-                monitor.require_available(step)
-                lrm = apply_schedule(optimizer, config, step, decay)
+                def prepare_update():
+                    check_training_memory(device, step, synchronize_workers=False)
+                    monitor.require_available(step)
+                    return apply_schedule(optimizer, config, step, decay)
+
+                lrm = runtime.collective(prepare_update, "update admission")
                 metrics, loader_state = measured_update(
                     model, forward_cycle, optimizer, loader, config, step, tokenizer.get_bos_token_id(),
                     os.environ.get("NANOCHAT_MIN_SYSTEM_AVAILABLE_GB"),
-                    failure_path=attempt / "failed-update.json",
+                    failure_path=diagnostic_dir / "failed-update.json", runtime=runtime,
                     before_optimizer_step=before_optimizer_step if writer is not None else None,
                 )
                 step += 1
@@ -441,32 +520,56 @@ def run(args, attempt):
                     token_counts[name] += count
                 metrics["lr_multiplier"] = lrm
                 updates.append(metrics)
-                with metrics_path.open("a") as stream:
-                    stream.write(json.dumps(metrics, allow_nan=False) + "\n")
-                    stream.flush()
-                logger.info("%s", json.dumps(metrics))
-                logger.info("Update %d/%d: %.2f s", step, args.num_iterations, metrics["duration_seconds"])
+
+                def record_update():
+                    with metrics_path.open("a") as stream:
+                        stream.write(json.dumps(metrics, allow_nan=False) + "\n")
+                        stream.flush()
+                    logger.info("%s", json.dumps(metrics))
+                    logger.info("Update %d/%d: %.2f s", step, args.num_iterations, metrics["duration_seconds"])
+
+                runtime.primary(record_update, "record update metrics")
                 if writer is not None:
                     numbered = step == 2 or step == endpoint or bool(args.save_every and step % args.save_every == 0)
-                    synchronize(device)
-                    saved_metadata = checkpoint_metadata(model, config, step, loader_state, contract, token_counts)
+
+                    def prepare_snapshot():
+                        synchronize(device)
+                        return checkpoint_metadata(model, config, step, loader_state, contract, token_counts)
+
+                    saved_metadata = runtime.collective(prepare_snapshot, "checkpoint metadata")
                     saved_metadata["numbered_checkpoint"] = numbered
                     milestone = step == milestone_step
                     saved_metadata["milestone_checkpoint"] = milestone
-                    writer.submit(model.state_dict(), optimizer.state_dict(), saved_metadata,
+                    model_state, optimizer_state = runtime.collective(
+                        lambda: (model.state_dict(), optimizer.state_dict()), "checkpoint state references",
+                    )
+                    writer.submit(model_state, optimizer_state, saved_metadata,
                                   numbered=numbered, milestone=milestone)
                     if milestone:
                         # Unfreezing happens at the start of the next forward,
                         # earlier than the usual pre-optimizer writer barrier.
                         writer.wait(completed_step=step)
-                    record_checkpoint_measurements()
-                    logger.info("%s", json.dumps({"checkpoint_status": writer.status(step)}))
-        finally:
+                    runtime.collective(record_checkpoint_measurements, "checkpoint measurements")
+                    if runtime.is_primary:
+                        logger.info("%s", json.dumps({"checkpoint_status": writer.status(step)}))
+        except BaseException:
             if writer is not None:
-                writer.close(completed_step=step)
+                if hasattr(writer, "abort"):
+                    writer.abort()
+                else:
+                    writer.close(completed_step=step)
                 record_checkpoint_measurements()
-        synchronize(device)
-        monitor.require_available(step)
+            raise
+        else:
+            if writer is not None:
+                runtime.collective(lambda: writer.close(completed_step=step), "close checkpoint writer")
+                runtime.collective(record_checkpoint_measurements, "final checkpoint measurements")
+
+        def finish_execution():
+            synchronize(device)
+            monitor.require_available(step)
+
+        runtime.collective(finish_execution, "final memory check")
         execution_wall_seconds = time.monotonic() - execution_started
     measurements = updates + checkpoint_measurements
     training_peak_reserved = max([setup_metrics["cuda_peak_reserved_gb"]] + [item["cuda_peak_reserved_gb"] for item in updates])
@@ -474,7 +577,8 @@ def run(args, attempt):
     peak_allocated = max([setup_metrics["cuda_peak_allocated_gb"]] + [item["cuda_peak_allocated_gb"] for item in measurements])
     report = {
         "status": "completed" if step == args.num_iterations else "paused",
-        "mode": args.mode, "completed_updates": step, "attempt_updates": len(updates),
+        "mode": args.mode, "world_size": runtime.world_size,
+        "completed_updates": step, "attempt_updates": len(updates),
         "parameter_counts": parameter_counts,
         "text_tokens": token_counts["text_tokens"],
         "supervised_tokens": token_counts["supervised_tokens"],
@@ -490,9 +594,14 @@ def run(args, attempt):
         "checkpoint_dir": str(checkpoint_dir) if args.mode == "train" else None,
         "setup_memory": setup_metrics, "updates": updates,
     }
-    write_json(attempt / "result.json", report)
-    write_json(args.output_dir / "result.json", report)
-    logger.info("%s", json.dumps({"result": str(attempt / "result.json"), "status": report["status"]}))
+    report = runtime.aggregate_metrics(report)
+
+    def record_result():
+        write_json(attempt / "result.json", report)
+        write_json(args.output_dir / "result.json", report)
+        logger.info("%s", json.dumps({"result": str(attempt / "result.json"), "status": report["status"]}))
+
+    runtime.primary(record_result, "record final result")
 
 
 def main():
@@ -506,33 +615,59 @@ def main():
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     args.output_dir = args.output_dir.expanduser().absolute()
-    if args.output_dir.is_symlink():
-        raise ValueError("Run output must be an owned directory, not a symlink")
-    if args.resume_from_step is None and not args.resume_latest:
-        args.output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
-    elif not (args.output_dir / "run.json").is_file():
-        raise ValueError("Resume requires an existing RLM run directory")
     from filelock import FileLock
+    from nanochat.rlm_distributed import DistributedRuntime
     from nanochat.rlm_training import validate_run_directory, write_json
-    validate_run_directory(args.output_dir)
-    with FileLock(args.output_dir / ".run.lock", timeout=0):
-        attempt = args.output_dir / "attempts" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        attempt.mkdir(parents=True)
-        try:
-            run(args, attempt)
-        except BaseException as exc:
+
+    runtime = DistributedRuntime.initialize(args.device_type)
+    lock = None
+    attempt = None
+
+    def prepare_attempt():
+        nonlocal lock
+        if args.output_dir.is_symlink():
+            raise ValueError("Run output must be an owned directory, not a symlink")
+        if args.resume_from_step is None and not args.resume_latest:
+            args.output_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+        elif not (args.output_dir / "run.json").is_file():
+            raise ValueError("Resume requires an existing RLM run directory")
+        validate_run_directory(args.output_dir)
+        lock = FileLock(args.output_dir / ".run.lock", timeout=0)
+        lock.acquire()
+        directory = args.output_dir / "attempts" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        directory.mkdir(parents=True)
+        if runtime.world_size > 1:
+            for rank in range(runtime.world_size):
+                (directory / f"rank-{rank:05d}").mkdir()
+        return str(directory)
+
+    try:
+        attempt = Path(runtime.primary(prepare_attempt, "run directory and lock"))
+        run(args, attempt, runtime=runtime)
+    except BaseException as exc:
+        if attempt is not None:
             import torch
             from nanochat.rlm_capacity import is_cuda_out_of_memory
             from nanochat.rlm_training import cuda_metrics
-            device = torch.device(args.device_type)
+
             status = {
-                "status": "failed", "error_type": type(exc).__name__, "error": str(exc),
+                "status": "failed", "world_size": runtime.world_size,
+                "error_type": type(exc).__name__, "error": str(exc),
                 "failure_kind": "cuda_out_of_memory" if is_cuda_out_of_memory(exc) else "error",
-                "memory": cuda_metrics(device) if device.type == "cpu" or torch.cuda.is_initialized() else {},
+                "memory": cuda_metrics(runtime.device) if runtime.device.type == "cpu" or torch.cuda.is_initialized() else {},
             }
-            write_json(attempt / "failure.json", status)
-            write_json(args.output_dir / "result.json", status)
-            raise
+            # Error paths do not start new collectives. Every worker owns a
+            # diagnostic file; the coordinator alone publishes shared status.
+            diagnostic_dir = attempt if runtime.world_size == 1 else attempt / f"rank-{runtime.rank:05d}"
+            write_json(diagnostic_dir / "failure.json", status)
+            if runtime.is_primary:
+                write_json(attempt / "result.json", status)
+                write_json(args.output_dir / "result.json", status)
+        raise
+    finally:
+        if lock is not None:
+            lock.release()
+        runtime.close()
 
 
 if __name__ == "__main__":

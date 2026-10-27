@@ -1,19 +1,22 @@
-# Single-H100 RLM pretraining
+# RLM pretraining on 1, 2, or 4 H100 GPUs
 
 Use the supplied files on the merged `rlm` branch to start a fresh pretraining run.
 The initialization embedding and matching tokenizer are provided in `assets/h100-seed/` and downloaded through Git LFS during setup.
 The launcher installs the Python environment, downloads the dataset, checks capacity, benchmarks attention, and starts training with the faster supported backend.
+Select the number of GPUs explicitly with `--num-gpus 1`, `--num-gpus 2`, or `--num-gpus 4` for every launch, including resume.
 
 ## Requirements
 
-- Linux x86-64 with exactly one unpartitioned H100 GPU visible to the run, including H100 80 GB and H100 NVL 94 GB.
+- Linux x86-64 with at least the requested 1, 2, or 4 unpartitioned H100 GPUs visible on one host, including H100 80 GB and H100 NVL 94 GB.
 - A working NVIDIA driver compatible with the locked PyTorch 2.14.1 CUDA 12.6 build.
 - At least 32 GB of available host RAM before launch.
 - Approximately 280 GB of free disk space for a new run, plus space for the supplied bundle and Python environment.
 - Git, Git LFS, `uv`, and Python 3.10 or newer available as `python3`.
 - Internet access for dependencies, the supplied files, and the dataset.
 
-The GPU capacity check requires at least 75 GB (75 × 10^9 bytes) of total GPU memory and has no upper memory limit.
+Each selected GPU must have at least 75 GB (75 × 10^9 bytes) of total GPU memory; there is no upper memory limit.
+The allocator budget uses the least free memory among the selected GPUs.
+Capacity probes also measure host memory with local checkpoint staging and the coordinator's complete optimizer snapshot resident, so multi-GPU runs can require more than the minimum host RAM.
 Use a persistent terminal session or your normal job scheduler so disconnecting SSH does not terminate training.
 The launcher checks the GPU, available memory, and disk space before training; it does not install or upgrade the NVIDIA driver.
 
@@ -27,14 +30,28 @@ git clone --branch rlm https://github.com/ifsheldon/nanochat.git
 cd nanochat
 git lfs pull
 bash runs/runh100_rlm.sh \
+    --num-gpus 1 \
     --assets assets/h100-seed \
     --run-name pretrain-1
 ```
 
 For an existing checkout, run `git lfs install`, `git fetch origin`, `git switch rlm`, `git pull --ff-only`, and `git lfs pull` before launching.
-If the host exposes multiple GPUs, set `CUDA_VISIBLE_DEVICES` to the H100's device index when running the launcher.
+The launcher selects the first requested number of visible GPUs, in visibility order.
+Use `CUDA_VISIBLE_DEVICES` to choose their physical device indices or GPU UUIDs; for example:
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 bash runs/runh100_rlm.sh \
+    --num-gpus 2 --assets assets/h100-seed --run-name pretrain-2gpu
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash runs/runh100_rlm.sh \
+    --num-gpus 4 --assets assets/h100-seed --run-name pretrain-4gpu
+```
+
 Run the script directly, outside `torchrun` or another distributed worker environment.
-A GPU partition or a different accelerator is rejected.
+It starts one worker per selected GPU through `torch.distributed.run` for two or four GPUs; dataset preparation runs once.
+A selected GPU partition or a different accelerator is rejected.
+Every recurrent episode and its four-cycle gradient path stays on its assigned GPU.
+The existing distributed optimizer averages gradients and partitions optimizer state across workers.
 
 The launcher uses `uv.lock` and Python 3.10.21 to install the required environment automatically.
 The GPU extra selects PyTorch 2.14.1+cu126 on this Linux x86-64 host; the same lockfile selects PyTorch 2.14.1+cu132 on Linux ARM64 for DGX Spark.
@@ -58,15 +75,16 @@ Use `bash runs/runh100_rlm.sh --help` for the available options.
 
 The launcher tries the following recipes in order with PyTorch SDPA, using one complete optimizer update for each capacity probe:
 
-| Priority | Probe batch × accumulation | Input embedding during probe | Selected training recipe |
-| --- | --- | --- | --- |
-| 1 | 32 × 8 | Trainable | Batch 32; frozen for updates 1–5016, trainable for 5017–5574 |
-| 2 | 32 × 8 | Frozen | Batch 32; input embedding frozen for all 5574 updates |
-| 3 | 16 × 16 | Trainable | Batch 16; frozen for updates 1–5016, trainable for 5017–5574 |
+| Priority | Batch per GPU | Accumulation with 1 / 2 / 4 GPUs | Input embedding during probe | Selected training recipe |
+| --- | --- | --- | --- | --- |
+| 1 | 32 | 8 / 4 / 2 | Trainable | Batch 32; frozen for updates 1–5016, trainable for 5017–5574 |
+| 2 | 32 | 8 / 4 / 2 | Frozen | Batch 32; input embedding frozen for all 5574 updates |
+| 3 | 16 | 16 / 8 / 4 | Trainable | Batch 16; frozen for updates 1–5016, trainable for 5017–5574 |
 
 After a successful capacity probe, the launcher benchmarks attention for the selected recipe as described below.
 Production then starts fresh from the supplied initialization; probe updates are discarded.
-Every recipe uses 5574 optimizer updates and 1,047,552 real-text tokens per update.
+Every recipe uses 5574 optimizer updates and 1,047,552 real-text targets per update across all GPUs, equivalent to 256 complete four-cycle episodes.
+Increasing GPU count reduces accumulation per worker and keeps this global batch unchanged.
 The remaining model and training settings are already configured by the launcher.
 
 Only a CUDA out-of-memory result advances to the next recipe.
@@ -79,9 +97,10 @@ For the selected recipe, the launcher compares PyTorch SDPA with FlashAttention 
 Each backend runs in its own subprocess with the same model, data, batch size, accumulation, activation checkpointing, and optimizer settings.
 Scheduled-freeze recipes use trainable input embeddings during the comparison, matching the capacity probe's more demanding phase; the permanently frozen recipe keeps them frozen.
 
-Each subprocess warms up for at most five full optimizer updates until an update completes without compilation, then measures exactly one further update without compilation.
+Each backend warms up for at most five full optimizer updates until all workers complete an update without compilation, then measures exactly one further update without compilation.
+Workers make the warmup decision together, and the reported update duration is the slowest worker's duration.
 The measurement includes forward, backward, optimizer work, and training health checks, with CUDA synchronization around the timed update.
-Compilation and checkpoint disk writes are excluded; optimizer state and checkpoint staging buffers are already resident.
+Compilation and checkpoint disk writes are excluded; optimizer state, local checkpoint staging buffers, and the coordinator's complete optimizer staging buffers are already resident.
 The launcher chooses the faster successful backend, using SDPA for a tie, and records the measurements and selection in `selected-recipe.json`.
 The comparison is one steady update for the selected recipe, not a full-run throughput measurement.
 
@@ -100,7 +119,8 @@ Retain the full training horizon in `--num-iterations` because it controls the l
 | File or directory | What to check |
 | --- | --- |
 | `OUTPUT/logs/TIMESTAMP/` | Dataset preparation, capacity probe, attention probe, and training logs |
-| `OUTPUT/selected-recipe.json` | Selected recipe, attention backend and measurements, and exact training arguments |
+| `OUTPUT/selected-recipe.json` | Original GPU count, per-worker accumulation, selected recipe, attention measurements, and training arguments |
+| `OUTPUT/logs/TIMESTAMP/invocation.json` | Actual GPU count and accumulation for the current launch or resume |
 | `OUTPUT/probes/` | Capacity probe results and any failures |
 | `OUTPUT/probes/attention-sdpa/`, `OUTPUT/probes/attention-fa3/` | Attention measurements and failures when a result could be written |
 | `OUTPUT/train/attempts/` | Training measurements and attempt records |
@@ -111,6 +131,10 @@ Confirm production reaches update 2 and publishes both `latest.pt` and a numbere
 The capacity probe checks one update; continue watching for later memory, driver, or storage failures.
 
 `latest.pt` is saved after every optimizer update for interruption recovery.
+The coordinator owns shared run artifacts and writes one model plus the complete optimizer state, so checkpoints can resume with any supported GPU count.
+Each worker stages its local optimizer state on the CPU; the coordinator gathers those tensors and writes the snapshot asynchronously while the next forward/backward runs.
+All workers wait for that snapshot before updating parameters, and a required milestone must finish before the input embedding unfreezes.
+Worker diagnostics use separate files; update losses average across workers, CUDA memory reports the largest per-worker usage, and throughput uses the global text batch and slowest-worker duration.
 Numbered checkpoints are saved at update 2, every 10 updates, and the final or explicitly paused update; the latest 10 numbered checkpoints are retained.
 `pretrain-90pct.pt` preserves the complete update-5016 state separately from numbered-checkpoint retention.
 For recipes that unfreeze the input embedding, this checkpoint is saved before update 5017 begins.
@@ -122,12 +146,17 @@ Keep these files in the run directory so the launcher can resume from them.
 When the run has a complete `latest.pt`, resume it with:
 
 ```bash
-bash runs/runh100_rlm.sh --resume --run-name pretrain-1
+bash runs/runh100_rlm.sh --num-gpus 4 --resume --run-name pretrain-1
 ```
 
 If the original launch used `--output-dir`, use that same option and path when resuming.
 The launcher uses the saved dataset directory by default; pass `--datasets-dir` to select a different location.
-Resume restores the selected recipe and attention backend, model, optimizer, data-loader position, and random state, then continues the original 5574-update budget.
+Resume restores the selected recipe and attention backend, model, complete optimizer state, data-loader position, and random state, then continues the original 5574-update budget.
+The requested GPU count may differ from the saved count: transitions between 1, 2, and 4 GPUs repartition optimizer moments and recompute accumulation while preserving the global batch.
+For example, the command above resumes the one-GPU example on four GPUs.
+At the same count, each worker restores its own saved loader cursor and RNG state.
+At a changed count, workers repartition data from the earliest saved row-group cursor and reuse saved RNG states deterministically.
+Data continuation remains approximate at row-group granularity and does not preserve exact example order when the count changes.
 It skips dataset downloading, capacity and attention probes, and embedding initialization, so `--assets` is not needed.
 
 The saved recipe selects the model and training settings.

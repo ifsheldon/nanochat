@@ -27,7 +27,7 @@ def mock_updates(monkeypatch, compiled_updates):
     calls = []
     snapshot = {"stats": {"unique_graphs": 1}, "timing_events": {"backward": 1}}
 
-    def update(model, forward, optimizer, loader, config, step, bos, minimum, failure_path):
+    def update(model, forward, optimizer, loader, config, step, bos, minimum, failure_path, runtime=None):
         assert optimizer.state, "Optimizer state must be resident before forward/backward"
         compiled = compiled_updates[len(calls)]
         if compiled:

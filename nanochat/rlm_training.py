@@ -52,12 +52,12 @@ class TrainingConfig:
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
 
-    def accumulation_steps(self, text_length):
-        microbatch_tokens = self.device_batch_size * self.cycles * text_length
+    def accumulation_steps(self, text_length, world_size=1):
+        microbatch_tokens = self.device_batch_size * self.cycles * text_length * world_size
         if self.total_batch_size % microbatch_tokens:
             raise ValueError(
                 f"Global text batch {self.total_batch_size} must be divisible by "
-                f"{microbatch_tokens} text targets per episode microbatch"
+                f"{microbatch_tokens} text targets per global episode microbatch"
             )
         return self.total_batch_size // microbatch_tokens
 
@@ -220,11 +220,11 @@ def continuation_counts(inputs, text_length, cycles, bos_token_id):
     return handoffs, useful_positions
 
 
-def train_update(model, forward_cycle, optimizer, loader, config, step, bos_token_id,
-                 memory_monitor=None, before_optimizer_step=None):
-    """Consume, backpropagate, then release each loader view before requesting another."""
+def _accumulate_gradients(model, forward_cycle, optimizer, loader, config, step, bos_token_id,
+                          memory_monitor, world_size):
+    """Finish local forward/backward before any optimizer communication."""
     text_length = model.config.text_length
-    accumulation = config.accumulation_steps(text_length)
+    accumulation = config.accumulation_steps(text_length, world_size)
     input_embedding = model.transformer.wte.weight
     input_embedding_frozen = apply_input_embedding_schedule(model, config, step)
     optimizer.zero_grad(set_to_none=True)
@@ -246,7 +246,9 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
             forward_cycle, inputs, targets, text_length, config.cycles,
             timings=first_episode_timings if microstep == 0 else None,
         )
-        require_finite_loss(loss, step)
+        # The complete local phase is coordinated by train_update. An inline
+        # reduction here would strand peers when another forward has failed.
+        require_finite_loss(loss, step, synchronize_workers=False)
         last_batch_loss = loss.detach()
         if microstep == 0:
             synchronize(inputs.device)
@@ -265,23 +267,10 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
     require_finite_gradients(
         model, step, frozen_parameter=input_embedding if input_embedding_frozen else None,
     )
-    checkpoint_wait = 0.0
-    if before_optimizer_step is not None:
-        waiting_started = time.monotonic()
-        before_optimizer_step()
-        checkpoint_wait = time.monotonic() - waiting_started
-    if memory_monitor is not None:
-        memory_monitor.require_available(step)
-    optimizer.step()
-    require_finite_state(model, optimizer, step)
-    optimizer.zero_grad(set_to_none=True)
-    if memory_monitor is not None:
-        memory_monitor.require_available(step)
     possible_handoffs = accumulation * config.device_batch_size * (config.cycles - 1)
     cycle_losses = (cycle_sums / cycle_counts).tolist()
     return {
         "input_embedding_frozen": input_embedding_frozen,
-        "checkpoint_wait_seconds": checkpoint_wait,
         "loss": (cycle_sums.sum() / cycle_counts.sum()).item(),
         "last_batch_loss": last_batch_loss.item(),
         "cycle_losses": cycle_losses,
@@ -289,21 +278,62 @@ def train_update(model, forward_cycle, optimizer, loader, config, step, bos_toke
         "within_document_handoff_fraction": handoffs.item() / possible_handoffs,
         "continuation_text_fraction": useful_positions.item() / (possible_handoffs * text_length),
         "finite_loss_and_gradients": True,
-        "finite_model_and_optimizer_state": True,
         "first_episode_cycle_forwards": first_episode_timings,
         "first_episode_backward_seconds": first_backward_seconds,
     }, dict(loader_state)
 
 
+def train_update(model, forward_cycle, optimizer, loader, config, step, bos_token_id,
+                 memory_monitor=None, before_optimizer_step=None, runtime=None):
+    """Coordinate worker failures before the optimizer synchronizes gradients."""
+    from nanochat.rlm_distributed import DistributedRuntime
+
+    runtime = runtime or DistributedRuntime.single(model.get_device())
+    result, loader_state = runtime.collective(
+        lambda: _accumulate_gradients(model, forward_cycle, optimizer, loader, config, step,
+                                      bos_token_id, memory_monitor, runtime.world_size),
+        "forward and backward",
+    )
+
+    def admit_optimizer():
+        started = time.monotonic()
+        if before_optimizer_step is not None:
+            before_optimizer_step()
+        checkpoint_wait = time.monotonic() - started if before_optimizer_step is not None else 0.0
+        if memory_monitor is not None:
+            memory_monitor.require_available(step)
+        # Allocate lazy moments before workers enter gradient collectives.
+        if runtime.world_size > 1:
+            optimizer.initialize_state()
+        return checkpoint_wait
+
+    result["checkpoint_wait_seconds"] = runtime.collective(admit_optimizer, "prepare optimizer update")
+    if runtime.world_size > 1:
+        optimizer.step(coordinate=runtime.collective)
+    else:
+        optimizer.step()
+
+    def finish_update():
+        require_finite_state(model, optimizer, step)
+        optimizer.zero_grad(set_to_none=True)
+        if memory_monitor is not None:
+            memory_monitor.require_available(step)
+
+    runtime.collective(finish_update, "validate optimizer update")
+    result["finite_model_and_optimizer_state"] = True
+    return result, loader_state
+
+
 class MemoryMonitor:
     """Sample shared-system headroom while CUDA counters measure allocator peaks."""
 
-    def __init__(self, minimum_available_gb=None, interval=0.05):
+    def __init__(self, minimum_available_gb=None, interval=0.05, runtime=None):
         self.minimum = (
             positive_gb(minimum_available_gb, "NANOCHAT_MIN_SYSTEM_AVAILABLE_GB")
             if minimum_available_gb is not None else 0
         )
         self.interval = interval
+        self.runtime = runtime
         self.minimum_observed = psutil.virtual_memory().available
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -319,7 +349,16 @@ class MemoryMonitor:
             self._error = exc
 
     def __enter__(self):
-        self._thread.start()
+        try:
+            if self.runtime is None:
+                self._thread.start()
+            else:
+                self.runtime.collective(self._thread.start, "start memory monitor")
+        except BaseException:
+            self._stop.set()
+            if self._thread.is_alive():
+                self._thread.join()
+            raise
         return self
 
     def require_available(self, step):
@@ -358,21 +397,31 @@ def cuda_metrics(device):
 
 def measured_update(model, forward_cycle, optimizer, loader, config, step, bos_token_id,
                     minimum_available_gb=None, failure_path: Path | None = None,
-                    before_optimizer_step=None):
-    synchronize(model.get_device())
-    if model.get_device().type == "cuda":
-        torch.cuda.reset_peak_memory_stats(model.get_device())
+                    before_optimizer_step=None, runtime=None):
+    from nanochat.rlm_distributed import DistributedRuntime
+
+    runtime = runtime or DistributedRuntime.single(model.get_device())
+
+    def prepare_measurement():
+        synchronize(model.get_device())
+        if model.get_device().type == "cuda":
+            torch.cuda.reset_peak_memory_stats(model.get_device())
+
+    runtime.collective(prepare_measurement, "prepare update measurement")
     graphs_before = dict(torch._dynamo.utils.counters["stats"])
     start = time.monotonic()
-    monitor = MemoryMonitor(minimum_available_gb)
+    monitor = MemoryMonitor(minimum_available_gb, runtime=runtime)
     try:
         with monitor:
             result, loader_state = train_update(
                 model, forward_cycle, optimizer, loader, config, step, bos_token_id, monitor,
-                before_optimizer_step=before_optimizer_step,
+                before_optimizer_step=before_optimizer_step, runtime=runtime,
             )
-            synchronize(model.get_device())
-            monitor.require_available(step)
+            def finish_measurement():
+                synchronize(model.get_device())
+                monitor.require_available(step)
+
+            runtime.collective(finish_measurement, "finish update measurement")
     except BaseException:
         if failure_path is not None:
             write_json(failure_path, {
@@ -386,7 +435,7 @@ def measured_update(model, forward_cycle, optimizer, loader, config, step, bos_t
         raise
     elapsed = time.monotonic() - start
     positions = config.positions_per_episode(model.config.text_length, model.config.memory_tokens)
-    positions *= config.device_batch_size * config.accumulation_steps(model.config.text_length)
+    positions *= config.device_batch_size * config.accumulation_steps(model.config.text_length, runtime.world_size) * runtime.world_size
     result.update({
         "completed_updates": step + 1,
         "duration_seconds": elapsed,
@@ -400,7 +449,7 @@ def measured_update(model, forward_cycle, optimizer, loader, config, step, bos_t
         "compiler_stats_after": dict(torch._dynamo.utils.counters["stats"]),
         **cuda_metrics(model.get_device()),
     })
-    return result, loader_state
+    return runtime.aggregate_metrics(result), loader_state
 
 
 def write_json(path: Path, value):

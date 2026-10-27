@@ -1,0 +1,15 @@
+{
+  // Same d24 backbone as rlm-d24.jsonc.
+  "n_layer": 24,
+  "n_embd": 1536,
+  "n_head": 12,
+  "n_kv_head": 12,
+
+  // Use --cycles 4: 2044 text tokens and 2048 supervised predictions per episode.
+  "text_length": 511,
+  "memory_tokens": 128,
+
+  // Exactly one end-of-memory token precedes the text; this must always be 1.
+  // Maximum sequence length = 511 + 1 + 2 * 128 = 768.
+  "eom_tokens": 1
+}

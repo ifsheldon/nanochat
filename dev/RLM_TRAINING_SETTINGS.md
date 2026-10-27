@@ -63,34 +63,35 @@ The final cycle has `[memory][EOM][text]` and uses `L + 1 + M` positions, becaus
 With two cycles there are no intermediate cycles.
 Internal-position counts describe model input work; they are neither extra corpus text nor an RLM FLOP estimate.
 
-## Worked four-cycle budget
+## Worked four-cycle budgets
 
-This example uses the d24 reference profile, four cycles, and device batch 32.
-Its 1,047,552 text-target budget produces 1,048,576 supervised predictions per update.
+These examples use d24, four cycles, and device batch 32.
+Both budgets produce 1,048,576 supervised predictions per update, but they use different text-target and episode counts.
 
-| Setting or count | `rlm-d24.jsonc` |
-| --- | ---: |
-| Text length `L` | 1023 |
-| Memory slots `M` | 512 |
-| Required chosen text budget `T` | 1,047,552 |
-| Text targets per episode | 4092 |
-| Predictions per episode | 4096 |
-| Global episodes per update | 256 |
-| Accumulation on 1 / 2 / 4 GPUs | 8 / 4 / 2 |
-| Cycle input lengths | 1536, 2048, 2048, 1536 |
-| Input positions per episode | 7168 |
-| Input positions per update | 1,835,008 |
+| Setting or count | `rlm-d24.jsonc` | `rlm-d24-c511-m128.jsonc` |
+| --- | ---: | ---: |
+| Text length `L` | 1023 | 511 |
+| Memory slots `M` | 512 | 128 |
+| Required chosen text budget `T` | 1,047,552 | 1,046,528 |
+| Text targets per episode | 4092 | 2044 |
+| Predictions per episode | 4096 | 2048 |
+| Global episodes per update | 256 | 512 |
+| Accumulation on 1 / 2 / 4 GPUs | 8 / 4 / 2 | 16 / 8 / 4 |
+| Cycle input lengths | 1536, 2048, 2048, 1536 | 640, 768, 768, 640 |
+| Input positions per episode | 7168 | 2816 |
+| Input positions per update | 1,835,008 | 1,441,792 |
 
-The H100 launcher supports this profile with its explicit budget.
+The 1,047,552 budget does not divide into complete four-cycle episodes of 511 text tokens; select 1,046,528 for the comparison above.
+The H100 launcher supports both profiles with their explicit budgets.
 These counts do not establish measured throughput, memory capacity, or model quality.
 
-For a bounded direct-trainer probe:
+For a bounded direct-trainer probe with the smaller text and memory profile:
 
 ```bash
-NANOCHAT_RUN_NAME=rlm-d24-probe NANOCHAT_TRAIN_SHARDS=170 \
+NANOCHAT_RUN_NAME=rlm-c511-probe NANOCHAT_TRAIN_SHARDS=170 \
 uv run --no-sync python -m scripts.rlm_train \
-    --model-profile model_profiles/rlm-d24.jsonc \
-    --total-batch-token-size 1047552 --cycles 4 \
+    --model-profile model_profiles/rlm-d24-c511-m128.jsonc \
+    --total-batch-token-size 1046528 --cycles 4 \
     --device-batch-size 32 --activation-checkpointing --mode probe
 ```
 

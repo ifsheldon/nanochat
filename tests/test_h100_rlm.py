@@ -123,7 +123,7 @@ def test_probe_without_resident_memory_contract_is_not_accepted(tmp_path, missin
 
 
 @pytest.mark.parametrize("profile_file,total_batch_token_size,one_gpu_accumulation", [
-    ("rlm-d24.jsonc", 1047552, 8),
+    ("rlm-d24.jsonc", 1047552, 8), ("rlm-d24-c511-m128.jsonc", 1046528, 16),
 ])
 @pytest.mark.parametrize("initial_gpus,resume_gpus", [(1, 1), (1, 2), (2, 4), (4, 1)])
 @pytest.mark.parametrize("destination_kind", ["explicit", "named", "default"])

@@ -98,8 +98,8 @@ Accumulation remains derived, and no separate accumulation CLI option is added.
 - [x] Require `--total-batch-token-size` on every direct RLM trainer invocation, remove the old RLM flag, and document the existing `TrainingConfig.total_batch_size` field and accounting methods.
 - [x] Accept the budget explicitly for fresh H100 launches, pass it through all probes and training, record it in recipe/invocation metadata, and reuse it on resume across GPU counts.
 - [x] Reject conflicting H100 resume overrides and invalid token-budget divisibility; retain the existing batch/freeze recipe selection and four-cycle setting.
-- [x] Add a central RLM training-settings guide with definitions, the batch equation, a worked d24 example, all trainer/launcher options, and runtime settings; update related guides and indexes.
-- [x] Verify the renamed CLI, profile-dependent token-budget propagation, changed-count resume, accounting, documentation links, and affected tests; obtain independent review.
+- [x] Add a central RLM training-settings guide with definitions, the batch equation, examples for both model profiles, all trainer/launcher options, and runtime settings; update related guides and indexes.
+- [x] Verify the renamed CLI, original and 511-token profile propagation, changed-count resume, accounting, documentation links, and affected tests; obtain independent review.
 
 The H100 helpers receive a required `total_batch_token_size` argument, and saved recipes record that field explicitly under a new schema version.
 The direct trainer maps the explicit CLI name to the existing `TrainingConfig.total_batch_size` field; model configuration and training accounting retain their current meaning.
@@ -109,8 +109,8 @@ This work stays in the current checkout without commits or production training.
 ### Token-budget verification
 
 - Trainer CLI, distributed CLI, profile-training, storage, attention-probe, and capacity tests: 91 passed.
-- H100 launcher tests: 124 passed, including custom-text-length profiles, budget propagation, and saved-budget resume across GPU counts.
+- H100 launcher tests: 148 passed, including both bundled profiles, budget propagation, and saved-budget resume across GPU counts.
 - Independent review found no actionable issues and separately passed 30 focused H100 budget/accumulation tests from the affected suite.
-- Verified coverage of all 30 trainer options and eight H100 options in the central guide, 14 runnable examples, 65 local documentation links, and the worked d24 profile calculation.
+- Verified coverage of all 30 trainer options and eight H100 options in the central guide, 17 runnable examples, 70 local documentation links, and both worked profile calculations.
 - Shell syntax/help, dependency-free launcher argument parsing, compilation, and whitespace checks passed.
 - The full CPU and CUDA suites recorded above were not repeated for this CLI/configuration extension; no actual H100 training was launched.

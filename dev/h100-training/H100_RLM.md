@@ -86,6 +86,14 @@ The model architecture comes from a seven-field [JSONC profile](../../model_prof
 The bundled reference `model_profiles/rlm-d24.jsonc` specifies 24 layers, width 1536, 12 query and KV heads, 1023 text tokens, 512 memory tokens, and exactly one EOM token.
 The launcher preserves the original document as `OUTPUT/model-profile.jsonc` before probing and passes that same copy through capacity selection, attention selection, and training.
 The supplied initialization embedding requires width 1536 and its matching tokenizer; a different width requires a compatible asset bundle.
+The bundled profile with 511 text tokens and 128 memory slots uses the same backbone and can launch with a compatible 1,046,528-text-target budget:
+
+```bash
+bash runs/runh100_rlm.sh \
+    --num-gpus 2 --model-profile model_profiles/rlm-d24-c511-m128.jsonc \
+    --total-batch-token-size 1046528 \
+    --assets assets/h100-seed --run-name pretrain-c511-m128-2gpu
+```
 
 ## Automatic capacity selection
 
@@ -105,6 +113,7 @@ The 1,047,552 budget above gives 256 complete four-cycle episodes and 1,048,576 
 Increasing GPU count reduces accumulation per worker and keeps this global batch unchanged.
 Accumulation is `total_batch_token_size / (device_batch_size * 4 * text_length * num_gpus)` and must be a positive integer.
 Fresh launches validate the batch-32 recipe before GPU setup, so the budget must be divisible by `32 * 4 * text_length * num_gpus`; the batch-16 fallback then also divides evenly.
+With `rlm-d24-c511-m128.jsonc` and a 1,046,528 budget, each update contains 512 episodes and 1,048,576 predictions; device batch 32 accumulates 16 / 8 / 4 microbatches on 1 / 2 / 4 GPUs, and device batch 16 uses twice those counts.
 The text budget excludes the extra EOM predictions and memory/summary positions, and is passed unchanged to capacity probes, attention probes, and training.
 Changing that budget changes total training text across the fixed 5574-update horizon.
 The remaining training settings are configured by the launcher.

@@ -51,7 +51,7 @@ Select a [JSONC model profile](../../model_profiles/README.md), preserve its ori
 Every trainer or launcher invocation requires `--model-profile PATH`, including resume; no profile is selected automatically.
 Use `model_profiles/rlm-d24.jsonc` for the full-size checks and a separate small profile for tiny-model tests; the former architecture CLI flags have been removed.
 Pass the same explicit `total_batch_token_size` to `choose_recipe`, `choose_attention`, and `training_arguments`; the generated direct-trainer commands must include `--total-batch-token-size` in every mode, including resume.
-For the reference 1023-text/512-memory profile, use 1,047,552 text targets.
+For the reference 1023-text/512-memory profile, use 1,047,552 text targets; for the bundled 511-text/128-memory profile, use 1,046,528, which gives 512 four-cycle episodes and 1,048,576 predictions per update.
 
 - Run capacity and attention probes at each count intended for full-size validation, including the smaller counts needed for resume tests.
   Confirm the reported worker count, finite updates, local staging buffers and the coordinator's complete optimizer snapshot, memory headroom, and collective warmup completion.
@@ -71,6 +71,7 @@ They require embedding freeze `none` or `permanent`, not `scheduled`.
   Verify loaded model weights, complete Adam/Muon state, completed step, and per-worker loader/RNG metadata before another healthy update.
   Remove the original scratch profile source and pass `--model-profile OUTPUT/train/checkpoints/model-profile.jsonc` explicitly on resume to exercise the saved checkpoint copy, where `OUTPUT` is the scratch run root.
 - Keep the global batch fixed and confirm accumulation changes with worker count: batch 32 uses `8 / 4 / 2` microbatches for `1 / 2 / 4` GPUs; batch 16 uses `16 / 8 / 4`.
+  Those counts use 1023 text tokens and a 1,047,552 budget; with 511 text tokens and a 1,046,528 budget, batch 32 uses `16 / 8 / 4`, and batch 16 uses `32 / 16 / 8`.
   Changed-count data continuation is approximate at row-group granularity, so production losses need not match bit-for-bit after resume.
 - Confirm schema-4 `selected-recipe.json` and the launch invocation record contain the selected token budget.
   H100 launcher resume must restore that budget when omitted, accept the same explicit value, and reject a different value; direct-trainer resume still requires `--total-batch-token-size` explicitly.

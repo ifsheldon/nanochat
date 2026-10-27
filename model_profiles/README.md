@@ -4,6 +4,12 @@ RLM training, capacity probes, attention probes, and the H100 launcher require `
 There is no default or automatic profile selection; [`rlm-d24.jsonc`](rlm-d24.jsonc) is a bundled reference example.
 Profiles support `//` and `/* ... */` comments and trailing commas through the `json5` parser.
 
+| Profile | Text tokens per cycle | Memory slots | Maximum positions per cycle |
+| --- | ---: | ---: | ---: |
+| [`rlm-d24.jsonc`](rlm-d24.jsonc) | 1023 | 512 | 2048 |
+| [`rlm-d24-c511-m128.jsonc`](rlm-d24-c511-m128.jsonc) | 511 | 128 | 768 |
+
+Both profiles use the same d24 backbone; set the training cycle count separately with `--cycles`.
 The [training settings reference](../dev/RLM_TRAINING_SETTINGS.md) explains episodes, token budgets, accumulation, and every trainer/launcher option.
 
 Each profile requires exactly these seven fields:
@@ -50,6 +56,46 @@ Changing the model width requires a matching initialization embedding or fresh i
 
 The separate RLM `--depth`, `--width`, `--head-dim`, `--text-length`, and `--memory-tokens` options have been removed.
 The base GPT trainer's CLI is unchanged.
+
+## Four-cycle comparison with 2K NanoChat
+
+Use `rlm-d24-c511-m128.jsonc` with `--cycles 4` to compare an episode spanning approximately 2K text tokens against the [original d24 NanoChat setup](../dev/spark-training/SPARK_D24.md#configuration).
+The model retains 24 layers, width 1536, and 12 query and KV heads.
+
+| Per sequence or episode | Original NanoChat | RLM, 511 text tokens × 4 cycles |
+| --- | ---: | ---: |
+| Real-text targets | 2048 | 2044 |
+| Supervised predictions, including EOM readouts | 2048 | 2048 |
+| Incoming memory slots at a recurrent boundary | None | 128 |
+| Training forward lengths | 2048 | 640, 768, 768, 640 |
+| Total Transformer input positions | 2048 | 2816 |
+
+RLM compresses earlier chunks into memory rather than retaining their individual tokens in a single 2048-token attention context.
+The extra EOM predictions supervise chunk starts; they are not four additional text tokens.
+These counts describe the architecture, not measured speed, GPU memory use, or model quality.
+
+For 512 episodes per optimizer update, set `--total-batch-token-size 1046528`: this supplies 1,046,528 real-text targets and 1,048,576 supervised predictions, matching the original NanoChat prediction count with 0.195% fewer real-text targets.
+At device batch 32, this gives 16, 8, or 4 accumulation steps with 1, 2, or 4 workers respectively.
+The reference 1,047,552 text-target budget does not divide evenly into these episodes; the trainer requires a compatible budget explicitly and has no default.
+After preparing the tokenizer and dataset, a direct-trainer probe is:
+
+```bash
+uv run --no-sync python -m scripts.rlm_train \
+    --model-profile model_profiles/rlm-d24-c511-m128.jsonc \
+    --cycles 4 --total-batch-token-size 1046528 \
+    --mode probe --device-batch-size 32 --activation-checkpointing \
+    --output-dir training_run/rlm-d24-c511-m128-probe
+```
+
+Keep `--cycles 4 --total-batch-token-size 1046528` when using this profile with the direct trainer for training or resume.
+The H100 launcher supports the same profile and budget, with four cycles fixed by its recipe:
+
+```bash
+bash runs/runh100_rlm.sh \
+    --num-gpus 2 --model-profile model_profiles/rlm-d24-c511-m128.jsonc \
+    --total-batch-token-size 1046528 \
+    --assets assets/h100-seed --run-name pretrain-c511-m128-2gpu
+```
 
 ## Checkpoints and resume
 

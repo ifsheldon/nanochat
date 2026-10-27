@@ -1,7 +1,7 @@
 # Recurrent latent memory pretraining plan
 
 Date: October 8, 2026.
-Branch: `spark-rlm`, created from `spark` at `f148fe7`.
+Branch: `rlm`, originally created as `spark-rlm` from `spark` at `f148fe7`.
 Status: the initial model, training, evaluation, and sampling workflow is implemented; d24 batch 16 passed the two-update probe with activation checkpointing, and a six-update natural-language pilot completed with checkpointing and held-out memory controls.
 See the [RLM workflow and measured results](../spark-training/SPARK_RLM.md) for commands, implementation details, and validation status.
 New runs now default to the repository's `training_run/<NANOCHAT_RUN_NAME>/`, using `pretrain-1` when no name is set, while datasets are shared under `datasets/`.

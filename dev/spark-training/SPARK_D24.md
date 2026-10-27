@@ -4,7 +4,7 @@ For the October 5, 2026 run status and instructions to finish only the paused Hu
 
 This workflow trains a fresh 1,384,122,122-parameter nanochat model on one GB10 GPU through pretraining, base evaluation, SFT, and chat evaluation.
 The quality target is the repository's GPT-2 reference CORE score of 0.256525; completing training does not by itself establish that capability.
-Run commands from the repository root on the merged `spark-rlm` branch.
+Run commands from the repository root on the merged `rlm` branch.
 
 ## Configuration
 

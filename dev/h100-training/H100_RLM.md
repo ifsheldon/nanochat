@@ -1,6 +1,6 @@
 # Single-H100 RLM pretraining
 
-Use the supplied files on the merged `spark-rlm` branch to start a fresh pretraining run.
+Use the supplied files on the merged `rlm` branch to start a fresh pretraining run.
 The initialization embedding and matching tokenizer are provided in `assets/h100-seed/` and downloaded through Git LFS during setup.
 The launcher installs the Python environment, downloads the dataset, checks capacity, benchmarks attention, and starts training with the faster supported backend.
 
@@ -23,7 +23,7 @@ Initialize Git LFS, clone the branch, download the supplied files, and run the l
 
 ```bash
 git lfs install
-git clone --branch spark-rlm https://github.com/ifsheldon/nanochat.git
+git clone --branch rlm https://github.com/ifsheldon/nanochat.git
 cd nanochat
 git lfs pull
 bash runs/runh100_rlm.sh \
@@ -31,7 +31,7 @@ bash runs/runh100_rlm.sh \
     --run-name pretrain-1
 ```
 
-For an existing checkout, run `git lfs install`, `git fetch origin`, `git switch spark-rlm`, `git pull --ff-only`, and `git lfs pull` before launching.
+For an existing checkout, run `git lfs install`, `git fetch origin`, `git switch rlm`, `git pull --ff-only`, and `git lfs pull` before launching.
 If the host exposes multiple GPUs, set `CUDA_VISIBLE_DEVICES` to the H100's device index when running the launcher.
 Run the script directly, outside `torchrun` or another distributed worker environment.
 A GPU partition or a different accelerator is rejected.

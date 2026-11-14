@@ -142,6 +142,7 @@ Use valid-target counts if masking or variable text lengths are introduced.
 Preserve the existing document convention: each document receives BOS, and pretraining does not append an EOS token.
 Do not insert another BOS merely because text enters a new recurrent cycle.
 The existing packed rows may contain several documents and may discard cropped document tails; this prototype does not guarantee that an episode is one uninterrupted document.
+See [long documents and conversations](RLM_LONG_DOCUMENTS.md) for how the packers treat text longer than an episode.
 Reset latent memory between packed rows, and preserve existing attention across internal document boundaries initially.
 
 Measure how often a cycle boundary falls within the same document and how much later-chunk text has relevant earlier context.

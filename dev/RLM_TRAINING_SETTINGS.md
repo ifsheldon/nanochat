@@ -17,6 +17,11 @@ Memory remains attached to autograd across all cycles, so a later cycle's loss c
 Memory does not carry across episodes or accumulation steps.
 An episode may contain several packed documents; it is not necessarily one document.
 
+A **chunk** is a fixed `text_length`-token slice of an episode, and a **cycle** is the one Transformer call that processes a chunk together with its memory, EOM, and summary positions.
+An episode with `C` cycles has exactly `C` chunks, and cycle `k` processes chunk `k`.
+Chunk boundaries are fixed token positions and ignore document boundaries, so only the first chunk is guaranteed to begin at a document start.
+"Chunk" is used only for this fixed slice; the [RLM design](RLM-architecture/RLM_DESIGN.md#terminology) defines these and the related terms.
+
 A **device microbatch** contains `device_batch_size` independent episodes on one GPU.
 Each worker completes `accumulation_steps` microbatches, accumulating gradients before one **optimizer update**.
 Workers average gradients for that global update; adding GPUs does not split an episode's recurrent path across devices.
@@ -33,7 +38,7 @@ $$
 | `W` | Worker/GPU count | `--num-gpus` on H100; the distributed launcher's world size for the direct trainer; 1 for a single process |
 | `B` | `--device-batch-size` | Episodes per worker per accumulation step |
 | `A` | Derived accumulation steps | Microbatches per worker per optimizer update; no separate CLI option |
-| `C` | `--cycles` | Consecutive recurrent chunks per episode |
+| `C` | `--cycles` | Cycles per episode, one per consecutive chunk |
 | `L` | Profile `text_length` | Text tokens per cycle |
 | `M` | Profile `memory_tokens` | Incoming memory slots and outgoing summary slots where present; outside the text budget |
 
@@ -106,7 +111,7 @@ Defaults apply only where shown, and schedule/checkpoint step numbers refer to c
 | --- | --- | --- |
 | `--model-profile PATH` | Required | Seven-field architecture document; required for fresh runs and resume, with no automatic selection |
 | `--total-batch-token-size T` | Required | Positive global text-target budget per optimizer update; must satisfy the divisibility equation above in every mode and on resume |
-| `--cycles C` | `2` | Recurrent chunks per episode; integer at least 2 so later losses supervise the memory writer |
+| `--cycles C` | `2` | Cycles per episode, one per chunk; integer at least 2 so later losses supervise the memory writer |
 | `--device-batch-size B` | `16` | Positive number of episodes on each worker per accumulation step |
 | `--mode` | `probe` | `probe`, `capacity-probe`, `attention-probe`, or `train`; limits described below |
 | `--num-iterations N` | Required for `train`; `2` otherwise | Positive full schedule horizon; ordinary probes run this many updates and require at least 2; capacity and attention probes use their own execution limits |

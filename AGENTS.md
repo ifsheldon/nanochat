@@ -44,7 +44,7 @@ RLM reuses a GPT backbone across bounded text chunks and passes learned memory b
 - [RLM model profiles](model_profiles/README.md): architecture fields, `--model-profile`, and checkpoint/resume behavior.
 - [H100 pretraining](dev/h100-training/H100_RLM.md): run, monitor, and resume using the supplied files.
 - [Spark RLM training](dev/spark-training/SPARK_RLM.md): training, evaluation, and measured results.
-- [RLM design](dev/RLM-architecture/RLM_DESIGN.md) and [memory-boundary analysis](dev/RLM-architecture/SPARK_RLM_DOCUMENT_BOUNDARIES.md): architecture and supporting research.
+- [RLM design](dev/RLM-architecture/RLM_DESIGN.md) and [memory-boundary analysis](dev/RLM-architecture/SPARK_RLM_DOCUMENT_BOUNDARIES.md): terminology (document, episode, chunk, cycle, handoff), architecture, and supporting research.
 - [Development documentation index](dev/README.md): hardware-specific implementation plans and experiment records, alongside the workflow guides.
 - [Spark d24](dev/spark-training/SPARK_D24.md) and [small Spark experiments](dev/spark-training/SPARK.md): base-model workflows.
 - [Project storage](dev/PROJECT_STORAGE.md): artifact locations, dataset sharing, and path overrides.

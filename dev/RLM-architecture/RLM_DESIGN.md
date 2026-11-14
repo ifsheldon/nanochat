@@ -4,6 +4,29 @@ This document covers the recurrent model, its data and loss contract, and archit
 Hardware settings, resource probes, and implementation history belong to the [Spark training record](../spark-training/SPARK_RLM_PLAN.md) and [H100 implementation plan](../h100-training/H100_MULTI_GPU_PLAN.md).
 See the [Spark workflow](../spark-training/SPARK_RLM.md) or [H100 workflow](../h100-training/H100_RLM.md) for training commands.
 
+## Terminology
+
+These words have one meaning throughout the RLM code and documentation.
+Sizes are named by their profile field or CLI option: `text_length` tokens per chunk, `memory_tokens` memory slots, and `--cycles` cycles per episode.
+
+| Term | Meaning |
+| --- | --- |
+| Document | One source text from the corpus, tokenized with a leading BOS and no EOS. |
+| Episode | One training or evaluation example: one data-loader row of `cycles * text_length` text tokens. Memory is empty at its start and discarded at its end. |
+| Chunk | A fixed `text_length`-token slice of an episode. An episode with `cycles` cycles has exactly that many chunks; chunk `k` covers text positions from `(k - 1) * text_length` up to `k * text_length`. |
+| Cycle | One Transformer call that processes one chunk, laid out as `[memory][<EOM>][chunk][summary slots]`. Cycle `k` processes chunk `k`. |
+| Memory | The `memory_tokens` continuous vectors a cycle receives as its prefix. The first cycle of an episode receives none. |
+| Summary slots | The `memory_tokens` positions appended after the chunk, whose final hidden states become the next cycle's memory. |
+| `<EOM>` | The one learned input placed between memory and chunk in every cycle; its output predicts the chunk's first token. |
+| Handoff | The transfer of memory from one cycle to the next. Nothing else crosses a chunk boundary. |
+
+Use "chunk" only for this fixed slice.
+Do not use it for a document, a document fragment, a cycle, or any other piece of text.
+Chunk boundaries are fixed token positions and ignore document boundaries.
+With the packed pretraining loader an episode begins at a document start, so chunk 1 does too; each later chunk begins wherever the packed text happens to be, usually inside a document.
+A chunk can therefore hold part of one document, several whole documents, or a mix, and one document can span several chunks.
+During generation the current chunk fills one token at a time, and a new cycle begins when it reaches `text_length` tokens.
+
 ## Objective and design decisions
 
 Train a fresh nanochat model that carries information between text chunks through continuous latent memory.

@@ -2,7 +2,8 @@
 
 Recorded on November 14, 2026.
 This document records how the pretraining and SFT data loaders treat documents and conversations longer than one episode, the measurements behind that, and the decisions for the next runs.
-The pretraining decision is implemented; the SFT decision is not yet.
+The pretraining decision is implemented.
+For SFT the data loader is implemented and measured; the RLM SFT trainer that would call it is not in this repository yet.
 The findings do not change the model already trained, [`rlm-exps/nanochat-rlm`](https://huggingface.co/rlm-exps/nanochat-rlm); they matter for the next pretraining and SFT runs.
 
 Terms follow the [RLM terminology](RLM_DESIGN.md#terminology): an episode is one loader row, a chunk is a fixed `text_length`-token slice of it, and a cycle processes one chunk.
@@ -184,29 +185,100 @@ With each conversation assigned to the shortest length it fits:
 | 24 cycles | 1,145 read-then-answer | 3.3% | 0.08% |
 | Longer than 24 cycles | 22 read-then-answer | 0.1% | under 0.01% |
 
+### Implementation: the mixed-episode loader
+
+`sft_mixed_episode_loader` in [`nanochat/sft_dataloader.py`](../../nanochat/sft_dataloader.py) implements the decision.
+Its `episode_mix` parameter is required and has no default.
+`parse_episode_mix` reads it from text as comma-separated `CYCLESxBATCH:MICROBATCHES` entries: cycles per episode, episodes per microbatch, and microbatches of that shape in one optimizer update.
+
+```text
+4x8:29,12x2:2,24x1:2    29 microbatches of 8 four-cycle episodes, 2 of 2 twelve-cycle episodes,
+                        and 2 of 1 twenty-four-cycle episode per update: 1,024 chunks
+4x8:32                  four-cycle episodes only: 1,024 chunks
+```
+
+- Each conversation is routed, when it is read, to the shortest episode length that holds it whole, so a long conversation never waits in the four-cycle buffer.
+- A longer episode opens with a waiting conversation that needs its length, and the rest of it is filled best-fit from that length and all shorter ones.
+- When no conversation of its length is waiting, a longer episode is filled from shorter ones.
+- A conversation longer than the longest episode is truncated to it, or skipped when no assistant token would remain.
+- Conversations of the longer lengths wait in unbounded queues until an episode of that length takes them; only the shortest length uses the 100-conversation buffer.
+- One optimizer update is one pass over a fixed pattern in which every shape contributes its microbatches, evenly interleaved.
+
+The trainer reads the cycle count of a microbatch from its width, and `episode_mix_chunks(mix) * text_length * workers` must equal the text-token budget of an update.
+With a single entry the loader gives fixed-length episodes whose over-long conversations are truncated or skipped on arrival, so its buffer does not fill.
+The original `sft_data_loader_bos_bestfit` is unchanged and reproduces the packing of the earlier run.
+
+One epoch of the real mixture with `4x8:29,12x2:2,24x1:2`, compared with the original packer at four cycles:
+The original packer's replay reproduces the published SFT run exactly: 504 updates and 790,367 conversations consumed.
+
+| Measurement | Original packer | Mixed-episode loader |
+| --- | ---: | ---: |
+| Updates in one epoch | 504 | 498 |
+| Padding, share of all positions | 9.05% | 0.25% |
+| Supervised targets per update | 586,514 | 596,555 |
+| Conversations of 5 to 12 cycles trained on whole, of 2,852 | 0 | 2,842 |
+| Conversations of 13 to 24 cycles trained on whole, of 1,145 | 0 | 996 |
+| Loader time per update on CPU | 406 ms | 488 ms |
+
+| Episode length | Share of positions | Padding | Supervised share | Conversations per episode |
+| --- | ---: | ---: | ---: | ---: |
+| 4 cycles | 90.6% | 0.27% | 61.3% | 6.7 |
+| 12 cycles | 4.7% | 0.10% | 16.1% | 5.3 |
+| 24 cycles | 4.7% | 0.05% | 13.3% | 6.7 |
+
+The 24-cycle episodes also absorbed 826 of the 5-to-12-cycle conversations.
+149 conversations of 13 to 24 cycles were still waiting when the epoch ended, because two 24-cycle episodes per update is slightly fewer than they arrive.
+
+### Speed of the mixed episodes
+
+Forward and backward of one microbatch were timed on the DGX Spark with the published SFT checkpoint, real SFT conversations, BF16, activation checkpointing, and the compiled cycle forward.
+
+| Microbatch | Text tokens | Positions | Seconds | Text tokens per second | Cost per token against 8 × 4 | Peak CUDA allocated |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 episodes × 4 cycles | 32,736 | 57,344 | 6.72 | 4,868 | 1.00 | 24.5 GB |
+| 2 episodes × 12 cycles | 24,552 | 47,104 | 6.68 | 3,674 | 1.33 | 18.1 GB |
+| 1 episode × 24 cycles | 24,552 | 48,128 | 8.51 | 2,885 | 1.73 | 19.5 GB |
+
+The longer episodes cost more per token because more of their cycles carry both memory and summary positions, and because one or two episodes per microbatch use the GPU less efficiently than eight.
+They need less memory than the four-cycle microbatch.
+
+For one optimizer update of 1,024 chunks:
+
+| Measurement | 32 microbatches of 8 × 4 | `4x8:29,12x2:2,24x1:2` | Change |
+| --- | ---: | ---: | ---: |
+| Forward and backward time, in 8 × 4 microbatches | 32.0 | 33.6 | +4.9% |
+| Supervised targets, against the original packer | 586,514 | 596,555 | +1.7% |
+| Updates in one epoch, against the original packer | 504 | 498 | -1.2% |
+| Forward and backward time for one epoch | 504 × 32.0 | 498 × 33.6 | +3.7% |
+| Loader time on CPU | 0.41 s | 0.49 s | +0.08 s |
+
+The mixed episodes therefore slow an update by about 5% and an epoch by about 4%, and the extra loader time is negligible against an update of more than 90 seconds.
+The 24-cycle microbatch accounts for most of the cost.
+The three shapes need nine compiled graphs, more than PyTorch's default recompile limit of eight.
+With the default limit the 24-cycle shape silently ran uncompiled and took 9.70 seconds instead of 8.51, so the trainer must raise `torch._dynamo.config.recompile_limit`.
+These timings are from one GB10 GPU, one batch per shape, and five timed repetitions after warm-up, without the optimizer step; the ratio on H100s has not been measured.
+
 ## Plan
 
-Decided:
+Done:
 
-- Pretraining: crop over-long documents on arrival in the best-fit packer. Implemented as the packer's default.
-- SFT: episode lengths of 4, 12, and 24 cycles, mixed together.
+- Pretraining: crop over-long documents on arrival in the best-fit packer, as the packer's default.
+- SFT loader: episode lengths chosen by the required `episode_mix`, each conversation assigned to the shortest length it fits, long episodes filled with shorter conversations, and lengths mixed inside every optimizer update.
 
-Proposed, to confirm before implementation:
+Remaining:
 
-- Assign each conversation to the shortest episode length it fits, and fill the rest of a long episode with short conversations.
-- Mix the lengths inside every optimizer update instead of alternating blocks of updates, so each update sees the whole mixture.
-- Keep the update at 1,024 chunks, for example 29 microbatches of 8 episodes × 4 cycles, 2 of 2 × 12, and 2 of 1 × 24.
-  By position count the two long microbatches are smaller than the current 8 × 4 microbatch: 47,104 and 48,128 positions against 57,344.
+- Call the loader from the RLM SFT trainer, with a required `--episode-mix` option parsed by `parse_episode_mix`, and let each microbatch run the cycle count given by its width.
+- Raise the compiler's recompile limit in that trainer so that all three shapes stay compiled.
 - Hold out some long conversations and score them with intact and shuffled memory, to tell whether long-range retention was learned.
 
 ## Open questions
 
 - **Loss normalisation in SFT.** A long episode has about 185 supervised tokens, against roughly 20,000 in a four-cycle microbatch. If loss is averaged over all supervised tokens in an update, the long episodes contribute about 0.2% of the gradient.
-- **Capacity.** Whether 12 and 24 cycles of full backpropagation fit on the H100s has not been measured; it needs a capacity probe.
+- **Capacity and speed on H100s.** On the Spark the 12- and 24-cycle microbatches need less memory than the four-cycle one, without optimizer state resident. Neither memory nor the speed ratio has been measured on the H100s.
 - **The 22 conversations beyond 24 cycles.** Cropping them leaves no answer, so they would stay skipped unless a longer episode length is added.
 - **Training signal.** Pretraining never ran more than four cycles, and about 4,000 conversations would teach longer retention; whether one SFT epoch is enough is unknown.
-- **The four-cycle SFT packer.** Conversations longer than four cycles must be routed to the longer lengths before they reach its buffer, or it fills as it does today.
-- **Code location.** The RLM SFT trainer used for the H100 run is not in this repository yet.
+- **Code location.** The RLM SFT trainer used for the H100 run is not in this repository yet, so the required `--episode-mix` option exists only as the loader's required parameter and its parser.
+- **Unused long conversations.** With two 24-cycle episodes per update, 13% of the conversations of 13 to 24 cycles are not reached in one epoch; a different mix changes this.
 
 ## How the numbers were measured
 
@@ -215,4 +287,6 @@ Proposed, to confirm before implementation:
 - **SFT packer:** the actual loader function replayed on CPU with a 4,092-token row for 88,000 episodes, compared with `sft/updates.jsonl` from the published SFT run.
 - **Conversation lengths:** the three length columns in the mixture table use 6,000 sampled conversations per source. Counts of over-long conversations and the cycle table use all 460,341 SmolTalk conversations. Mixture totals combine exact SmolTalk counts with MMLU and GSM8K totals scaled from the samples.
 - **Median assistant tokens kept by cropping, and median messages:** an 80,000-conversation SmolTalk sample.
-- The replay scripts were run from a scratch directory and are not part of the repository.
+- **Mixed-episode loader:** the loader function replayed on CPU over one epoch of the real mixture, 498 updates, next to the original packer over its 504 updates.
+- **Speed:** the published SFT checkpoint at step 504 on the Spark's GB10 with PyTorch 2.14.1, three warm-up and five timed forward-and-backward repetitions per shape. The 24-cycle figure comes from a second process with the recompile limit raised, in which the four-cycle shape measured 6.57 seconds; the update comparison uses each shape's ratio to the four-cycle time from its own process.
+- The replay and timing scripts were run from a scratch directory and are not part of the repository.

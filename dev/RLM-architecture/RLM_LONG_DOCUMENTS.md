@@ -2,7 +2,7 @@
 
 Recorded on November 14, 2026.
 This document records how the pretraining and SFT data loaders treat documents and conversations longer than one episode, the measurements behind that, and the decisions for the next runs.
-Nothing under the decisions below is implemented yet.
+The pretraining decision is implemented; the SFT decision is not yet.
 The findings do not change the model already trained, [`rlm-exps/nanochat-rlm`](https://huggingface.co/rlm-exps/nanochat-rlm); they matter for the next pretraining and SFT runs.
 
 Terms follow the [RLM terminology](RLM_DESIGN.md#terminology): an episode is one loader row, a chunk is a fixed `text_length`-token slice of it, and a cycle processes one chunk.
@@ -60,6 +60,8 @@ It leaves the buffer only through step 2, which requires it to be the shortest d
 ### Decision: option 1
 
 Pretraining cannot afford more cycles per episode, so the next pretraining run crops over-long documents on arrival.
+The packer does this by default through `crop_long_documents=True`; passing `False` restores the original behaviour.
+The base GPT trainer and the packed evaluation loaders share the function and get the same default, so their rows change too.
 A replay of both variants gives:
 
 | Measurement | Original packer | Crop on arrival |
@@ -75,6 +77,7 @@ A replay of both variants gives:
 
 Option 1 does not reduce discarded text.
 Its benefit is that every long document is used as a full single-document episode, where all three handoffs stay inside one document, and that best-fit works over the whole buffer again.
+The real loader on the training shards gives 6.8% single-document episodes over its first 1,920 episodes with the crop, and none without it.
 
 ## SFT
 
@@ -185,7 +188,7 @@ With each conversation assigned to the shortest length it fits:
 
 Decided:
 
-- Pretraining: crop over-long documents on arrival in the best-fit packer.
+- Pretraining: crop over-long documents on arrival in the best-fit packer. Implemented as the packer's default.
 - SFT: episode lengths of 4, 12, and 24 cycles, mixed together.
 
 Proposed, to confirm before implementation:
@@ -202,7 +205,6 @@ Proposed, to confirm before implementation:
 - **Capacity.** Whether 12 and 24 cycles of full backpropagation fit on the H100s has not been measured; it needs a capacity probe.
 - **The 22 conversations beyond 24 cycles.** Cropping them leaves no answer, so they would stay skipped unless a longer episode length is added.
 - **Training signal.** Pretraining never ran more than four cycles, and about 4,000 conversations would teach longer retention; whether one SFT epoch is enough is unknown.
-- **Scope of the pretraining change.** The packer is shared with the base GPT trainer and the packed evaluation loaders, so changing it there changes their rows too.
 - **The four-cycle SFT packer.** Conversations longer than four cycles must be routed to the longer lengths before they reach its buffer, or it fills as it does today.
 - **Code location.** The RLM SFT trainer used for the H100 run is not in this repository yet.
 

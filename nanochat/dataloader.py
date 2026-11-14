@@ -74,7 +74,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000, crop_long_documents=True
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -86,6 +86,12 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     1. From buffered docs, pick the LARGEST doc that fits entirely
     2. Repeat until no doc fits
     3. When nothing fits, crop a doc to fill remaining space exactly
+
+    A document longer than a row can never fit, so by default it is cropped to
+    exactly one row when it enters the buffer. It is then the largest candidate
+    for the next empty row and becomes a whole single-document row. Without
+    this (crop_long_documents=False), such documents wait in the buffer until
+    they fill it, and best-fit then searches only the freshly loaded documents.
 
     Key properties:
     - Every row starts with BOS
@@ -105,7 +111,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         doc_batch, (pq_idx, rg_idx, epoch) = next(batches)
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
         for tokens in token_lists:
-            doc_buffer.append(tokens)
+            doc_buffer.append(tokens[:row_capacity] if crop_long_documents else tokens)
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer

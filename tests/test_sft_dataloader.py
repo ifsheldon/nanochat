@@ -4,7 +4,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nanochat.sft_dataloader import sft_data_loader_bos_bestfit
+from nanochat.sft_dataloader import (
+    EpisodeShape, episode_mix_chunks, parse_episode_mix, sft_data_loader_bos_bestfit, sft_mixed_episode_loader,
+)
 
 
 class TokenizedConversations:
@@ -107,3 +109,83 @@ def test_oversized_buffer_keeps_producing_finite_training_loss():
         logits = torch.zeros(*targets.shape, 64)
         loss = F.cross_entropy(logits.flatten(0, 1), targets.flatten(), ignore_index=-1)
         assert loss.isfinite()
+
+
+def mixed_loader(dataset, episode_mix, **kwargs):
+    options = dict(text_length=4, device=torch.device("cpu"), buffer_size=len(dataset))
+    options.update(kwargs)
+    return sft_mixed_episode_loader(dataset, TokenizedConversations(), episode_mix=parse_episode_mix(episode_mix), **options)
+
+
+def test_episode_mix_parses_shapes_shortest_first():
+    mix = parse_episode_mix("24x1:2, 4x8:29,12x2:2")
+    assert mix == (EpisodeShape(4, 8, 29), EpisodeShape(12, 2, 2), EpisodeShape(24, 1, 2))
+    assert episode_mix_chunks(mix) == 1024
+
+
+@pytest.mark.parametrize("text", ["", "4x8", "4x8:0", "0x8:1", "4x8:1,4x2:1", "4x8:1;12x2:1"])
+def test_invalid_episode_mix_is_rejected(text):
+    with pytest.raises(ValueError):
+        parse_episode_mix(text)
+
+
+def test_single_length_mix_matches_original_packer_when_every_conversation_fits():
+    dataset = [conversation(length, start=10 * index) for index, length in enumerate([3, 9, 5, 2, 7, 4, 6, 8], start=1)]
+    original = sft_data_loader_bos_bestfit(dataset, TokenizedConversations(), 2, 8, torch.device("cpu"), buffer_size=4)
+    mixed = mixed_loader(dataset, "2x2:1", buffer_size=4)
+    for _ in range(6):
+        x, y, state = next(original)
+        mixed_x, mixed_y, mixed_state = next(mixed)
+        assert torch.equal(x, mixed_x) and torch.equal(y, mixed_y)
+        assert state == mixed_state
+
+
+def test_long_conversation_opens_a_longer_episode_and_short_ones_fill_it():
+    short, long, other = conversation(5), conversation(12, start=20), conversation(4, start=40)
+    batches = mixed_loader([short, long, other], "2x1:1,4x1:1")
+    x, y, _ = next(batches)
+    assert x.shape == (1, 8)
+    assert x[0].tolist() == [*short[0], *other[0]][:8]
+    x, y, _ = next(batches)
+    assert x.shape == (1, 16)
+    assert x[0].tolist() == [*long[0], *short[0]][:16]
+    assert y[0].tolist() == [*long[0][1:], -1, *short[0][1:]]
+
+
+def test_long_conversations_never_displace_short_ones_from_the_buffer():
+    long = [conversation(12, start=20 + index) for index in range(6)]
+    dataset = [conversation(5), *long, conversation(4, start=40)]
+    batches = mixed_loader(dataset, "2x1:3,4x1:1", buffer_size=2)
+    for index in range(12):
+        x, y, _ = next(batches)
+        if index % 4 != 2:
+            assert x.shape == (1, 8)
+            assert (x[0] == 0).sum() == 2 and not ((x[0] >= 20) & (x[0] < 40)).any()
+            assert (y[0] != -1).sum() == 7
+        else:
+            assert x.shape == (1, 16) and x[0, 1] >= 20
+
+
+def test_longer_episode_without_a_waiting_long_conversation_uses_short_ones():
+    dataset = [conversation(5), conversation(4, start=40)]
+    batches = mixed_loader(dataset, "4x1:1,2x1:1")
+    x, _, _ = next(batches)
+    assert x.shape == (1, 8)
+    x, y, _ = next(batches)
+    assert x.shape == (1, 16)
+    assert x[0].tolist() == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 40, 41, 42, 0, 0]
+    assert (y[0] != -1).sum() == 11
+
+
+def test_conversation_beyond_the_longest_episode_is_truncated_or_skipped():
+    late_reply = (list(range(100, 130)), [0] * 20 + [1] * 10)
+    early_reply = conversation(30, start=50)
+    x, y, state = next(mixed_loader([late_reply, early_reply], "4x1:1", buffer_size=1))
+    assert x[0].tolist() == early_reply[0][:16]
+    assert y[0].tolist() == early_reply[0][1:17]
+    assert state.consumed == 2
+
+
+def test_mix_without_any_fitting_conversation_raises_instead_of_looping():
+    with pytest.raises(ValueError, match="no conversation that fits a 2-cycle episode"):
+        next(mixed_loader([conversation(12)], "2x1:1,4x1:1"))

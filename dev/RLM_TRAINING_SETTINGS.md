@@ -4,10 +4,15 @@ RLM splits each training episode into consecutive text chunks and passes learned
 Choose the architecture in a [JSONC model profile](../model_profiles/README.md), then choose how many episodes contribute to each optimizer update with the training settings below.
 Run commands from the repository root after preparing the tokenizer and dataset using the [Spark workflow](spark-training/SPARK_RLM.md) or the [H100 launcher](h100-training/H100_RLM.md).
 
-The direct trainer requires both `--model-profile PATH` and `--total-batch-token-size T` for every mode, including probes and resume.
+The direct pretraining trainer requires both `--model-profile PATH` and `--total-batch-token-size T` for every mode, including probes and resume.
 The H100 launcher requires both for a fresh run; on resume the profile remains required, while omitting the token budget restores the saved recipe's budget.
 An explicit H100 resume budget must match the saved value.
-The RLM option `--total-batch-size` has been removed without an alias; base GPT and chat entry points keep their own existing options.
+The pretraining option `--total-batch-size` has been removed without an alias; base GPT and chat entry points keep their own existing options.
+
+The settings below describe pretraining with `scripts.rlm_train` and the H100 launcher.
+The separate [`scripts.rlm_sft`](../scripts/rlm_sft.py) entry point loads architecture from a pretraining checkpoint, runs in one process with fixed-length episodes, and uses optional `--total-batch-size` for text positions per optimizer update, inherited from pretraining when omitted.
+It does not take `--model-profile` or `--episode-mix`; run `uv run --no-sync python -m scripts.rlm_sft --help` for its options.
+The [mixed-episode SFT plan](RLM-architecture/RLM_LONG_DOCUMENTS.md#plan) records the remaining loader integration.
 
 ## Episodes, microbatches, and optimizer updates
 

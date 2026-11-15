@@ -34,6 +34,7 @@ RLM reuses a GPT backbone across bounded text chunks and passes learned memory b
 - `nanochat/optim.py` implements optimizers; `training_runtime.py` provides shared training resource checks; `paths.py` resolves run, dataset, and cache locations.
 - `nanochat/rlm_distributed.py` coordinates workers; `optim_checkpoint.py` partitions portable optimizer state; `rlm_distributed_checkpoint.py` gathers worker snapshots for coordinator publication.
 - `nanochat/rlm_training.py` implements recurrent training; the other `rlm_*.py` modules separate data handling, initialization, freezing policy, capacity probes, inference, and checkpoints.
+- `nanochat/rlm_sft.py` implements assistant-only recurrent SFT loss, updates, and evaluation; `scripts/rlm_sft.py` fine-tunes a pretraining checkpoint in one process with fixed-length episodes and the original SFT packer.
 - `scripts/base_train.py`, `chat_sft.py`, and `chat_rl.py` drive the base-model and chat training stages.
 - `scripts/rlm_train.py`, `rlm_eval.py`, and `rlm_sample.py` expose recurrent training, evaluation, and generation; the trainer requires `--model-profile PATH` and `--total-batch-token-size` for every mode, including resume.
 - `scripts/h100_rlm.py` orchestrates the H100 workflow with required `--num-gpus {1,2,4}` and `--model-profile PATH`, including portable resume across those GPU counts; fresh runs require `--total-batch-token-size`, and resume restores the saved budget or accepts an explicit matching value.

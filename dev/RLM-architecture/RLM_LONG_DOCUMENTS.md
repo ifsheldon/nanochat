@@ -3,7 +3,8 @@
 Recorded on November 14, 2026.
 This document records how the pretraining and SFT data loaders treat documents and conversations longer than one episode, the measurements behind that, and the decisions for the next runs.
 The pretraining decision is implemented.
-For SFT the data loader is implemented and measured; the RLM SFT trainer that would call it is not in this repository yet.
+For SFT the mixed-episode data loader is implemented and measured.
+The fixed-length RLM SFT trainer was imported on November 16, 2026; connecting it to the mixed-episode loader remains unfinished.
 The findings do not change the model already trained, [`rlm-exps/nanochat-rlm`](https://huggingface.co/rlm-exps/nanochat-rlm); they matter for the next pretraining and SFT runs.
 
 Terms follow the [RLM terminology](RLM_DESIGN.md#terminology): an episode is one loader row, a chunk is a fixed `text_length`-token slice of it, and a cycle processes one chunk.
@@ -188,7 +189,8 @@ With each conversation assigned to the shortest length it fits:
 ### Implementation: the mixed-episode loader
 
 `sft_mixed_episode_loader` in [`nanochat/sft_dataloader.py`](../../nanochat/sft_dataloader.py) implements the decision.
-Its `episode_mix` parameter is required and has no default.
+The imported [`scripts/rlm_sft.py`](../../scripts/rlm_sft.py) still uses the original `sft_data_loader_bos_bestfit` with one fixed cycle count for every microbatch.
+The mixed loader's `episode_mix` parameter is required and has no default.
 `parse_episode_mix` reads it from text as comma-separated `CYCLESxBATCH:MICROBATCHES` entries: cycles per episode, episodes per microbatch, and microbatches of that shape in one optimizer update.
 
 ```text
@@ -267,7 +269,7 @@ Done:
 
 Remaining:
 
-- Call the loader from the RLM SFT trainer, with a required `--episode-mix` option parsed by `parse_episode_mix`, and let each microbatch run the cycle count given by its width.
+- Connect the loader to `scripts/rlm_sft.py` and the update loop in `nanochat/rlm_sft.py`, with a required `--episode-mix` option parsed by `parse_episode_mix`, and let each microbatch run the cycle count given by its width.
 - Raise the compiler's recompile limit in that trainer so that all three shapes stay compiled.
 - Hold out some long conversations and score them with intact and shuffled memory, to tell whether long-range retention was learned.
 
@@ -277,7 +279,7 @@ Remaining:
 - **Capacity and speed on H100s.** On the Spark the 12- and 24-cycle microbatches need less memory than the four-cycle one, without optimizer state resident. Neither memory nor the speed ratio has been measured on the H100s.
 - **The 22 conversations beyond 24 cycles.** Cropping them leaves no answer, so they would stay skipped unless a longer episode length is added.
 - **Training signal.** Pretraining never ran more than four cycles, and about 4,000 conversations would teach longer retention; whether one SFT epoch is enough is unknown.
-- **Code location.** The RLM SFT trainer used for the H100 run is not in this repository yet, so the required `--episode-mix` option exists only as the loader's required parameter and its parser.
+- **Trainer integration.** The imported RLM SFT trainer uses fixed-length episodes and the original packer, so `episode_mix` remains a required loader parameter and parser input without a trainer CLI option.
 - **Unused long conversations.** With two 24-cycle episodes per update, 13% of the conversations of 13 to 24 cycles are not reached in one epoch; a different mix changes this.
 
 ## How the numbers were measured

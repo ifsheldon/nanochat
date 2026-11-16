@@ -5,6 +5,7 @@ This document records how the pretraining and SFT data loaders treat documents a
 The pretraining decision is implemented.
 For SFT the mixed-episode data loader is implemented and measured.
 The fixed-length RLM SFT trainer was imported on November 16, 2026; connecting it to the mixed-episode loader remains unfinished.
+The [SFT loss-weighting design discussion](RLM_SFT_LOSS_WEIGHTING.md) records the November 16 follow-up on answer lengths, packed supervision, and the weighting of delayed answers.
 The findings do not change the model already trained, [`rlm-exps/nanochat-rlm`](https://huggingface.co/rlm-exps/nanochat-rlm); they matter for the next pretraining and SFT runs.
 
 Terms follow the [RLM terminology](RLM_DESIGN.md#terminology): an episode is one loader row, a chunk is a fixed `text_length`-token slice of it, and a cycle processes one chunk.
@@ -123,17 +124,21 @@ After the buffer fills, about 40% of all supervised tokens follow a handoff insi
 None of the sampled MMLU or GSM8K conversations is.
 They fall into two groups:
 
-| Group | Conversations | Shape | Share of SFT tokens | Share of assistant tokens | What the packer does today |
+| Group | Conversations | Shape | Share of SFT tokens | Share of assistant tokens | What the original packer does |
 | --- | ---: | --- | ---: | ---: | --- |
 | Read, then answer | 3,562 | Two messages: one long user message, then an answer with a median of 185 tokens | 8.0% | 0.23% | Skipped: no assistant token falls inside the row |
-| Long multi-turn chat | 457 | Median 25 messages | 0.4% | 0.67% | Waits in the buffer and is eventually truncated to one row |
+| Long conversation with early supervision | 457 | 449 multi-turn chats and 8 single-answer conversations | 0.4% | 0.67% | Waits in the buffer and is eventually truncated to one row |
+
+The November 16 full scan separates the eight single-answer conversations whose answer already begins within four cycles from the 449 actual long multi-turn chats.
+The earlier analysis grouped all 457 as multi-turn chats.
 
 In the read-then-answer group the answer ends at a median of 10,806 tokens; the 5th and 95th percentiles are 8,184 and 18,398.
-These conversations require reading about ten chunks and then answering from memory alone, which is the situation the memory exists for.
+These conversations place their answers after about ten chunks of input, so access to earlier chunks passes through recurrent memory.
+Whether the answers actually depend on that earlier context was not measured by the length analysis.
 
 ### The buffer fills here too
 
-The long multi-turn chats can never be best-fit, so they accumulate in the 100-conversation buffer.
+The long conversations with early supervision can never be best-fit, so they accumulate in the 100-conversation buffer.
 The buffer is full of them at about episode 24,000, around update 95 of 504.
 From then on the packer effectively sees one fresh conversation at a time and pads whatever it cannot fill.
 
@@ -162,12 +167,12 @@ Each has exactly two messages, so this equals the whole conversation fitting.
 | 20 | 3,464 | 97.2% | 7.54% |
 | 24 | 3,540 | 99.4% | 7.87% |
 
-Doubling to eight cycles covers 5% of the group, because the answers cluster between about 8,000 and 13,000 tokens.
-All 457 long multi-turn chats fit whole within ten cycles.
+Doubling to eight cycles covers 5% of the group, because answer ending positions cluster between about 8,000 and 13,000 tokens into the conversation.
+All 457 long conversations with early supervision fit whole within ten cycles.
 
 ### Options considered
 
-- **Crop conversations to four cycles on arrival.** This clears the buffer and recovers the long multi-turn chats, keeping a median of 89% of their assistant tokens, but every read-then-answer conversation stays skipped.
+- **Crop conversations to four cycles on arrival.** This clears the buffer and recovers the long conversations with early supervision, keeping a median of 89% of their assistant tokens in the earlier sample, but every read-then-answer conversation stays skipped.
 - **Crop from the front, keeping the answer.** Rejected: the model would be trained to answer from text it never saw.
 - **Raise the cycle count for every episode.** A long episode packed from the whole mixture is mostly unrelated short conversations, so it pays for long backpropagation without training long retention.
 - **Use several episode lengths and send each conversation to the shortest one it fits.** Chosen.
@@ -182,7 +187,7 @@ With each conversation assigned to the shortest length it fits:
 | Episode length | Conversations | Share of SFT tokens | Share of assistant tokens |
 | --- | ---: | ---: | ---: |
 | 4 cycles | 785,740 | 91.6% | 99.1% |
-| 12 cycles | 2,852: 2,395 read-then-answer and 457 long multi-turn | 4.9% | 0.82% |
+| 12 cycles | 2,852: 2,395 read-then-answer, 449 multi-turn, and 8 single-answer with early supervision | 4.9% | 0.82% |
 | 24 cycles | 1,145 read-then-answer | 3.3% | 0.08% |
 | Longer than 24 cycles | 22 read-then-answer | 0.1% | under 0.01% |
 
@@ -206,18 +211,18 @@ The mixed loader's `episode_mix` parameter is required and has no default.
 - Conversations of the longer lengths wait in unbounded queues until an episode of that length takes them; only the shortest length uses the 100-conversation buffer.
 - One optimizer update is one pass over a fixed pattern in which every shape contributes its microbatches, evenly interleaved.
 
-The trainer reads the cycle count of a microbatch from its width, and `episode_mix_chunks(mix) * text_length * workers` must equal the text-token budget of an update.
+In the proposed mixed trainer, the cycle count follows from the width of each microbatch, and `episode_mix_chunks(mix) * text_length * workers` must equal the text-token budget of an update.
 With a single entry the loader gives fixed-length episodes whose over-long conversations are truncated or skipped on arrival, so its buffer does not fill.
 The original `sft_data_loader_bos_bestfit` is unchanged and reproduces the packing of the earlier run.
 
-One epoch of the real mixture with `4x8:29,12x2:2,24x1:2`, compared with the original packer at four cycles:
+The earlier packing replay compared one epoch of the real mixture with `4x8:29,12x2:2,24x1:2` against the original packer at four cycles:
 The original packer's replay reproduces the published SFT run exactly: 504 updates and 790,367 conversations consumed.
 
 | Measurement | Original packer | Mixed-episode loader |
 | --- | ---: | ---: |
 | Updates in one epoch | 504 | 498 |
 | Padding, share of all positions | 9.05% | 0.25% |
-| Supervised targets per update | 586,514 | 596,555 |
+| Supervised text targets per update, excluding EOM readouts | 586,514 | 596,555 |
 | Conversations of 5 to 12 cycles trained on whole, of 2,852 | 0 | 2,842 |
 | Conversations of 13 to 24 cycles trained on whole, of 1,145 | 0 | 996 |
 | Loader time per update on CPU | 406 ms | 488 ms |
@@ -230,6 +235,8 @@ The original packer's replay reproduces the published SFT run exactly: 504 updat
 
 The 24-cycle episodes also absorbed 826 of the 5-to-12-cycle conversations.
 149 conversations of 13 to 24 cycles were still waiting when the epoch ended, because two 24-cycle episodes per update is slightly fewer than they arrive.
+These are the earlier replay's coverage and queue figures.
+The November 16 [loss-weighting investigation](RLM_SFT_LOSS_WEIGHTING.md#data-and-procedure) separately counts unique examples with at least one trained target and distinguishes them from processed occurrences when the loader crosses the epoch boundary.
 
 ### Speed of the mixed episodes
 
@@ -249,7 +256,7 @@ For one optimizer update of 1,024 chunks:
 | Measurement | 32 microbatches of 8 × 4 | `4x8:29,12x2:2,24x1:2` | Change |
 | --- | ---: | ---: | ---: |
 | Forward and backward time, in 8 × 4 microbatches | 32.0 | 33.6 | +4.9% |
-| Supervised targets, against the original packer | 586,514 | 596,555 | +1.7% |
+| Supervised text targets, against the original packer | 586,514 | 596,555 | +1.7% |
 | Updates in one epoch, against the original packer | 504 | 498 | -1.2% |
 | Forward and backward time for one epoch | 504 × 32.0 | 498 × 33.6 | +3.7% |
 | Loader time on CPU | 0.41 s | 0.49 s | +0.08 s |
@@ -275,9 +282,9 @@ Remaining:
 
 ## Open questions
 
-- **Loss normalisation in SFT.** A long episode has about 185 supervised tokens, against roughly 20,000 in a four-cycle microbatch. If loss is averaged over all supervised tokens in an update, the long episodes contribute about 0.2% of the gradient.
+- **Loss normalisation in SFT.** The November 16 replay measures about 3,954 supervised predictions per two-episode 12-cycle microbatch and 3,256 per one-episode 24-cycle microbatch, including EOM readouts. The earlier figure of about 185 describes one delayed answer, not a packed episode, and target counts do not establish gradient shares. See the [design discussion and measured weighting tradeoff](RLM_SFT_LOSS_WEIGHTING.md).
 - **Capacity and speed on H100s.** On the Spark the 12- and 24-cycle microbatches need less memory than the four-cycle one, without optimizer state resident. Neither memory nor the speed ratio has been measured on the H100s.
-- **The 22 conversations beyond 24 cycles.** Cropping them leaves no answer, so they would stay skipped unless a longer episode length is added.
+- **The 22 conversations beyond 24 cycles.** The November 16 scan finds that cropping leaves no answer in 21 and retains 190 targets from a partial answer in one. None fits whole within the selected episode lengths.
 - **Training signal.** Pretraining never ran more than four cycles, and about 4,000 conversations would teach longer retention; whether one SFT epoch is enough is unknown.
 - **Trainer integration.** The imported RLM SFT trainer uses fixed-length episodes and the original packer, so `episode_mix` remains a required loader parameter and parser input without a trainer CLI option.
 - **Unused long conversations.** With two 24-cycle episodes per update, 13% of the conversations of 13 to 24 cycles are not reached in one epoch; a different mix changes this.

@@ -14,15 +14,14 @@ import logging
 import math
 import os
 from pathlib import Path
-import sys
-import time
 
 from nanochat.paths import configure_runtime_paths, get_run_dir
+from nanochat.sft_training import LossWeighting, SFTLossConfig
 
 logger = logging.getLogger(__name__)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-dir", type=Path, default=get_run_dir() / "train" / "checkpoints",
                         help="pretraining checkpoint directory (default: selected run's train/checkpoints)")
@@ -30,9 +29,12 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, default=get_run_dir() / "sft",
                         help="new SFT output directory (default: selected run's sft directory)")
     parser.add_argument("--device-type", choices=("cpu", "cuda"), default="cuda")
-    parser.add_argument("--cycles", type=int, default=4, help="text chunks per episode row")
-    parser.add_argument("--device-batch-size", type=int, default=8, help="episode rows per forward/backward")
-    parser.add_argument("--total-batch-size", type=int, default=None, help="text positions per optimizer update (default: inherit from pretraining)")
+    parser.add_argument("--episode-mix", required=True, help="CYCLESxBATCH:MICROBATCHES entries for one optimizer update")
+    parser.add_argument("--loss-weighting", choices=tuple(mode.value for mode in LossWeighting), required=True,
+                        help="average microbatch losses or weight each cycle group's supervised-target mean")
+    parser.add_argument("--group-loss-weights", help="CYCLES:WEIGHT entries, required only for group-token; weights must sum to one")
+    parser.add_argument("--total-batch-size", type=int, default=None,
+                        help="text positions per optimizer update, equal to one episode-mix pattern (default: inherit from pretraining)")
     parser.add_argument("--num-iterations", type=int, default=-1, help="optimizer updates (-1 = one epoch of the mixture)")
     parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer moments from the pretraining checkpoint (0=no, 1=yes)")
     parser.add_argument("--embedding-lr", type=float, default=None, help="default: inherit from pretraining")
@@ -50,9 +52,16 @@ def parse_args():
     parser.add_argument("--gsm8k-epochs", type=int, default=4)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-    if args.cycles < 1 or args.device_batch_size < 1:
-        parser.error("cycles and device batch size must be positive")
+    args = parser.parse_args(argv)
+    from nanochat.sft_dataloader import parse_episode_mix
+    try:
+        args.episode_mix = parse_episode_mix(args.episode_mix)
+        args.loss_config = SFTLossConfig.parse(
+            args.loss_weighting, args.group_loss_weights, tuple(shape.cycles for shape in args.episode_mix),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    del args.loss_weighting, args.group_loss_weights
     if args.num_iterations != -1 and args.num_iterations <= 0:
         parser.error("--num-iterations must be positive or -1 for one epoch")
     if args.eval_every == 0 or args.save_every == 0 or args.eval_batches <= 0:
@@ -76,7 +85,7 @@ def run(args):
     from nanochat.rlm_inference import load_rlm_checkpoint, tokenizer_fingerprint
     from nanochat.rlm_sft import evaluate_sft_loss, sft_update
     from nanochat.rlm_training import cuda_metrics, synchronize, write_json
-    from nanochat.sft_dataloader import sft_data_loader_bos_bestfit
+    from nanochat.sft_dataloader import episode_mix_chunks, sft_mixed_episode_loader
     from nanochat.sft_training import SFTProgress, sft_lr_multiplier
     from nanochat.training_runtime import check_training_memory
     from tasks.common import TaskMixture
@@ -102,11 +111,10 @@ def run(args):
             setattr(args, name, pretrain_config[name])
             logger.info("Inherited %s=%s from pretraining", name, pretrain_config[name])
     text_length = model.config.text_length
-    episode_length = args.cycles * text_length
-    microbatch = args.device_batch_size * episode_length
-    if args.total_batch_size % microbatch:
-        raise ValueError(f"total batch {args.total_batch_size} must be divisible by {microbatch} text positions per microbatch")
-    accumulation = args.total_batch_size // microbatch
+    pattern_positions = episode_mix_chunks(args.episode_mix) * text_length
+    if args.total_batch_size != pattern_positions:
+        raise ValueError(f"total batch {args.total_batch_size} must equal {pattern_positions} text positions in one episode-mix pattern")
+    accumulation = sum(shape.microbatches for shape in args.episode_mix)
 
     # Match pretraining's batch-scaled learning rates; pretraining decays weight decay to zero.
     batch_scale = math.sqrt(args.total_batch_size / 524_288)
@@ -129,7 +137,14 @@ def run(args):
         group["initial_lr"] = group["lr"]
         if group["kind"] == "muon":
             group["weight_decay"] = 0.0
-    forward_cycle = torch.compile(model.forward_cycle, dynamic=False) if args.compile else model.forward_cycle
+    if args.compile:
+        # Initial, first recurrent, later recurrent, and final cycles can have
+        # different guards: the first handoff's memory view has a different
+        # backing stride. Budget for every shape in training and validation.
+        torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 8 * len(args.episode_mix))
+        forward_cycle = torch.compile(model.forward_cycle, dynamic=False)
+    else:
+        forward_cycle = model.forward_cycle
 
     train_dataset = TaskMixture([
         SmolTalk(split="train"),
@@ -143,18 +158,29 @@ def run(args):
     ])
     logger.info("Training mixture: %d conversations (MMLU x%d, GSM8K x%d)", len(train_dataset), args.mmlu_epochs, args.gsm8k_epochs)
 
-    def data_loader(dataset):
-        return sft_data_loader_bos_bestfit(dataset, tokenizer, args.device_batch_size, episode_length, device)
+    def data_loader(dataset, loader_device):
+        return sft_mixed_episode_loader(dataset, tokenizer, text_length, args.episode_mix, loader_device)
 
-    train_loader = data_loader(train_dataset)
+    train_loader = data_loader(train_dataset, torch.device("cpu"))
     progress = SFTProgress(len(train_dataset), args.num_iterations)
     sft_lr_multiplier(0.0, args.warmup_ratio, args.warmdown_ratio, args.final_lr_frac)
 
     output_checkpoints = args.output_dir / "checkpoints"
     metrics_path = args.output_dir / "updates.jsonl"
+    sft_config = {
+        name: str(value) if isinstance(value, Path) else value
+        for name, value in vars(args).items() if name not in ("episode_mix", "loss_config")
+    }
+    sft_config.update({
+        "episode_mix": [asdict(shape) for shape in args.episode_mix],
+        "loss_weighting": args.loss_config.mode.value,
+        "group_loss_weights": None if args.loss_config.group_weights is None else {
+            str(cycles): weight for cycles, weight in args.loss_config.group_weights.items()
+        },
+    })
     contract = {
         "source_checkpoint": {"dir": str(checkpoint_dir), "step": step_loaded, "optimizer": optimizer_source},
-        "model_config": asdict(model.config), "sft_config": {name: str(value) if isinstance(value, Path) else value for name, value in vars(args).items()},
+        "model_config": asdict(model.config), "sft_config": sft_config,
         "accumulation_steps": accumulation, "training_conversations": len(train_dataset),
         "supervision": "assistant_text_targets_and_eom_readouts_of_assistant_tokens",
         "tokenizer_sha256": tokenizer_fingerprint(), "compute_dtype": str(COMPUTE_DTYPE),
@@ -164,13 +190,18 @@ def run(args):
     logger.info("%s", json.dumps(contract))
 
     def metadata(step, val_loss):
+        memory_contract = dict(pretrain_metadata.get("memory_contract", {}))
+        memory_contract.pop("gradient_horizon", None)
+        memory_contract.update({
+            "loss": "assistant_text_and_assistant_eom_targets",
+            "gradient_horizons": [shape.cycles for shape in args.episode_mix],
+        })
         return {
             "model_type": "rlm", "model_config": asdict(model.config), "step": step,
             "stage": "sft", "val_loss": val_loss,
             "consumed_conversations": progress.consumed, "epoch": progress.epoch,
             "tokenizer_sha256": contract["tokenizer_sha256"], "run_contract": contract,
-            "memory_contract": {**pretrain_metadata.get("memory_contract", {}),
-                                "loss": "assistant_text_and_assistant_eom_targets", "gradient_horizon": args.cycles},
+            "memory_contract": memory_contract,
         }
 
     val_loss = None
@@ -180,7 +211,7 @@ def run(args):
         check_training_memory(device, step)
         last_step = progress.done
         if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
-            val_loss = evaluate_sft_loss(forward_cycle, data_loader(val_dataset), args.eval_batches, text_length, args.cycles)
+            val_loss = evaluate_sft_loss(forward_cycle, data_loader(val_dataset, device), args.eval_batches, text_length)
             logger.info("%s", json.dumps({"step": step, "val_loss": val_loss}))
         if last_step or (args.save_every > 0 and step > 0 and step % args.save_every == 0):
             synchronize(device)
@@ -197,8 +228,8 @@ def run(args):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         metrics, data_state = sft_update(
-            model, forward_cycle, optimizer, train_loader, accumulation, step,
-            device_batch_size=args.device_batch_size, cycles=args.cycles,
+            model, forward_cycle, optimizer, train_loader, step,
+            episode_mix=args.episode_mix, loss_config=args.loss_config,
         )
         progress.complete_update(data_state)
         step = progress.step

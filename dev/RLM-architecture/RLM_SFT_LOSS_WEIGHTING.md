@@ -1,7 +1,8 @@
 # RLM SFT loss weighting: design discussion
 
 Recorded on November 16, 2026.
-The investigation compares equal microbatch means with a proposed objective that weights episode-length groups explicitly.
+Status: both loss-weighting methods and mixed-episode training are implemented, with a completed data investigation.
+The trainer requires an explicit choice through `--loss-weighting {microbatch,group-token}` and a required `--episode-mix`.
 No model-quality winner has been selected; equal-microbatch averaging remains the recommended first comparison baseline.
 
 ## Question and current position
@@ -57,7 +58,7 @@ The mixed-schedule coefficients below were calculated from a packing replay usin
 
 ## Microbatch method: average microbatch means
 
-The fixed-length recurrent SFT trainer averages the mean loss from each microbatch. See [`sft_update`](../../nanochat/rlm_sft.py).
+With `--loss-weighting microbatch`, the recurrent SFT update in [`nanochat/rlm_sft.py`](../../nanochat/rlm_sft.py) backpropagates:
 
 $$
 L_{\mathrm{micro}} = \frac{1}{A}\sum_{j=1}^{A}\frac{S_j}{N_j}.
@@ -68,27 +69,28 @@ Within microbatch $j$, each supervised prediction has coefficient $1/(A N_j)$.
 Consequently, a target in a sparsely supervised microbatch receives more weight than a target in a densely supervised microbatch.
 This is equal weighting of microbatch means, not equal weighting of conversations, episodes, or answers.
 
-The imported trainer logs a different aggregate across the update.
+Before mixed-episode integration, the imported trainer's logged training loss used a different aggregation:
 
 $$
 L_{\mathrm{logged}} = \frac{\sum_j S_j}{\sum_j N_j}.
 $$
 
-Its `loss` field reports the global target-weighted mean.
+That historical `loss` field reported the global target-weighted mean across the update.
 The two aggregations agree when all microbatches have the same supervised-target count; they can also coincide accidentally for particular losses.
 Their objectives are not generally equivalent when counts differ.
-Recurrent validation also divides total supervised loss by total supervised-target count.
+The implemented trainer now logs the actual optimized objective as `loss` and the global target-weighted mean separately as `token_loss`.
+Recurrent validation continues to use total supervised loss divided by total supervised-target count under either training objective.
 
 ### Why the original code uses this pattern
 
 The original NanoChat loop in [`scripts/chat_sft.py`](../../scripts/chat_sft.py) computes a mean loss for each microbatch, divides it by the accumulation count, and immediately backpropagates.
-The recurrent trainer follows that pattern while adding recurrent memory and eligible EOM supervision.
+The recurrent trainer's `microbatch` mode follows that pattern while adding recurrent memory and eligible EOM supervision.
 The base model's mean reduction is defined in [`nanochat/gpt.py`](../../nanochat/gpt.py).
 
 Simplicity and reuse are plausible reasons for the choice, but the code does not establish the author's intent.
 Equal-microbatch averaging is equivalent to a global token mean when every microbatch contains the same number of supervised targets, as in a fully supervised fixed-size batch with no ignored targets.
 Assistant-only SFT breaks that assumption: equal input lengths can have different amounts of user text, assistant text, tool output, and padding.
-The original chat trainer logs a smoothed last-microbatch loss, whereas the imported recurrent trainer reports the target-weighted update aggregate above.
+The original chat trainer also logs a smoothed last-microbatch loss, whereas the imported recurrent trainer historically reported the target-weighted update aggregate above.
 
 ## Group-token method: explicit group weights and token normalization
 
@@ -98,7 +100,7 @@ $$
 L_c = \frac{\sum_{j\in G_c} S_j}{\sum_{j\in G_c} N_j}.
 $$
 
-The proposed objective combines these group losses with weights $\alpha_c$.
+With `--loss-weighting group-token`, the objective is:
 
 $$
 L_{\mathrm{group}} = \sum_c \alpha_c L_c,
@@ -117,13 +119,15 @@ $$
 These example weights are a proposal, not an empirically determined optimum or a trainer default.
 They approximate the 29/33, 2/33, and 2/33 coefficients of the example mix.
 An exact comparison can keep those fractions and change only the normalization within each group.
+The CLI requires explicit `--group-loss-weights`, for example `4:0.88,12:0.06,24:0.06`.
 
 The main rationale is to separate desired training emphasis from the microbatch sizes used to fit GPU memory.
 For the same examples, same episode assignments, and fixed group weights, repartitioning a group into different microbatches preserves the mathematical objective.
 This does not imply that changing the packing, examples, episode lengths, or update boundaries leaves the objective unchanged.
 
-Computing group totals from the supervision masks and EOM eligibility before backpropagation would allow the trainer to process one microbatch at a time.
-Given $N_c=\sum_{j\in G_c}N_j$, each microbatch contributes $\alpha_c S_j/N_c$ to the objective.
+The implementation stages a complete mix as CPU input and target tensors and counts each group's targets before scaling its backward passes.
+It transfers and backpropagates one microbatch at a time, retaining only that microbatch's recurrent graph on the GPU.
+With $N_c=\sum_{j\in G_c}N_j$ counted from the masks and EOM eligibility, each microbatch backpropagates $\alpha_c S_j/N_c$ immediately.
 
 ### Why this differs from the microbatch method
 
@@ -166,7 +170,8 @@ Under the microbatch method, the additional short microbatches increase that gro
 | Main advantage | Simple and gives sparse microbatches extra emphasis | Deliberate group allocation independent of microbatch sizes | Simple per-target objective with no group weights |
 | Main concern here | Emphasis depends on batching and packing | Fillers and multi-turn chats share the long-group allocation | Sparse delayed answers have little influence relative to the large short-conversation target pool |
 
-The global alternative is $L_{\mathrm{global}}=\sum_j S_j/\sum_j N_j$, the same form as the recurrent trainer's logged training loss and validation metric.
+The global alternative is $L_{\mathrm{global}}=\sum_j S_j/\sum_j N_j$, the same form as the recurrent trainer's `token_loss` and validation metric.
+It was considered as a baseline but is not a separate training selector.
 Equal weighting per conversation, per answer, or specifically for delayed answers would define other objectives; those were not specified or evaluated in this discussion.
 
 ## Investigation on the actual SFT mixture
@@ -323,7 +328,32 @@ Evaluation should cover ordinary short conversations and held-out long answers, 
 Long examples intended for evaluation must be held out before training.
 The data investigation itself did not establish that every delayed answer depends on distant context.
 
-For a training comparison, record the optimized objective, the group mean losses and target counts, and the globally target-weighted validation loss.
+For either chosen objective, the implemented logs report the actual optimized scalar, the group mean losses and target counts, and a separate globally target-weighted validation metric for comparison.
+These metrics support the comparison; implementing both objectives does not resolve the quality questions above.
+
+## Implemented integration
+
+[`scripts/rlm_sft.py`](../../scripts/rlm_sft.py) uses the mixed-episode loader in one process, with required `--episode-mix` and `--loss-weighting {microbatch,group-token}` options.
+There is no default objective.
+`--group-loss-weights` is required for `group-token` and rejected for `microbatch`.
+Its cycle keys must be unique positive integers and match every cycle count in the mix exactly; weights must be finite, nonnegative, and sum to one.
+The old `--cycles` and `--device-batch-size` options are removed; a one-entry mix such as `4x8:32` gives fixed-length episodes.
+
+Each update consumes one complete pattern, validates its shape multiplicities, and derives cycle counts from batch widths.
+The example mixed pattern accumulates 33 microbatches, whereas `4x8:32` accumulates 32 for the same text-position budget.
+Optional `--total-batch-size` inherits from pretraining when omitted and must equal `sum(cycles * batch_size * microbatches) * text_length`.
+Training stages the full pattern's input and target tensors on CPU, counts assistant text and eligible EOM supervision, and backpropagates one GPU microbatch at a time.
+
+The `loss` metric is the optimized objective; `token_loss` is the global supervised-target mean.
+Cycle-keyed `episode_groups` records each group's token-mean `loss`, `supervised_targets`, and per-cycle `cycle_losses`.
+Validation derives cycle counts per microbatch and remains a global supervised-target mean under both objectives.
+`--eval-batches` counts microbatches; use 33 or a multiple for whole patterns of the example mix.
+When compilation is enabled, the trainer raises the recompile limit to at least eight times the number of shapes, preserving any larger existing setting, to cover initial, first recurrent, later recurrent, and final cycles in training and validation.
+The first memory handoff can have a different tensor stride from later handoffs, requiring a separate compiled variant.
+
+`run.json` and checkpoint metadata serialize the episode mix, selected objective, and explicit group weights.
+Checkpoint `memory_contract.gradient_horizons` lists all selected cycle counts in place of the old scalar horizon.
+See [recurrent SFT settings](../RLM_TRAINING_SETTINGS.md#recurrent-sft) for command examples and [the long-conversation plan](RLM_LONG_DOCUMENTS.md#plan) for the remaining long-answer evaluation work.
 
 ## Evidence and local artifacts
 

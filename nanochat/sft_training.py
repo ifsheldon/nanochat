@@ -1,6 +1,66 @@
-"""SFT progress counts completed updates and actually processed conversations."""
+"""SFT loss configuration, update progress, and learning-rate schedules."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
+import math
+from types import MappingProxyType
+
+
+class LossWeighting(str, Enum):
+    MICROBATCH = "microbatch"
+    GROUP_TOKEN = "group-token"
+
+
+@dataclass(frozen=True)
+class SFTLossConfig:
+    """An explicit reduction, with fixed cycle weights for group normalization."""
+
+    mode: LossWeighting
+    group_weights: Mapping[int, float] | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.mode, LossWeighting):
+            raise TypeError("SFT loss mode must be a LossWeighting value")
+        if self.mode is LossWeighting.MICROBATCH:
+            if self.group_weights is not None:
+                raise ValueError("--group-loss-weights is only valid with --loss-weighting group-token")
+            return
+        if not self.group_weights:
+            raise ValueError("--group-loss-weights is required with --loss-weighting group-token")
+        weights = dict(self.group_weights)
+        if any(type(cycles) is not int or cycles <= 0 for cycles in weights):
+            raise ValueError("Group loss weights must use positive cycle counts")
+        if any(not math.isfinite(weight) or weight < 0 for weight in weights.values()):
+            raise ValueError("Group loss weights must be finite and nonnegative")
+        if not math.isclose(sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1e-8):
+            raise ValueError("Group loss weights must sum to one")
+        object.__setattr__(self, "group_weights", MappingProxyType(weights))
+
+    @classmethod
+    def parse(cls, mode: str, weights: str | None, cycles: tuple[int, ...]):
+        mode = LossWeighting(mode)
+        parsed = None
+        if weights is not None:
+            if mode is LossWeighting.MICROBATCH:
+                raise ValueError("--group-loss-weights is only valid with --loss-weighting group-token")
+            parsed = {}
+            for entry in weights.split(","):
+                try:
+                    cycle_text, weight_text = entry.split(":")
+                    cycle, weight = int(cycle_text), float(weight_text)
+                except ValueError as exc:
+                    raise ValueError("Group loss weights must look like CYCLES:WEIGHT,...") from exc
+                if cycle in parsed:
+                    raise ValueError(f"Duplicate cycle count in group loss weights: {cycle}")
+                parsed[cycle] = weight
+        config = cls(mode, parsed)
+        config.validate_cycles(cycles)
+        return config
+
+    def validate_cycles(self, cycles):
+        if self.group_weights is not None and set(self.group_weights) != set(cycles):
+            raise ValueError("Group loss weights must match every cycle count in --episode-mix exactly")
 
 
 @dataclass

@@ -3,9 +3,9 @@
 Recorded on November 14, 2026.
 This document records how the pretraining and SFT data loaders treat documents and conversations longer than one episode, the measurements behind that, and the decisions for the next runs.
 The pretraining decision is implemented.
-For SFT the mixed-episode data loader is implemented and measured.
-The fixed-length RLM SFT trainer was imported on November 16, 2026; connecting it to the mixed-episode loader remains unfinished.
-The [SFT loss-weighting design discussion](RLM_SFT_LOSS_WEIGHTING.md) records the November 16 follow-up on answer lengths, packed supervision, and the weighting of delayed answers.
+For SFT the mixed-episode data loader is implemented, measured, and integrated into the recurrent trainer.
+The trainer requires `--episode-mix` and an explicit `--loss-weighting` choice between `microbatch` and `group-token`.
+The [SFT loss-weighting design discussion](RLM_SFT_LOSS_WEIGHTING.md) records the November 16 follow-up on answer lengths, packed supervision, and the two implemented objectives; their model-quality comparison remains unresolved.
 The findings do not change the model already trained, [`rlm-exps/nanochat-rlm`](https://huggingface.co/rlm-exps/nanochat-rlm); they matter for the next pretraining and SFT runs.
 
 Terms follow the [RLM terminology](RLM_DESIGN.md#terminology): an episode is one loader row, a chunk is a fixed `text_length`-token slice of it, and a cycle processes one chunk.
@@ -87,6 +87,7 @@ The real loader on the training shards gives 6.8% single-document episodes over 
 ### How the packer works
 
 The original SFT packer in [`nanochat/sft_dataloader.py`](../../nanochat/sft_dataloader.py) keeps a buffer of 100 rendered conversations.
+The measurements below describe that original packer and the earlier H100 run; the current recurrent trainer uses the mixed-episode loader described later.
 
 - It fills each row with the largest whole conversation that fits, repeating until none fits, then pads the rest of the row.
 - It never splits a conversation across rows.
@@ -194,8 +195,8 @@ With each conversation assigned to the shortest length it fits:
 ### Implementation: the mixed-episode loader
 
 `sft_mixed_episode_loader` in [`nanochat/sft_dataloader.py`](../../nanochat/sft_dataloader.py) implements the decision.
-The imported [`scripts/rlm_sft.py`](../../scripts/rlm_sft.py) still uses the original `sft_data_loader_bos_bestfit` with one fixed cycle count for every microbatch.
-The mixed loader's `episode_mix` parameter is required and has no default.
+[`scripts/rlm_sft.py`](../../scripts/rlm_sft.py) uses this loader for both training and validation in one process.
+The mixed loader's `episode_mix` parameter and the trainer's `--episode-mix` option are required and have no default.
 `parse_episode_mix` reads it from text as comma-separated `CYCLESxBATCH:MICROBATCHES` entries: cycles per episode, episodes per microbatch, and microbatches of that shape in one optimizer update.
 
 ```text
@@ -211,9 +212,13 @@ The mixed loader's `episode_mix` parameter is required and has no default.
 - Conversations of the longer lengths wait in unbounded queues until an episode of that length takes them; only the shortest length uses the 100-conversation buffer.
 - One optimizer update is one pass over a fixed pattern in which every shape contributes its microbatches, evenly interleaved.
 
-In the proposed mixed trainer, the cycle count follows from the width of each microbatch, and `episode_mix_chunks(mix) * text_length * workers` must equal the text-token budget of an update.
+The trainer reads the cycle count of a microbatch from its width, and `episode_mix_chunks(mix) * text_length` must equal its inherited or explicit `--total-batch-size` text-position budget.
+The old `--cycles` and `--device-batch-size` options are replaced by the mix; `--episode-mix 4x8:32` selects fixed-length episodes.
 With a single entry the loader gives fixed-length episodes whose over-long conversations are truncated or skipped on arrival, so its buffer does not fill.
 The original `sft_data_loader_bos_bestfit` is unchanged and reproduces the packing of the earlier run.
+The trainer also requires `--loss-weighting {microbatch,group-token}`, with explicit `--group-loss-weights` required only for `group-token`.
+It stages a complete mix on CPU, counts assistant text and eligible EOM targets, then transfers and backpropagates one microbatch at a time.
+See [recurrent SFT settings](../RLM_TRAINING_SETTINGS.md#recurrent-sft) for the selectors, exact budget, evaluation counts, metrics, and examples.
 
 The earlier packing replay compared one epoch of the real mixture with `4x8:29,12x2:2,24x1:2` against the original packer at four cycles:
 The original packer's replay reproduces the published SFT run exactly: 504 updates and 790,367 conversations consumed.
@@ -263,8 +268,10 @@ For one optimizer update of 1,024 chunks:
 
 The mixed episodes therefore slow an update by about 5% and an epoch by about 4%, and the extra loader time is negligible against an update of more than 90 seconds.
 The 24-cycle microbatch accounts for most of the cost.
-The three shapes need nine compiled graphs, more than PyTorch's default recompile limit of eight.
-With the default limit the 24-cycle shape silently ran uncompiled and took 9.70 seconds instead of 8.51, so the trainer must raise `torch._dynamo.config.recompile_limit`.
+In this measurement the three training shapes needed nine compiled graphs, more than PyTorch's default recompile limit of eight.
+With the default limit the 24-cycle shape silently ran uncompiled and took 9.70 seconds instead of 8.51.
+The trainer now raises `torch._dynamo.config.recompile_limit` to at least `8 * number_of_shapes`, preserving larger existing values, to cover initial, first recurrent, later recurrent, and final cycles in both training and validation.
+The first memory handoff can have a different tensor stride from later handoffs, requiring a separate compiled variant.
 These timings are from one GB10 GPU, one batch per shape, and five timed repetitions after warm-up, without the optimizer step; the ratio on H100s has not been measured.
 
 ## Plan
@@ -273,20 +280,20 @@ Done:
 
 - Pretraining: crop over-long documents on arrival in the best-fit packer, as the packer's default.
 - SFT loader: episode lengths chosen by the required `episode_mix`, each conversation assigned to the shortest length it fits, long episodes filled with shorter conversations, and lengths mixed inside every optimizer update.
+- SFT trainer: consume one complete mix per update through required `--episode-mix`, derive cycle counts from batch widths, and require the mix to match the text-position budget.
+- SFT objectives: require `--loss-weighting {microbatch,group-token}`, implement both reductions, and record the optimized loss, global token mean, and cycle-group metrics separately.
+- Compilation: raise the recompile limit for the mixed shapes in training and validation.
 
 Remaining:
 
-- Connect the loader to `scripts/rlm_sft.py` and the update loop in `nanochat/rlm_sft.py`, with a required `--episode-mix` option parsed by `parse_episode_mix`, and let each microbatch run the cycle count given by its width.
-- Raise the compiler's recompile limit in that trainer so that all three shapes stay compiled.
 - Hold out some long conversations and score them with intact and shuffled memory, to tell whether long-range retention was learned.
 
 ## Open questions
 
-- **Loss normalisation in SFT.** The November 16 replay measures about 3,954 supervised predictions per two-episode 12-cycle microbatch and 3,256 per one-episode 24-cycle microbatch, including EOM readouts. The earlier figure of about 185 describes one delayed answer, not a packed episode, and target counts do not establish gradient shares. See the [design discussion and measured weighting tradeoff](RLM_SFT_LOSS_WEIGHTING.md).
+- **Loss normalisation in SFT.** Both equal microbatch means and explicit group weights with token normalization are implemented, but neither has demonstrated better model quality; equal-microbatch averaging remains the recommended first comparison baseline. The November 16 replay measures about 3,954 supervised predictions per two-episode 12-cycle microbatch and 3,256 per one-episode 24-cycle microbatch, including EOM readouts. The earlier figure of about 185 describes one delayed answer, not a packed episode, and target counts do not establish gradient shares. See the [design discussion and measured weighting tradeoff](RLM_SFT_LOSS_WEIGHTING.md).
 - **Capacity and speed on H100s.** On the Spark the 12- and 24-cycle microbatches need less memory than the four-cycle one, without optimizer state resident. Neither memory nor the speed ratio has been measured on the H100s.
 - **The 22 conversations beyond 24 cycles.** The November 16 scan finds that cropping leaves no answer in 21 and retains 190 targets from a partial answer in one. None fits whole within the selected episode lengths.
 - **Training signal.** Pretraining never ran more than four cycles, and about 4,000 conversations would teach longer retention; whether one SFT epoch is enough is unknown.
-- **Trainer integration.** The imported RLM SFT trainer uses fixed-length episodes and the original packer, so `episode_mix` remains a required loader parameter and parser input without a trainer CLI option.
 - **Unused long conversations.** With two 24-cycle episodes per update, 13% of the conversations of 13 to 24 cycles are not reached in one epoch; a different mix changes this.
 
 ## How the numbers were measured

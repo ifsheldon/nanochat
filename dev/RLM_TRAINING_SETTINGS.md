@@ -9,10 +9,8 @@ The H100 launcher requires both for a fresh run; on resume the profile remains r
 An explicit H100 resume budget must match the saved value.
 The pretraining option `--total-batch-size` has been removed without an alias; base GPT and chat entry points keep their own existing options.
 
-The settings below describe pretraining with `scripts.rlm_train` and the H100 launcher.
-The separate [`scripts.rlm_sft`](../scripts/rlm_sft.py) entry point loads architecture from a pretraining checkpoint, runs in one process with fixed-length episodes, and uses optional `--total-batch-size` for text positions per optimizer update, inherited from pretraining when omitted.
-It does not take `--model-profile` or `--episode-mix`; run `uv run --no-sync python -m scripts.rlm_sft --help` for its options.
-The [mixed-episode SFT plan](RLM-architecture/RLM_LONG_DOCUMENTS.md#plan) records the remaining loader integration.
+The pretraining settings below describe `scripts.rlm_train` and the H100 launcher.
+The separate [recurrent SFT settings](#recurrent-sft) describe `scripts.rlm_sft`, which loads architecture from a pretraining checkpoint and requires an episode mix and loss-weighting choice.
 
 ## Episodes, microbatches, and optimizer updates
 
@@ -238,6 +236,70 @@ Changing GPU count recomputes accumulation while keeping that budget and the sel
 Current `selected-recipe.json` records use schema version 4 and store the text budget; per-launch `logs/TIMESTAMP/invocation.json` also records it with GPU count and accumulation.
 The direct trainer's serialized `training_config.total_batch_size` remains the internal field name for the value supplied by `--total-batch-token-size`; it counts text targets, never episodes.
 This field name in run records and checkpoints is not a CLI alias.
+
+## Recurrent SFT
+
+[`scripts.rlm_sft`](../scripts/rlm_sft.py) fine-tunes a pretraining checkpoint in one process using the [mixed-episode conversation loader](RLM-architecture/RLM_LONG_DOCUMENTS.md#implementation-the-mixed-episode-loader).
+It loads the architecture from the checkpoint, so it does not take `--model-profile`.
+`NANOCHAT_RUN_NAME` selects the tokenizer under `training_run/<name>/tokenizer`; it must match the source checkpoint.
+By default the source is that run's `train/checkpoints`, and the new output directory is its `sft` directory.
+Run `uv run --no-sync python -m scripts.rlm_sft --help` for all options.
+
+| Option | Default | Meaning and constraints |
+| --- | --- | --- |
+| `--episode-mix CYCLESxBATCH:MICROBATCHES,...` | Required | Shapes in one complete optimizer update; each entry specifies cycles per episode, episodes per microbatch, and microbatch count |
+| `--loss-weighting {microbatch,group-token}` | Required | Equal microbatch mean losses, or explicit weights applied to each cycle group's supervised-target mean |
+| `--group-loss-weights CYCLES:WEIGHT,...` | Required only for `group-token` | Unique positive cycle keys must exactly match the episode mix; weights must be finite, nonnegative, and sum to one; forbidden with `microbatch` |
+| `--total-batch-size T` | Inherit from pretraining | Text positions per optimizer update; must equal `sum(cycles * batch_size * microbatches) * text_length` for exactly one complete mix |
+| `--eval-batches N` | `16` | Microbatches per held-out evaluation, not optimizer updates; validation always reports a global supervised-target mean |
+| `--checkpoint-dir PATH` | `<run>/train/checkpoints` | Source pretraining checkpoint directory; `--step` selects a step, otherwise the latest complete checkpoint is loaded |
+| `--output-dir PATH` | `<run>/sft` | New SFT output directory; it must not already exist |
+
+The SFT options `--cycles` and `--device-batch-size` have been removed.
+For fixed-length episodes, pass a one-entry mix such as `--episode-mix 4x8:32`.
+The loader still crops or skips over-long conversations on arrival with this single entry; it does not reproduce the original packer's buffer behavior.
+
+With `text_length = 1023`, both `4x8:32` and `4x8:29,12x2:2,24x1:2` contain 1,024 chunks and require `--total-batch-size 1047552`.
+They accumulate 32 and 33 microbatches respectively.
+The budget counts input text positions, including ignored user and padding positions, rather than the number of supervised targets.
+Loss denominators count assistant text targets and eligible EOM readouts that predict assistant tokens.
+
+`microbatch` optimizes the average of the microbatch mean losses.
+`group-token` pools supervised losses and target counts within each cycle group, then sums those group means using the supplied weights.
+The [loss-weighting investigation](RLM-architecture/RLM_SFT_LOSS_WEIGHTING.md) recommends equal-microbatch averaging as the first comparison baseline; neither objective has demonstrated better model quality.
+The example group weights below are an explicit experimental choice, not a default or validated optimum.
+
+These examples assume a source checkpoint with `text_length = 1023`; replace `<name>` with its run name and choose fresh output directories:
+
+```bash
+NANOCHAT_RUN_NAME='<name>' uv run --no-sync python -m scripts.rlm_sft \
+    --checkpoint-dir 'training_run/<name>/train/checkpoints' \
+    --output-dir 'training_run/<name>/sft-microbatch' \
+    --episode-mix 4x8:29,12x2:2,24x1:2 \
+    --loss-weighting microbatch \
+    --total-batch-size 1047552 --eval-batches 33
+
+NANOCHAT_RUN_NAME='<name>' uv run --no-sync python -m scripts.rlm_sft \
+    --checkpoint-dir 'training_run/<name>/train/checkpoints' \
+    --output-dir 'training_run/<name>/sft-group-token' \
+    --episode-mix 4x8:29,12x2:2,24x1:2 \
+    --loss-weighting group-token --group-loss-weights 4:0.88,12:0.06,24:0.06 \
+    --total-batch-size 1047552 --eval-batches 33
+```
+
+Use `--eval-batches 33` or a multiple of 33 to evaluate whole patterns of this example mix.
+Other positive counts are allowed but evaluate only that many microbatches, which may be a partial pattern.
+Validation uses the same episode mix and always divides total supervised loss by total supervised-target count, independently of the selected training objective.
+
+Training stages one complete mix as CPU input and target tensors and counts supervision before running the model.
+It transfers and backpropagates one microbatch at a time, retaining one microbatch's recurrent graph on the GPU at a time.
+When compilation is enabled, the trainer raises `torch._dynamo.config.recompile_limit` to at least `8 * number_of_shapes`, preserving any larger existing value, to cover initial, first recurrent, later recurrent, and final cycles in training and validation.
+The first memory handoff can have a different tensor stride from later handoffs, requiring a separate compiled variant.
+
+`updates.jsonl` records the actual optimized scalar as `loss`, the global supervised-target mean as `token_loss`, and `supervised_targets` for the whole update.
+`episode_groups` is keyed by cycle count and contains each group's token-mean `loss`, `supervised_targets`, and per-cycle `cycle_losses`.
+`run.json` and checkpoint metadata serialize the resolved `episode_mix`, `loss_weighting`, and `group_loss_weights` under `sft_config`, with checkpoints storing the run record as `run_contract`.
+Checkpoint `memory_contract.gradient_horizons` lists the selected cycle counts and replaces the old scalar `gradient_horizon`.
 
 ## Runtime environment and storage
 

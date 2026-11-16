@@ -1,10 +1,12 @@
 """Assistant-only supervised fine-tuning of recurrent latent memory episodes."""
 
+from collections import Counter
 import time
 
 import torch
 
 from nanochat.rlm_training import require_finite_gradients, synchronize
+from nanochat.sft_training import LossWeighting, SFTLossConfig
 from nanochat.training_runtime import require_finite_loss
 
 
@@ -56,50 +58,97 @@ def sft_episode_loss(forward_cycle, inputs, targets, text_length, cycles):
     return cycle_sums.sum() / cycle_counts.sum(), cycle_sums.detach(), cycle_counts
 
 
-def sft_update(model, forward_cycle, optimizer, loader, accumulation, step, *, device_batch_size, cycles):
-    """Accumulate complete episodes, then apply one optimizer update."""
+def _episode_cycles(inputs, targets, text_length):
+    if inputs.ndim != 2 or inputs.shape != targets.shape:
+        raise ValueError("Episode inputs and targets must have matching [batch, text] shapes")
+    if inputs.size(1) == 0 or inputs.size(1) % text_length:
+        raise ValueError("Episode width must be a positive multiple of text_length")
+    return inputs.size(1) // text_length
+
+
+def sft_update(model, forward_cycle, optimizer, loader, step, *, episode_mix, loss_config: SFTLossConfig):
+    """Stage one mix on CPU, then backpropagate one episode microbatch at a time."""
     text_length = model.config.text_length
     device = model.get_device()
-    optimizer.zero_grad(set_to_none=True)
-    cycle_sums = torch.zeros(cycles, device=device)
-    cycle_counts = torch.zeros(cycles, dtype=torch.int64, device=device)
+    if not episode_mix:
+        raise ValueError("SFT update requires a nonempty episode mix")
+    loss_config.validate_cycles(shape.cycles for shape in episode_mix)
+    expected = Counter({(shape.cycles, shape.batch_size): shape.microbatches for shape in episode_mix})
+    accumulation = sum(expected.values())
+    remaining = expected.copy()
+    group_targets = {shape.cycles: 0 for shape in episode_mix}
+    batches = []
     data_state = None
     synchronize(device)
     started = time.monotonic()
+    # Only token tensors are staged. Every forward graph is freed by its own backward.
     for _ in range(accumulation):
         inputs, targets, data_state = next(loader)
-        if inputs.shape != (device_batch_size, cycles * text_length):
-            raise ValueError("Loader batch does not match the configured episode microbatch")
-        loss, sums, counts = sft_episode_loss(forward_cycle, inputs.long(), targets, text_length, cycles)
+        cycles = _episode_cycles(inputs, targets, text_length)
+        shape = (cycles, inputs.size(0))
+        if remaining[shape] <= 0:
+            raise ValueError("Loader batch does not match the configured episode mix")
+        remaining[shape] -= 1
+        inputs, targets = inputs.cpu(), targets.cpu()
+        count = int(targets.ne(-1).sum() + eom_supervision(targets, text_length, cycles).sum())
+        if count == 0:
+            raise ValueError("SFT microbatch has no supervised targets")
+        group_targets[cycles] += count
+        batches.append((inputs, targets, cycles, count))
+
+    optimizer.zero_grad(set_to_none=True)
+    cycle_sums = {c: torch.zeros(c, device=device) for c in group_targets}
+    cycle_counts = {c: torch.zeros(c, dtype=torch.int64, device=device) for c in group_targets}
+    objective = torch.zeros((), device=device)
+    for cpu_inputs, cpu_targets, cycles, count in batches:
+        inputs = cpu_inputs.to(device=device, dtype=torch.long)
+        targets = cpu_targets.to(device=device)
+        loss, sums, counts = sft_episode_loss(forward_cycle, inputs, targets, text_length, cycles)
         require_finite_loss(loss, step)
-        (loss / accumulation).backward()
-        cycle_sums += sums
-        cycle_counts += counts
-        del loss, inputs, targets
+        if loss_config.mode is LossWeighting.MICROBATCH:
+            scale = 1.0 / accumulation
+        else:
+            scale = loss_config.group_weights[cycles] * count / group_targets[cycles]
+        (loss * scale).backward()
+        objective.add_(loss.detach(), alpha=scale)
+        cycle_sums[cycles] += sums
+        cycle_counts[cycles] += counts
+        del loss, inputs, targets, sums, counts
     require_finite_gradients(model, step)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     synchronize(device)
     elapsed = time.monotonic() - started
-    cycle_losses = (cycle_sums / cycle_counts.clamp(min=1)).tolist()
+    total_sum = sum(sums.sum() for sums in cycle_sums.values())
+    total_count = sum(counts.sum() for counts in cycle_counts.values())
+    groups = {
+        str(c): {
+            "loss": (cycle_sums[c].sum() / cycle_counts[c].sum()).item(),
+            "supervised_targets": int(cycle_counts[c].sum().item()),
+            "cycle_losses": (cycle_sums[c] / cycle_counts[c].clamp(min=1)).tolist(),
+        }
+        for c in group_targets
+    }
     return {
         "completed_updates": step + 1,
-        "loss": (cycle_sums.sum() / cycle_counts.sum()).item(),
-        "cycle_losses": cycle_losses,
-        "supervised_targets": int(cycle_counts.sum().item()),
+        "loss": objective.item(),
+        "token_loss": (total_sum / total_count).item(),
+        "episode_groups": groups,
+        "supervised_targets": int(total_count.item()),
         "duration_seconds": elapsed,
     }, data_state
 
 
 @torch.no_grad()
-def evaluate_sft_loss(forward_cycle, loader, batches, text_length, cycles):
-    """Mean loss per supervised target over a fixed number of held-out batches."""
+def evaluate_sft_loss(forward_cycle, loader, batches, text_length):
+    """Global supervised-target mean across the requested mixed microbatches."""
     if batches <= 0:
         raise ValueError("Evaluation needs a positive number of batches")
     total = None
     count = None
     for _ in range(batches):
         inputs, targets, _ = next(loader)
+        cycles = _episode_cycles(inputs, targets, text_length)
         _, sums, counts = sft_episode_loss(forward_cycle, inputs.long(), targets, text_length, cycles)
         total = sums.sum() if total is None else total + sums.sum()
         count = counts.sum() if count is None else count + counts.sum()

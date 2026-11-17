@@ -14,7 +14,7 @@ Everything in the branch `rlm`
     - data loader in pretraining will discard a lot of long documents
     - similar bug in data load of SFT: long conversation discarded because of small context window not covering assistant tokens for supervision
       - fixed by increasing the cycle number to cover long context [mixed SFT]
-    - whether the nanochat original loaders are fixed?
+    - whether the nanochat original loaders are fixed? Feng needs to check this and get back to Adi. 
 4. LoRA training for existing model:
     - Adi thinking about it
     - two potential problems or questions:

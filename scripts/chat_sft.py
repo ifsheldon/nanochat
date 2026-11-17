@@ -2,11 +2,11 @@
 Supervised fine-tuning (SFT) the model.
 Run as:
 
-python -m scripts.chat_sft
+python -m scripts.chat_sft --crop-long-conversations
 
 Or torchrun for training:
 
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --crop-long-conversations
 """
 
 import gc
@@ -71,6 +71,12 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument(
+    "--crop-long-conversations",
+    action=argparse.BooleanOptionalAction,
+    required=True,
+    help="crop over-long conversations to max_seq_len + 1 on arrival so they do not clog the packing buffer",
+)
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -185,6 +191,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     return sft_data_loader_bos_bestfit(
         dataset, tokenizer, args.device_batch_size, args.max_seq_len, device,
         rank=ddp_rank, world_size=ddp_world_size, buffer_size=buffer_size,
+        crop_long_conversations=args.crop_long_conversations,
     )
 
 train_loader = sft_data_generator_bos_bestfit("train")

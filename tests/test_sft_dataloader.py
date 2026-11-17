@@ -1,5 +1,9 @@
 """Regression tests for SFT packing, supervision masks, and dataset progress."""
 
+import os
+import subprocess
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -189,3 +193,47 @@ def test_conversation_beyond_the_longest_episode_is_truncated_or_skipped():
 def test_mix_without_any_fitting_conversation_raises_instead_of_looping():
     with pytest.raises(ValueError, match="no conversation that fits a 2-cycle episode"):
         next(mixed_loader([conversation(12)], "2x1:1,4x1:1"))
+
+
+def test_arrival_cropping_prevents_buffer_clog_and_matches_single_length_mixed_loader():
+    late_reply = ([0, *range(100, 120)], [0] * 12 + [1] * 9)
+    dataset = [
+        conversation(12, start=10),
+        conversation(4, start=30),
+        late_reply,
+        conversation(11, start=50),
+        conversation(5, start=70),
+        conversation(3, start=80),
+    ]
+    cropped = sft_data_loader_bos_bestfit(
+        dataset, TokenizedConversations(), batch_size=2, sequence_len=8,
+        device=torch.device("cpu"), buffer_size=2, crop_long_conversations=True,
+    )
+    mixed = mixed_loader(dataset, "2x2:1", buffer_size=2)
+    for _ in range(6):
+        x, y, state = next(cropped)
+        mixed_x, mixed_y, mixed_state = next(mixed)
+        assert torch.equal(x, mixed_x) and torch.equal(y, mixed_y)
+        assert state == mixed_state
+
+
+def test_chat_sft_cli_requires_explicit_crop_long_conversations_choice(tmp_path):
+    env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "",
+        "NANOCHAT_BASE_DIR": str(tmp_path / "run"),
+        "NANOCHAT_DATASETS_DIR": str(tmp_path / "datasets"),
+    }
+    missing = subprocess.run(
+        [sys.executable, "-m", "scripts.chat_sft"],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert missing.returncode == 2
+    assert "--crop-long-conversations/--no-crop-long-conversations" in missing.stderr
+
+    help_out = subprocess.run(
+        [sys.executable, "-m", "scripts.chat_sft", "--help"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert "--crop-long-conversations" in help_out.stdout
+    assert "--no-crop-long-conversations" in help_out.stdout

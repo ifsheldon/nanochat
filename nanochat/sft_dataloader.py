@@ -62,13 +62,18 @@ def episode_mix_chunks(episode_mix) -> int:
 
 def sft_data_loader_bos_bestfit(
     dataset, tokenizer, batch_size: int, sequence_len: int, device: torch.device,
-    rank: int = 0, world_size: int = 1, buffer_size: int = 100,
+    rank: int = 0, world_size: int = 1, buffer_size: int = 100, *,
+    crop_long_conversations: bool = False,
 ):
     """Yield inputs, assistant-only targets, and dataset progress.
 
-    Pack complete conversations first. Only when none fits an empty row,
-    truncate the shortest buffered conversation. Exclude conversations without
-    a supervised target in their usable prefix, counting them as consumed.
+    Pack complete conversations first. With crop_long_conversations=True,
+    conversations longer than a row are truncated to row_capacity on arrival so
+    they immediately fill the next empty row without accumulating in the buffer.
+    With crop_long_conversations=False, full lengths are buffered and only an
+    empty row truncates the shortest buffered conversation. Exclude
+    conversations without a supervised target in their usable prefix, counting
+    them as consumed.
     """
     if batch_size < 1 or sequence_len < 1 or buffer_size < 1:
         raise ValueError("SFT batch size, sequence length, and buffer size must be positive")
@@ -91,13 +96,14 @@ def sft_data_loader_bos_bestfit(
     def refill_buffer():
         nonlocal cursor, consumed, epoch, consecutive_skips
         while len(conv_buffer) < buffer_size:
-            # Preserve lengths so truncated conversations cannot outrank natural fits.
             ids, mask = tokenizer.render_conversation(dataset[cursor], max_tokens=None)
             cursor += world_size
             if cursor >= dataset_size:
                 cursor %= dataset_size
                 epoch += 1
 
+            if crop_long_conversations:
+                ids, mask = ids[:row_capacity], mask[:row_capacity]
             if not any(mask[1:row_capacity]):
                 consumed += world_size
                 consecutive_skips += 1

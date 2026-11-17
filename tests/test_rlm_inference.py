@@ -240,7 +240,7 @@ def test_checkpoint_rejects_wrong_tokenizer_and_missing_recurrent_parameter(tmp_
         load_rlm_checkpoint(checkpoint_dir, 3, torch.device("cpu"))
 
 
-@pytest.mark.parametrize("module_name", ["scripts.rlm_eval", "scripts.rlm_sample"])
+@pytest.mark.parametrize("module_name", ["scripts.rlm_eval", "scripts.rlm_sample", "scripts.rlm_chat_eval"])
 def test_cli_import_does_not_freeze_compute_precision(module_name):
     script = (
         f"import {module_name}; import sys; "
@@ -252,7 +252,7 @@ def test_cli_import_does_not_freeze_compute_precision(module_name):
     )
 
 
-@pytest.mark.parametrize("module_name", ["scripts.rlm_eval", "scripts.rlm_sample"])
+@pytest.mark.parametrize("module_name", ["scripts.rlm_eval", "scripts.rlm_sample", "scripts.rlm_chat_eval"])
 @pytest.mark.parametrize("explicit_environment", [False, True])
 def test_cli_configures_precision_and_checks_memory_before_loading(
     module_name, explicit_environment, monkeypatch, tmp_path,

@@ -9,6 +9,7 @@ Run commands from the repository root unless a guide says otherwise.
 - [D24 training and evaluation](spark-training/SPARK_D24.md)
 - [RLM training, evaluation, and measured results](spark-training/SPARK_RLM.md)
 - [RLM implementation plan and training history](spark-training/SPARK_RLM_PLAN.md)
+- [ARC-Easy and HumanEval answer and failure analysis](spark-training/SPARK_ARC_EASY_HUMANEVAL_ANALYSIS.md)
 
 ## H100 training
 

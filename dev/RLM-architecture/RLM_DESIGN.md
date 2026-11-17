@@ -159,6 +159,9 @@ Do not shift targets over the concatenated control layout, which would incorrect
 
 Generation summarizes the completed chunk first and uses a prefix-only `[memory][<EOM>]` call to predict the next chunk's first token.
 The old chunk's final-position prediction remains a training target but does not select the boundary token during generation.
+Within an active chunk (`< text_length` tokens), `RecurrentGPT.prefill_cycle` and `RecurrentGPT.decode_token` allow [`RLMEngine`](../../nanochat/rlm_inference.py) to cache per-layer keys/values and the previous token's pre-smear normalized embedding in a bounded `KVCache` of capacity `memory_tokens + 1 + text_length`, omitting unused summary slots until consolidation is needed.
+When the chunk reaches `text_length` tokens, `RLMEngine` consolidates outgoing memory through `forward_cycle(..., write_memory=True)`, resets the `KVCache` (clearing both `cache_seqlens` and `prev_embedding`), and prefills `[memory][<EOM>]` for the new cycle, so no raw text, KV state, or smear state crosses a handoff.
+[`RLMGenerator`](../../nanochat/rlm_inference.py) retains the uncached per-token cycle recomputation as an explicit reference path.
 
 The current loader returns views into a reusable GPU buffer.
 Keep those indices stable until backward completes; fetching another episode early can overwrite tensors saved for embedding backward.

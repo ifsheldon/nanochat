@@ -37,7 +37,7 @@ RLM reuses a GPT backbone across bounded text chunks and passes learned memory b
 - `nanochat/rlm_sft.py` implements assistant-only recurrent SFT loss, mixed-episode updates, and evaluation; `nanochat/sft_training.py` validates the explicit loss-weighting choice and tracks progress/schedules.
 - `scripts/rlm_sft.py` fine-tunes a pretraining checkpoint in one process with required `--episode-mix` and `--loss-weighting {microbatch,group-token}`; group-token requires explicit `--group-loss-weights`, and one complete mix must match the inherited or explicit `--total-batch-size` text-position budget.
 - `scripts/base_train.py`, `chat_sft.py`, and `chat_rl.py` drive the base-model and chat training stages.
-- `scripts/rlm_train.py`, `rlm_eval.py`, and `rlm_sample.py` expose recurrent training, evaluation, and generation; the trainer requires `--model-profile PATH` and `--total-batch-token-size` for every mode, including resume.
+- `scripts/rlm_train.py`, `rlm_eval.py`, `rlm_chat_eval.py`, and `rlm_sample.py` expose recurrent training, memory-control and ChatCORE evaluation, and generation; the trainer requires `--model-profile PATH` and `--total-batch-token-size` for every mode, including resume.
 - `scripts/h100_rlm.py` orchestrates the H100 workflow with required `--num-gpus {1,2,4}` and `--model-profile PATH`, including portable resume across those GPU counts; fresh runs require `--total-batch-token-size`, and resume restores the saved budget or accepts an explicit matching value.
 
 ## Workflow guides

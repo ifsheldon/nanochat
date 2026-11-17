@@ -593,11 +593,11 @@ Each intervention changes the current cycle's incoming memory; the intact trajec
 Cycle 1 has no memory intervention and cannot establish memory use.
 Natural-language quality claims still require matched ordinary-context training baselines.
 
-Generation retains only incoming memory and the current text chunk and recomputes that bounded context for each token.
-At a boundary it replaces the completed chunk with its summary, then predicts the new chunk's first token from `[memory][<EOM>]`.
-This implementation has no persistent KV cache, so rollover cannot retain hidden previous-text access or stale smear state.
-It favors an explicit generation contract; decoding performance has not been optimized.
-For Python callers, `model.eval().generate(prompt_ids, max_tokens=128)` uses this same recurrent sampler and resets memory for each new call.
+Generation retains only incoming memory and the current text chunk.
+`RLMGenerator` recomputes that bounded context on each token as an explicit reference without a KV cache, and `model.eval().generate(prompt_ids, max_tokens=128)` delegates to it while resetting memory on each call.
+For chat inference and benchmark evaluation, `RLMEngine` accelerates intra-chunk decoding with a bounded `KVCache` (`memory_tokens + 1 + text_length` positions) via `RecurrentGPT.prefill_cycle` and `RecurrentGPT.decode_token`, omitting unused summary slots during single-token steps and handling `<|python_start|>...<|python_end|>` calculator tool injection and `<|assistant_end|>`/`<|bos|>` stop tokens.
+When the active chunk reaches `text_length` tokens, `RLMEngine` consolidates outgoing memory through `forward_cycle(..., write_memory=True)`, resets `KVCache` (clearing `cache_seqlens` and `prev_embedding`), and prefills `[memory][<EOM>]` to predict the next chunk's first token, so rollover cannot retain previous-cycle KV entries or stale smear state.
+`scripts.rlm_chat_eval` combines `RLMEngine` with batched `predict_next_logits` scoring (grouping variable-length prompts by complete chunk count so memory consolidation stays unpadded) to evaluate RLM SFT checkpoints on `ARC-Easy`, `ARC-Challenge`, `MMLU`, `GSM8K`, and `HumanEval` (`ChatCORE`), defaulting to `<run>/sft/checkpoints`.
 RLM configuration rejects invalid dimensions, incompatible head counts, and insufficient cycle capacity before allocating the model.
 Python callers can request `forward_cycle(..., write_memory=False)` when no outgoing memory is needed; it omits the summary suffix and returns `memory=None`.
 The native episode forward and trainer use this option for the final cycle, preserving the supervised logits, loss, and cross-cycle gradient path.

@@ -301,6 +301,18 @@ The first memory handoff can have a different tensor stride from later handoffs,
 `run.json` and checkpoint metadata serialize the resolved `episode_mix`, `loss_weighting`, and `group_loss_weights` under `sft_config`, with checkpoints storing the run record as `run_contract`.
 Checkpoint `memory_contract.gradient_horizons` lists the selected cycle counts and replaces the old scalar `gradient_horizon`.
 
+Evaluate a completed RLM SFT checkpoint on the five ChatCORE tasks (`ARC-Easy`, `ARC-Challenge`, `MMLU`, `GSM8K`, and `HumanEval`) with [`scripts.rlm_chat_eval`](../scripts/rlm_chat_eval.py), which defaults to `<run>/sft/checkpoints`:
+
+```bash
+NANOCHAT_RUN_NAME='<name>' uv run --no-sync python -m scripts.rlm_chat_eval \
+    --checkpoint-dir 'training_run/<name>/sft/checkpoints' \
+    --batch-size 32 \
+    --output 'training_run/<name>/chatcore.json'
+```
+
+Categorical tasks group prompts by complete chunk count (`len // text_length`), consolidate full chunks without padding, and read choice-letter logits at each prompt's terminal position (or `[memory][<EOM>]` on an exact chunk boundary).
+Generative tasks use `RLMEngine`'s intra-cycle `KVCache`, calculator tool state (`<|python_start|>...<|python_end|>`), and recurrent `text_length` rollover.
+
 ## Runtime environment and storage
 
 The direct trainer uses the defaults below when the environment does not already supply values.

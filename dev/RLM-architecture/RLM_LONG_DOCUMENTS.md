@@ -215,7 +215,7 @@ The mixed loader's `episode_mix` parameter and the trainer's `--episode-mix` opt
 The trainer reads the cycle count of a microbatch from its width, and `episode_mix_chunks(mix) * text_length` must equal its inherited or explicit `--total-batch-size` text-position budget.
 The old `--cycles` and `--device-batch-size` options are replaced by the mix; `--episode-mix 4x8:32` selects fixed-length episodes.
 With a single entry the loader gives fixed-length episodes whose over-long conversations are truncated or skipped on arrival, so its buffer does not fill.
-The original `sft_data_loader_bos_bestfit` is unchanged and reproduces the packing of the earlier run.
+`sft_data_loader_bos_bestfit` retains `crop_long_conversations=False` by default so replays reproduce the earlier run, while `crop_long_conversations=True` truncates over-long conversations on arrival; `scripts/chat_sft.py` requires `--crop-long-conversations` or `--no-crop-long-conversations` explicitly.
 The trainer also requires `--loss-weighting {microbatch,group-token}`, with explicit `--group-loss-weights` required only for `group-token`.
 It stages a complete mix on CPU, counts assistant text and eligible EOM targets, then transfers and backpropagates one microbatch at a time.
 See [recurrent SFT settings](../RLM_TRAINING_SETTINGS.md#recurrent-sft) for the selectors, exact budget, evaluation counts, metrics, and examples.

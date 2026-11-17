@@ -9,8 +9,8 @@ from pathlib import Path
 import torch
 
 from nanochat.checkpoint_manager import find_last_step, load_checkpoint
-from nanochat.common import get_base_dir
-from nanochat.engine import sample_next_token
+from nanochat.common import COMPUTE_DTYPE, get_base_dir
+from nanochat.engine import KVCache, RowState, sample_next_token, use_calculator
 from nanochat.rlm import CycleOutput, RLMConfig, RecurrentGPT
 from nanochat.tokenizer import RustBPETokenizer, get_tokenizer
 
@@ -133,6 +133,241 @@ class RLMGenerator:
             current.append(token)
             del output
             yield token
+
+
+class RLMEngine:
+    """Intra-cycle KV-cached chat/inference engine with recurrent rollover and tool use.
+
+    Within one chunk (< text_length tokens), keys, values, and the smear input
+    embedding are cached across single-token decode steps. When a chunk reaches
+    text_length tokens, it is consolidated into outgoing latent memory via
+    forward_cycle(..., write_memory=True), the KVCache (including prev_embedding)
+    is reset, and the next cycle begins with a fresh [memory][EOM] prefill.
+    No raw text, KV state, or smear state ever crosses a chunk boundary.
+    """
+
+    def __init__(self, model: RecurrentGPT, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        tokens: Sequence[int],
+        num_samples: int = 1,
+        max_tokens: int | None = None,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        seed: int = 42,
+    ) -> Iterator[tuple[list[int], list[int]]]:
+        if self.model.training:
+            raise ValueError("RLM generation requires model.eval()")
+        if not isinstance(tokens, Sequence) or not tokens:
+            raise ValueError("RLM generation requires a nonempty prompt")
+        if type(num_samples) is not int or num_samples <= 0:
+            raise ValueError("num_samples must be a positive integer")
+        if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 0):
+            raise ValueError("max_tokens must be a nonnegative integer when supplied")
+        if not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be finite and nonnegative")
+        if top_k is not None and (type(top_k) is not int or top_k <= 0):
+            raise ValueError("top_k must be a positive integer when supplied")
+        vocab_size = self.model.config.vocab_size
+        if any(type(token) is not int or not 0 <= token < vocab_size for token in tokens):
+            raise ValueError("Prompt token IDs must be integers within the model vocabulary")
+        if max_tokens == 0:
+            return
+
+        python_start = self.tokenizer.encode_special("<|python_start|>")
+        python_end = self.tokenizer.encode_special("<|python_end|>")
+        output_start = self.tokenizer.encode_special("<|output_start|>")
+        output_end = self.tokenizer.encode_special("<|output_end|>")
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+
+        device = self.model.get_device()
+        rng = torch.Generator(device=device).manual_seed(seed)
+        cfg = self.model.config
+        text_length = cfg.text_length
+        max_cycle_cache_len = cfg.memory_tokens + 1 + text_length
+        kv_kwargs = {
+            "num_heads": cfg.n_kv_head,
+            "head_dim": cfg.n_embd // cfg.n_head,
+            "num_layers": cfg.n_layer,
+            "device": device,
+            "dtype": COMPUTE_DTYPE,
+        }
+
+        # 1) Consolidate any complete prompt chunks into latent memory (batch=1).
+        memory = None
+        start = 0
+        while len(tokens) - start >= text_length:
+            chunk_ids = torch.tensor([tokens[start:start + text_length]], dtype=torch.long, device=device)
+            memory = self.model.forward_cycle(chunk_ids, memory=memory, write_memory=True).memory.clone()
+            start += text_length
+        remainder = list(tokens[start:])
+
+        # 2) Prefill the active cycle [memory][EOM][remainder] once (batch=1),
+        #    then replicate into the per-sample intra-cycle decode KVCache.
+        prefill_len = (cfg.memory_tokens if memory is not None else 0) + 1 + len(remainder)
+        kv_cache_prefill = KVCache(batch_size=1, seq_len=prefill_len, **kv_kwargs)
+        rem_ids = torch.tensor([remainder], dtype=torch.long, device=device)
+        logits = self.model.prefill_cycle(rem_ids, memory=memory, kv_cache=kv_cache_prefill)
+        logits = logits.expand(num_samples, -1)
+
+        kv_cache_decode = KVCache(batch_size=num_samples, seq_len=max_cycle_cache_len, **kv_kwargs)
+        kv_cache_decode.prefill(kv_cache_prefill)
+        del kv_cache_prefill
+
+        if memory is not None and num_samples > 1:
+            memory = memory.expand(num_samples, -1, -1).clone()
+
+        # 3) Intra-cycle decoding with calculator tool state and chunk rollover.
+        row_states = [RowState(list(tokens)) for _ in range(num_samples)]
+        chunk_tokens = [remainder.copy() for _ in range(num_samples)]
+        num_generated = 0
+        while True:
+            if max_tokens is not None and num_generated >= max_tokens:
+                break
+            if all(state.completed for state in row_states):
+                break
+
+            next_ids = sample_next_token(logits, rng, temperature, top_k)
+            sampled_tokens = next_ids[:, 0].tolist()
+
+            token_column = []
+            token_masks = []
+            for i, state in enumerate(row_states):
+                if state.completed:
+                    token_masks.append(0)
+                    token_column.append(bos)
+                    chunk_tokens[i].append(bos)
+                    continue
+                is_forced = len(state.forced_tokens) > 0
+                token_masks.append(0 if is_forced else 1)
+                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                token_column.append(next_token)
+                state.current_tokens.append(next_token)
+                chunk_tokens[i].append(next_token)
+                if next_token == assistant_end or next_token == bos:
+                    state.completed = True
+                if next_token == python_start:
+                    state.in_python_block = True
+                    state.python_expr_tokens = []
+                elif next_token == python_end and state.in_python_block:
+                    state.in_python_block = False
+                    if state.python_expr_tokens:
+                        expr = self.tokenizer.decode(state.python_expr_tokens)
+                        result = use_calculator(expr)
+                        if result is not None:
+                            result_tokens = self.tokenizer.encode(str(result))
+                            state.forced_tokens.append(output_start)
+                            state.forced_tokens.extend(result_tokens)
+                            state.forced_tokens.append(output_end)
+                    state.python_expr_tokens = []
+                elif state.in_python_block:
+                    state.python_expr_tokens.append(next_token)
+
+            yield token_column, token_masks
+            num_generated += 1
+
+            if max_tokens is not None and num_generated >= max_tokens:
+                break
+            if all(state.completed for state in row_states):
+                break
+
+            if len(chunk_tokens[0]) == text_length:
+                chunk_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=device)
+                memory = self.model.forward_cycle(chunk_ids, memory=memory, write_memory=True).memory.clone()
+                chunk_tokens = [[] for _ in range(num_samples)]
+                kv_cache_decode.reset()
+                empty_ids = torch.empty((num_samples, 0), dtype=torch.long, device=device)
+                logits = self.model.prefill_cycle(empty_ids, memory=memory, kv_cache=kv_cache_decode)
+            else:
+                step_ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+                logits = self.model.decode_token(step_ids, kv_cache=kv_cache_decode)
+
+    def generate_batch(self, tokens: Sequence[int], num_samples: int = 1, **kwargs) -> tuple[list[list[int]], list[list[int]]]:
+        """Non-streaming batch generation; strips terminal assistant_end and bos tokens."""
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
+        results = [list(tokens) for _ in range(num_samples)]
+        masks = [[0] * len(tokens) for _ in range(num_samples)]
+        completed = [False] * num_samples
+        for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
+            for i, (token, mask) in enumerate(zip(token_column, token_masks)):
+                if not completed[i]:
+                    if token == assistant_end or token == bos:
+                        completed[i] = True
+                    else:
+                        results[i].append(token)
+                        masks[i].append(mask)
+            if all(completed):
+                break
+        return results, masks
+
+
+@torch.inference_mode()
+def predict_next_logits(
+    model: RecurrentGPT,
+    prompt_batch: Sequence[Sequence[int]],
+    pad_token_id: int,
+) -> torch.Tensor:
+    """Return next-token logits (B, vocab_size) for variable-length prompts under RLM rollover.
+
+    Prompts are grouped by complete chunk count (len // text_length) so outgoing
+    memory is consolidated only from exact, unpadded chunks. Within the final
+    cycle of each group, causal attention allows right-padding shorter tails
+    without changing logits at their true terminal positions; an exact chunk
+    boundary (remainder == 0) reads from the fresh [memory][EOM] slot (index 0).
+    """
+    if model.training:
+        raise ValueError("RLM prompt scoring requires model.eval()")
+    if not prompt_batch:
+        raise ValueError("prompt_batch must be nonempty")
+    vocab_size = model.config.vocab_size
+    if type(pad_token_id) is not int or not 0 <= pad_token_id < vocab_size:
+        raise ValueError("pad_token_id must be an integer within the model vocabulary")
+    for ids in prompt_batch:
+        if not ids:
+            raise ValueError("Each prompt in prompt_batch must be nonempty")
+        if any(type(token) is not int or not 0 <= token < vocab_size for token in ids):
+            raise ValueError("Prompt token IDs must be integers within the model vocabulary")
+
+    device = model.get_device()
+    text_length = model.config.text_length
+    groups: dict[int, list[int]] = {}
+    for idx, ids in enumerate(prompt_batch):
+        groups.setdefault(len(ids) // text_length, []).append(idx)
+
+    result: torch.Tensor | None = None
+    for full_chunks, indices in groups.items():
+        memory = None
+        for chunk_idx in range(full_chunks):
+            start = chunk_idx * text_length
+            stop = start + text_length
+            chunk_ids = torch.tensor(
+                [list(prompt_batch[i][start:stop]) for i in indices],
+                dtype=torch.long,
+                device=device,
+            )
+            memory = model.forward_cycle(chunk_ids, memory=memory, write_memory=True).memory.clone()
+        remainders = [list(prompt_batch[i][full_chunks * text_length:]) for i in indices]
+        max_rem = max(len(rem) for rem in remainders)
+        padded = [rem + [pad_token_id] * (max_rem - len(rem)) for rem in remainders]
+        tail_ids = torch.tensor(padded, dtype=torch.long, device=device)
+        cycle_out = model.forward_cycle(tail_ids, memory=memory, write_memory=False)
+        if cycle_out.logits is None:
+            raise RuntimeError("RLM prompt scoring cycle did not return logits")
+        if result is None:
+            result = torch.empty(
+                (len(prompt_batch), vocab_size), dtype=cycle_out.logits.dtype, device=device,
+            )
+        for local_idx, batch_idx in enumerate(indices):
+            rem_len = len(remainders[local_idx])
+            result[batch_idx] = cycle_out.logits[local_idx, rem_len]
+    assert result is not None
+    return result
 
 
 @dataclass(frozen=True)

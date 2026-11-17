@@ -151,6 +151,71 @@ class RecurrentGPT(GPT):
         )
         return CycleOutput(memory=next_memory, loss=loss)
 
+    def prefill_cycle(self, text_ids, memory=None, *, kv_cache):
+        """Prefill an empty intra-cycle KVCache with [memory][EOM][text] and return last-position logits.
+
+        Text must be strictly shorter than text_length; a completed chunk must
+        first be consolidated via forward_cycle(..., write_memory=True) and its
+        KVCache reset before prefilling the new cycle's [memory][EOM] prefix.
+        Summary slots are omitted because intra-cycle decoding never writes
+        memory until the chunk reaches text_length.
+        """
+        if kv_cache is None or kv_cache.get_pos() != 0:
+            raise ValueError("RLM cycle prefill requires an empty KVCache")
+        if text_ids.ndim != 2 or text_ids.size(0) == 0:
+            raise ValueError("RLM text_ids must have shape (nonempty batch, text length)")
+        batch, text_length = text_ids.shape
+        if batch != kv_cache.batch_size:
+            raise ValueError("RLM text_ids batch size must match KVCache batch size")
+        if not 0 <= text_length < self.config.text_length:
+            raise ValueError(f"RLM prefill text length must be between 0 and {self.config.text_length - 1}")
+        if text_length == 0 and memory is None:
+            raise ValueError("An empty initial cycle prefill requires incoming memory")
+        if text_ids.device != self.get_device():
+            raise ValueError("RLM text_ids and model must be on the same device")
+
+        text = self.transformer.wte(text_ids).to(COMPUTE_DTYPE)
+        eom = self.eom_embedding.to(text.dtype).view(1, 1, -1).expand(batch, 1, -1)
+        parts = [eom, text]
+        prefix_tokens = 0
+        if memory is not None:
+            expected_shape = (batch, self.config.memory_tokens, self.config.n_embd)
+            if memory.shape != expected_shape:
+                raise ValueError(f"RLM memory must have shape {expected_shape}")
+            if memory.device != text.device or memory.dtype != text.dtype:
+                raise ValueError("RLM memory must match the text embedding device and compute dtype")
+            prefix_tokens = self.config.memory_tokens
+            parts.insert(0, memory)
+        x = torch.cat(parts, dim=1)
+        positions = x.size(1)
+        if positions > kv_cache.max_seq_len:
+            raise ValueError("KVCache capacity is smaller than the RLM cycle prefill")
+
+        cos_sin = self.cos[:, :positions], self.sin[:, :positions]
+        hidden = self._forward_embeddings(
+            x, text_ids, cos_sin, kv_cache=kv_cache,
+            prefix_tokens=prefix_tokens + 1, suffix_tokens=0,
+        )
+        return self._compute_logits(hidden[:, -1:, :])[:, 0, :]
+
+    def decode_token(self, token_ids, *, kv_cache):
+        """Append one text token per lane to an active intra-cycle KVCache and return its logits."""
+        if kv_cache is None or kv_cache.get_pos() <= 0:
+            raise ValueError("RLM token decode requires a prefilled KVCache")
+        if token_ids.ndim != 2 or token_ids.shape != (kv_cache.batch_size, 1):
+            raise ValueError("RLM decode token_ids must have shape (kv_cache.batch_size, 1)")
+        if token_ids.device != self.get_device():
+            raise ValueError("RLM token_ids and model must be on the same device")
+        pos = kv_cache.get_pos()
+        max_positions = self.config.memory_tokens + 1 + self.config.text_length
+        if pos >= kv_cache.max_seq_len or pos >= max_positions:
+            raise ValueError("KVCache has no remaining intra-cycle capacity")
+
+        x = self.transformer.wte(token_ids).to(COMPUTE_DTYPE)
+        cos_sin = self.cos[:, pos:pos + 1], self.sin[:, pos:pos + 1]
+        hidden = self._forward_embeddings(x, token_ids, cos_sin, kv_cache=kv_cache)
+        return self._compute_logits(hidden)[:, 0, :]
+
     def forward(self, idx, targets=None, loss_reduction='mean'):
         """Run one complete episode per row, without storing recurrent module state.
 

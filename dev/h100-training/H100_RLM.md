@@ -15,7 +15,7 @@ Before the first multi-GPU pretraining run on a server, follow the [server valid
 - Linux x86-64 with at least the requested 1, 2, or 4 unpartitioned H100 GPUs visible on one host, including H100 80 GB and H100 NVL 94 GB.
 - A working NVIDIA driver compatible with the locked PyTorch 2.14.1 CUDA 12.6 build.
 - At least 32 GB of available host RAM before launch.
-- Approximately 280 GB of free disk space for a new run, plus space for the supplied bundle and Python environment.
+- Approximately 160 GB of free disk space for a new run, plus space for the supplied bundle and Python environment.
 - Git, Git LFS, `uv`, and Python 3.10 or newer available as `python3`.
 - Internet access for dependencies, the supplied files, and the dataset.
 
@@ -169,7 +169,7 @@ The coordinator owns shared run artifacts and writes one model plus the complete
 Each worker stages its local optimizer state on the CPU; the coordinator gathers those tensors and writes the snapshot asynchronously while the next forward/backward runs.
 All workers wait for that snapshot before updating parameters, and a required milestone must finish before the input embedding unfreezes.
 Worker diagnostics use separate files; update losses average across workers, CUDA memory reports the largest per-worker usage, and throughput uses the global text batch and slowest-worker duration.
-Numbered checkpoints are saved at update 2, every 10 updates, and the final or explicitly paused update; the latest 10 numbered checkpoints are retained.
+Numbered checkpoints are saved at update 2, every 10 updates, and the final or explicitly paused update; the latest 4 numbered checkpoints are retained.
 `pretrain-90pct.pt` preserves the complete update-5016 state separately from numbered-checkpoint retention.
 For recipes that unfreeze the input embedding, this checkpoint is saved before update 5017 begins.
 It is also saved for the permanently frozen recipe.

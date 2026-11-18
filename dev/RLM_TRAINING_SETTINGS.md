@@ -228,7 +228,7 @@ Before GPU setup, a fresh launch requires that budget to be divisible by `num_gp
 Resume validates divisibility for its saved device-batch recipe at the requested GPU count.
 The same budget is passed to capacity probing, attention benchmarking, and production training.
 Keeping `N = 5574` with a different `T` changes the total text processed over the run; it does not automatically preserve a prior token total.
-Production uses asynchronous checkpoints, numbered saves every 10 updates, and retention of 10 numbered checkpoints.
+Production uses asynchronous checkpoints, numbered saves every 10 updates, and retention of 4 numbered checkpoints.
 The launcher compares SDPA with FA3, chooses the faster successful backend, and uses SDPA on ties or failed FA3 probes.
 
 H100 resume restores the saved token budget, unlike the direct trainer's required explicit budget.

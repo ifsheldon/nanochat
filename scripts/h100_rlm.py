@@ -129,7 +129,7 @@ def training_arguments(recipe, output_dir, *, model_profile, total_batch_token_s
         "--checkpoint-mode", "async", "--output-dir", str(output_dir),
     ]
     if not probe:
-        arguments.extend(("--save-every", "10", "--keep-checkpoints", "10"))
+        arguments.extend(("--save-every", "10", "--keep-checkpoints", "4"))
     if resume:
         arguments.append("--resume-latest")
     elif assets is not None:
@@ -195,7 +195,7 @@ def runtime_environment(output_dir, datasets_dir, gpu):
         "NANOCHAT_TRAIN_SHARDS": "170", "NANOCHAT_DTYPE": "bfloat16",
         "NANOCHAT_ATTENTION_IMPL": "sdpa", "OMP_NUM_THREADS": "1", "PYTHONUNBUFFERED": "1",
         "NANOCHAT_CUDA_MEMORY_LIMIT_GB": str(gpu["allocator_limit_gb"]),
-        "NANOCHAT_MIN_SYSTEM_AVAILABLE_GB": "12", "NANOCHAT_CHECKPOINT_RESERVE_GB": "100",
+        "NANOCHAT_MIN_SYSTEM_AVAILABLE_GB": "12", "NANOCHAT_CHECKPOINT_RESERVE_GB": "50",
         "PYTORCH_ALLOC_CONF": "expandable_segments:True",
         "CUDA_VISIBLE_DEVICES": gpu["visible_devices"],
     })
@@ -214,7 +214,7 @@ def require_disk_space(output_dir, datasets_dir):
     dataset_dir = datasets_dir / "base_data_climbmix"
     missing = sum(not (dataset_dir / name).is_file() for name in EXPECTED_SHARDS)
     requirements = (
-        (output_dir, 100 * GB + max(0, 156 * GB - existing)),
+        (output_dir, 50 * GB + max(0, 80 * GB - existing)),
         (datasets_dir, missing * 110_000_000 + GB),
     )
     volumes = {}
@@ -225,7 +225,7 @@ def require_disk_space(output_dir, datasets_dir):
     for path, required in volumes.values():
         available = shutil.disk_usage(path).free
         if available < required:
-            raise RuntimeError(f"Insufficient free disk space at {path}: need {required / GB:.1f} GB, have {available / GB:.1f} GB. This includes retained checkpoints, staging, and the 100 GB checkpoint reserve.")
+            raise RuntimeError(f"Insufficient free disk space at {path}: need {required / GB:.1f} GB, have {available / GB:.1f} GB. This includes retained checkpoints, staging, and the 50 GB checkpoint reserve.")
 
 
 def run_logged(command, log_path, environment):

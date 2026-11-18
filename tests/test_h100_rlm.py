@@ -389,10 +389,10 @@ def test_disk_preflight_adds_cache_and_output_budgets_on_same_volume(tmp_path, m
     output, cache = tmp_path / "output", tmp_path / "cache"
     output.mkdir()
     cache.mkdir()
-    monkeypatch.setattr(launcher.shutil, "disk_usage", lambda _: SimpleNamespace(free=270 * launcher.GB))
+    monkeypatch.setattr(launcher.shutil, "disk_usage", lambda _: SimpleNamespace(free=140 * launcher.GB))
     with pytest.raises(RuntimeError, match="Insufficient free disk"):
         launcher.require_disk_space(output, cache)
-    monkeypatch.setattr(launcher.shutil, "disk_usage", lambda _: SimpleNamespace(free=280 * launcher.GB))
+    monkeypatch.setattr(launcher.shutil, "disk_usage", lambda _: SimpleNamespace(free=160 * launcher.GB))
     launcher.require_disk_space(output, cache)
 
 

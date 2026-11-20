@@ -1,0 +1,3 @@
+[submodule "recurrent-latent-memory"]
+	path = recurrent-latent-memory
+	url = git@github.com:ifsheldon/recurrent-latent-memory.git
